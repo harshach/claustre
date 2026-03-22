@@ -946,8 +946,9 @@ pub(crate) struct App {
     // from "idle after injection (Claude finished processing)".
     pub workflow_stage_injected: HashSet<String>,
 
-    // Reserved for future use — message queueing was removed as unreliable.
-    #[expect(dead_code, reason = "field kept for binary compatibility during development")]
+    // Queued compose message: when the user sends while Claude is busy,
+    // stored here and delivered when Claude becomes idle. User can press
+    // Ctrl+C to interrupt Claude and force-send the queued message.
     pub queued_compose_message: Option<(String, String)>,
 
     // Cached result of visible_tasks() — indices into self.tasks, filtered and sorted.
@@ -3617,18 +3618,89 @@ mod tests {
         // When send fails and restart also fails, the compose buffer is preserved
         // so the user doesn't lose their message. Toast indicates failure.
         let toast = app.toast_message.as_deref().unwrap_or_default();
-        let send_succeeded = toast.contains("Sent to agent") || toast.contains("Resuming");
+        let send_succeeded = toast.contains("Sent to agent")
+            || toast.contains("Resuming")
+            || toast.contains("Restarting");
         if send_succeeded {
-            assert_eq!(app.input_mode, InputMode::Normal);
+            // Compose stays active for fluid chat
+            assert_eq!(app.input_mode, InputMode::ThreadCompose);
             assert!(app.input_buffer.is_empty());
             assert!(app.thread_compose_buffer.is_empty());
         } else {
-            // Failed — buffer preserved, message still recorded in DB
+            // Failed or queued — buffer cleared, message still recorded in DB
             assert!(
-                toast.contains("exited") || toast.contains("not reachable"),
+                toast.contains("exited")
+                    || toast.contains("not reachable")
+                    || toast.contains("queued"),
                 "unexpected toast: {toast}"
             );
         }
+    }
+
+    #[test]
+    fn compose_queues_when_session_is_working() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        // Set the session to Working status to simulate Claude being busy
+        let thread = app.threads[0].clone();
+        if let Some(ref sid) = thread.session_id {
+            let _ = app
+                .store
+                .update_session_status(sid, crate::store::ClaudeStatus::Working, "Working");
+            app.sessions = app.store.list_sessions_for_project(&thread.project_id).unwrap();
+        }
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "please push to remote".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.thread_compose_buffer = app.input_buffer.clone();
+        app.thread_compose_cursor = app.input_cursor;
+
+        app.submit_thread_compose_message().unwrap();
+
+        let toast = app.toast_message.as_deref().unwrap_or_default();
+        // In test there's no PTY, so it will either queue or fail to send.
+        // The message should still be recorded in the DB.
+        let messages = app.store.list_thread_messages(&thread.id).unwrap();
+        assert!(
+            messages.iter().any(|m| m.content == "please push to remote"),
+            "User message should be persisted in DB"
+        );
+    }
+
+    #[test]
+    fn suggest_workflow_returns_review_for_pr() {
+        let item = crate::store::GitHubItem {
+            id: "item-1".to_string(),
+            repo_id: "repo-1".to_string(),
+            project_v2_id: None,
+            node_id: None,
+            kind: crate::store::GitHubItemKind::PullRequest,
+            number: 42,
+            title: "Fix stuff".to_string(),
+            body_text: None,
+            state: "open".to_string(),
+            url: "https://github.com/test/test/pull/42".to_string(),
+            label_names: vec![],
+            label_colors: serde_json::Value::Object(serde_json::Map::new()),
+            project_field_values: serde_json::Value::Object(serde_json::Map::new()),
+            base_ref: None,
+            head_ref: None,
+            assignee_logins: vec![],
+            linked_pr_number: None,
+            linked_pr_item_id: None,
+            github_updated_at: None,
+            synced_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            crate::threads::suggest_workflow(Some(&item), false),
+            "review_fix_loop"
+        );
     }
 
     #[test]

@@ -1424,11 +1424,23 @@ pub(super) fn draw_thread_chat(
         }
         lines
     } else {
+        let has_queued = app
+            .queued_compose_message
+            .as_ref()
+            .is_some_and(|(tid, _)| tid == &thread_ctx.thread.id);
         let compose_text = if compose_focused {
             format!(
                 "> {}",
                 format_with_cursor(&app.input_buffer, app.input_cursor)
             )
+        } else if has_queued {
+            let msg = &app.queued_compose_message.as_ref().unwrap().1;
+            let preview = if msg.len() > 60 {
+                format!("{}...", &msg[..57])
+            } else {
+                msg.clone()
+            };
+            format!("> {preview}")
         } else if !app.thread_compose_buffer.is_empty()
             && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str())
         {
@@ -1439,20 +1451,31 @@ pub(super) fn draw_thread_chat(
             "> Type a message here. Press l to continue the thread if no live provider is attached."
                 .to_string()
         };
+        let (reply_label, reply_color) = if has_queued {
+            (
+                "Reply  \u{23F3} queued — Ctrl+C to interrupt and send now",
+                app.theme.status_paused,
+            )
+        } else {
+            (
+                "Reply",
+                if compose_focused {
+                    app.theme.accent_tertiary
+                } else {
+                    app.theme.accent_secondary
+                },
+            )
+        };
         vec![
             Line::from(vec![Span::styled(
-                "Reply",
+                reply_label,
                 Style::default()
-                    .fg(if compose_focused {
-                        app.theme.accent_tertiary
-                    } else {
-                        app.theme.accent_secondary
-                    })
+                    .fg(reply_color)
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(Span::styled(
                 compose_text,
-                Style::default().fg(if compose_focused {
+                Style::default().fg(if compose_focused || has_queued {
                     app.theme.text_primary
                 } else {
                     app.theme.text_secondary

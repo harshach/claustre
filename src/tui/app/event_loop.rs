@@ -104,6 +104,7 @@ impl App {
                     }
                     self.process_pty_output();
                     self.detect_paused_sessions();
+                    self.drain_queued_compose_message();
                     self.cache_pty_activity_previews();
 
                     // Fast-path tick work (always runs)
