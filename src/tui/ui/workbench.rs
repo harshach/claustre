@@ -1249,6 +1249,12 @@ pub(super) fn draw_thread_chat(
         thread_ctx.thread.title.clone()
     };
     // Line 1: title on left, session status on right
+    let status_color = match session_state {
+        "live" => app.theme.status_working,
+        "claude exited" | "no session" | "closed" => app.theme.status_error,
+        "needs approval" | "waiting for input" => app.theme.status_paused,
+        _ => app.theme.accent_tertiary,
+    };
     let status_right = format!(
         "{}  {}",
         thread_ctx.identity_summary(),
@@ -1271,7 +1277,7 @@ pub(super) fn draw_thread_chat(
             Span::styled(" ".repeat(pad), Style::default()),
             Span::styled(
                 status_right,
-                Style::default().fg(app.theme.accent_tertiary),
+                Style::default().fg(status_color),
             ),
         ]),
         Line::from(vec![
@@ -1798,12 +1804,25 @@ fn thread_source_label(thread: &crate::store::Thread) -> &'static str {
 
 fn thread_session_state(app: &App, thread: &crate::store::Thread) -> &'static str {
     let Some(session_id) = thread.session_id.as_deref() else {
-        return "relaunch";
+        return "no session";
     };
 
-    match app.sessions.iter().find(|session| session.id == session_id) {
-        Some(session) if session.closed_at.is_none() => "live",
-        Some(_) | None => "relaunch",
+    let session = app.sessions.iter().find(|session| session.id == session_id);
+    match session {
+        Some(session) if session.closed_at.is_some() => "closed",
+        Some(_) => {
+            // Session is open in DB — but is Claude actually alive?
+            if app.pty_idle_sessions.contains(session_id) {
+                "claude exited"
+            } else if app.paused_sessions.contains(session_id) {
+                "needs approval"
+            } else if app.waiting_sessions.contains(session_id) {
+                "waiting for input"
+            } else {
+                "live"
+            }
+        }
+        None => "no session",
     }
 }
 
