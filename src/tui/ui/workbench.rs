@@ -1224,9 +1224,9 @@ pub(super) fn draw_thread_chat(
     let max_compose = (inner.height * 2 / 5).max(4);
     let compose_height = compose_content_height.clamp(3, max_compose);
 
-    // Compute header height: 3 base lines + optional pipeline strip
+    // Compute header height: 2 base lines + optional pipeline strip
     let pipeline = workflow_pipeline_line(thread_ctx, &app.theme, inner.width);
-    let header_height: u16 = if pipeline.is_some() { 4 } else { 3 };
+    let header_height: u16 = if pipeline.is_some() { 3 } else { 2 };
 
     // Compute approval banner height
     let approval_banner = workflow_approval_banner(thread_ctx, &app.theme, inner.width);
@@ -1243,37 +1243,59 @@ pub(super) fn draw_thread_chat(
         .split(inner);
 
     let session_state = thread_session_state(app, &thread_ctx.thread);
-    let source_line = if let Some(github_item) = thread_ctx.github_item.as_ref() {
-        format!(
-            "{} #{} {}",
-            github_item.kind, github_item.number, github_item.title
-        )
-    } else if let Some(task_id) = thread_ctx.thread.task_id.as_deref() {
-        format!("task {task_id}")
+    let title_line = if let Some(github_item) = thread_ctx.github_item.as_ref() {
+        format!("#{} {}", github_item.number, github_item.title)
     } else {
-        "ad hoc".to_string()
+        thread_ctx.thread.title.clone()
     };
+    // Line 1: title on left, session status on right
+    let status_right = format!(
+        "{}  {}",
+        thread_ctx.identity_summary(),
+        session_state
+    );
+    let title_width = inner.width.saturating_sub(status_right.len() as u16 + 2) as usize;
+    let display_title = truncate(&title_line, title_width);
+    let pad = inner
+        .width
+        .saturating_sub(display_title.len() as u16 + status_right.len() as u16)
+        as usize;
     let mut header = vec![
-        Line::from(vec![Span::styled(
-            thread_ctx.identity_summary(),
-            Style::default()
-                .fg(app.theme.accent_primary)
-                .add_modifier(Modifier::BOLD),
-        )]),
         Line::from(vec![
             Span::styled(
-                thread_ctx.runtime_summary(),
-                Style::default().fg(app.theme.accent_secondary),
+                display_title,
+                Style::default()
+                    .fg(app.theme.accent_primary)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  |  ", Style::default().fg(app.theme.border_unfocused)),
+            Span::styled(" ".repeat(pad), Style::default()),
             Span::styled(
-                session_state,
+                status_right,
                 Style::default().fg(app.theme.accent_tertiary),
             ),
         ]),
         Line::from(vec![
-            Span::styled("source: ", Style::default().fg(app.theme.text_secondary)),
-            Span::styled(source_line, Style::default().fg(app.theme.text_primary)),
+            Span::styled(
+                thread_ctx.runtime_summary(),
+                Style::default().fg(app.theme.text_secondary),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!(
+                    "source: {}",
+                    if let Some(github_item) = thread_ctx.github_item.as_ref() {
+                        format!(
+                            "{} #{} {}",
+                            github_item.kind, github_item.number, github_item.url
+                        )
+                    } else if let Some(task_id) = thread_ctx.thread.task_id.as_deref() {
+                        format!("task {task_id}")
+                    } else {
+                        "ad hoc".to_string()
+                    }
+                ),
+                Style::default().fg(app.theme.text_secondary),
+            ),
         ]),
     ];
     if let Some(pipeline_line) = pipeline {
@@ -1402,11 +1424,24 @@ pub(super) fn draw_thread_chat(
         }
         lines
     } else {
+        // Show queued message indicator if one exists
+        let has_queued = app
+            .queued_compose_message
+            .as_ref()
+            .is_some_and(|(tid, _)| tid == &thread_ctx.thread.id);
         let compose_text = if compose_focused {
             format!(
                 "> {}",
                 format_with_cursor(&app.input_buffer, app.input_cursor)
             )
+        } else if has_queued {
+            let msg = &app.queued_compose_message.as_ref().unwrap().1;
+            let preview = if msg.len() > 60 {
+                format!("{}...", &msg[..57])
+            } else {
+                msg.clone()
+            };
+            format!("> {preview}")
         } else if !app.thread_compose_buffer.is_empty()
             && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str())
         {
@@ -1417,20 +1452,28 @@ pub(super) fn draw_thread_chat(
             "> Type a message here. Press l to continue the thread if no live provider is attached."
                 .to_string()
         };
+        let reply_label = if has_queued {
+            "Reply  \u{23F3} message queued — waiting for Claude"
+        } else {
+            "Reply"
+        };
+        let reply_color = if has_queued {
+            app.theme.status_paused
+        } else if compose_focused {
+            app.theme.accent_tertiary
+        } else {
+            app.theme.accent_secondary
+        };
         vec![
             Line::from(vec![Span::styled(
-                "Reply",
+                reply_label,
                 Style::default()
-                    .fg(if compose_focused {
-                        app.theme.accent_tertiary
-                    } else {
-                        app.theme.accent_secondary
-                    })
+                    .fg(reply_color)
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(Span::styled(
                 compose_text,
-                Style::default().fg(if compose_focused {
+                Style::default().fg(if compose_focused || has_queued {
                     app.theme.text_primary
                 } else {
                     app.theme.text_secondary
