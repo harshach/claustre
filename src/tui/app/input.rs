@@ -3015,7 +3015,22 @@ impl App {
         let sent = self.send_to_active_session_claude(&content)
             || self.send_prompt_to_live_thread_session(&thread, &content);
         if sent {
-            self.show_toast("Sent to agent", ToastStyle::Success);
+            // Warn if the session looks stuck (idle or no PTY activity)
+            let session_stuck = thread.session_id.as_deref().is_some_and(|sid| {
+                self.pty_idle_sessions.contains(sid)
+                    || self
+                        .working_no_indicator_since
+                        .get(sid)
+                        .is_some_and(|since| since.elapsed() > std::time::Duration::from_secs(60))
+            });
+            if session_stuck {
+                self.show_toast(
+                    "Sent — but Claude may be stuck. Press Ctrl+O to check terminal",
+                    ToastStyle::Info,
+                );
+            } else {
+                self.show_toast("Sent to agent", ToastStyle::Success);
+            }
             // Immediately add the user message to the conversation cache so it
             // appears instantly, before the JSONL file is updated by Claude Code.
             if let Some(ref mut cache) = self.conversation_cache {
@@ -3051,7 +3066,10 @@ impl App {
         self.thread_compose_cursor = 0;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.input_mode = InputMode::Normal;
+        // Stay in compose mode so the user can keep chatting without pressing
+        // `i` again after every message — like a real chat interface.
+        // Press Esc to exit compose mode.
+        self.input_mode = InputMode::ThreadCompose;
         self.thread_compose_thread_id = Some(thread.id.clone());
         self.refresh_data()?;
         // Stay on the current session tab instead of switching to Threads view
@@ -3087,9 +3105,7 @@ impl App {
 
         let tx = self.session_op_tx.clone();
         let cfg = self.config.clone();
-        eprintln!("[claustre] launch_thread_from_draft: spawning background thread");
         std::thread::spawn(move || {
-            eprintln!("[claustre] background thread: starting launch");
             let result = match crate::store::Store::open() {
                 Ok(store) => {
                     let outcome = if let Some(task_id) = draft.task_id.as_ref() {
@@ -3210,33 +3226,20 @@ impl App {
                     };
 
                     match outcome {
-                        Ok(result) => {
-                            eprintln!(
-                                "[claustre] launch OK: thread={}, session_id={:?}, has_setup={}",
-                                result.thread.id,
-                                result.thread.session_id,
-                                result.session_setup.is_some()
-                            );
-                            SessionOpResult::ThreadLaunched {
-                                result: Box::new(result),
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("[claustre] launch FAILED: {error:#}");
-                            SessionOpResult::Error {
-                                message: format!("Thread launch failed: {error}"),
-                            }
-                        }
+                        Ok(result) => SessionOpResult::ThreadLaunched {
+                            result: Box::new(result),
+                        },
+                        Err(error) => SessionOpResult::Error {
+                            message: format!("Thread launch failed: {error}"),
+                        },
                     }
                 }
                 Err(error) => {
-                    eprintln!("[claustre] DB open FAILED: {error:#}");
                     SessionOpResult::Error {
                         message: format!("Thread launch failed (DB): {error}"),
                     }
                 }
             };
-            eprintln!("[claustre] sending result to channel");
             let _ = tx.send(result);
         });
 

@@ -643,40 +643,15 @@ impl App {
                             .and_then(|t| t.session_id)
                             .or_else(|| thread.session_id.clone());
                         if let Some(ref sid) = fresh_sid {
-                            eprintln!("[claustre] Step2: trying goto_session_tab({sid})");
                             if !self.goto_session_tab(sid) {
-                                eprintln!("[claustre] Step2: goto failed, trying restore");
-                                match self.store.get_session(sid) {
-                                    Ok(session) if session.closed_at.is_none() => {
-                                        eprintln!("[claustre] Step2: session open, restoring tab");
-                                        match self.restore_session_tab(&session) {
-                                            Ok(()) => {
-                                                eprintln!(
-                                                    "[claustre] Step2: restore OK, tabs={}",
-                                                    self.tabs.len()
-                                                );
-                                                let _ = self.goto_session_tab(sid);
-                                            }
-                                            Err(err) => {
-                                                eprintln!(
-                                                    "[claustre] Step2: restore FAILED: {err:#}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Ok(session) => {
-                                        eprintln!(
-                                            "[claustre] Step2: session closed at {:?}",
-                                            session.closed_at
-                                        );
-                                    }
-                                    Err(err) => {
-                                        eprintln!("[claustre] Step2: get_session failed: {err:#}");
+                                if let Ok(session) = self.store.get_session(sid)
+                                    && session.closed_at.is_none()
+                                {
+                                    if self.restore_session_tab(&session).is_ok() {
+                                        let _ = self.goto_session_tab(sid);
                                     }
                                 }
                             }
-                        } else {
-                            eprintln!("[claustre] Step2: no session_id found");
                         }
                     }
 
@@ -698,14 +673,6 @@ impl App {
                                 thread.provider_kind
                             ),
                             ToastStyle::Info,
-                        );
-                        eprintln!(
-                            "[claustre] ThreadLaunched: tab switch failed. \
-                             thread_id={}, session_id={:?}, active_tab={}, tabs={}",
-                            thread.id,
-                            thread.session_id,
-                            self.active_tab,
-                            self.tabs.len(),
                         );
                     }
                 }
