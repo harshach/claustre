@@ -3187,7 +3187,7 @@ impl App {
         );
 
         if claude_dead {
-            eprintln!("[compose] path: claude_dead → restart");
+            eprintln!("[compose] path: claude_dead → trying restart, then direct send");
             let restarted = self.restart_claude_with_message(&thread, &content);
             if restarted {
                 self.show_toast("Restarting Claude with your message...", ToastStyle::Info);
@@ -3200,19 +3200,33 @@ impl App {
                         });
                 }
             } else {
-                eprintln!("[compose] restart failed — preserving message in buffer");
-                // Keep the message in the compose buffer so user doesn't lose it
-                self.thread_compose_buffer = content;
-                self.thread_compose_cursor = self.thread_compose_buffer.len();
-                self.input_buffer.clone_from(&self.thread_compose_buffer);
-                self.input_cursor = self.input_buffer.len();
-                self.show_toast(
-                    "Claude has exited — press l to relaunch, your message is preserved",
-                    ToastStyle::Error,
-                );
-                self.input_mode = InputMode::ThreadCompose;
-                self.thread_compose_thread_id = Some(thread.id.clone());
-                return Ok(());
+                // Restart failed — fall through to direct send instead of
+                // trapping the user in a loop. The message goes to the PTY
+                // (shell or dead terminal) but at least the user isn't stuck.
+                eprintln!("[compose] restart failed — falling through to direct send");
+                let sent = self.send_to_active_session_claude(&content)
+                    || self.send_prompt_to_live_thread_session(&thread, &content);
+                if sent {
+                    self.show_toast(
+                        "Sent (Claude may have exited — check Ctrl+O terminal)",
+                        ToastStyle::Info,
+                    );
+                    if let Some(ref mut cache) = self.conversation_cache {
+                        cache
+                            .entries
+                            .push(crate::conversation::ConversationEntry::UserMessage {
+                                timestamp: chrono::Utc::now()
+                                    .format("%Y-%m-%dT%H:%M:%S")
+                                    .to_string(),
+                                text: content,
+                            });
+                    }
+                } else {
+                    self.show_toast(
+                        "Claude has exited — press l to relaunch session",
+                        ToastStyle::Error,
+                    );
+                }
             }
         } else if claude_working {
             eprintln!("[compose] path: claude_working → queue");
