@@ -3539,6 +3539,44 @@ impl App {
             }
         }
 
+        // Let tab-switching and dashboard keys pass through compose mode
+        // so the user is never trapped in compose.
+        match (code, modifiers) {
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                // Save draft and go to dashboard
+                self.thread_compose_buffer = self.input_buffer.clone();
+                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                self.input_mode = InputMode::Normal;
+                self.active_tab = 0;
+                return Ok(());
+            }
+            (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                // Save draft and switch to next tab
+                self.thread_compose_buffer = self.input_buffer.clone();
+                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                self.input_mode = InputMode::Normal;
+                if self.tabs.len() > 1 {
+                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                }
+                return Ok(());
+            }
+            (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                // Save draft and switch to previous tab
+                self.thread_compose_buffer = self.input_buffer.clone();
+                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                self.input_mode = InputMode::Normal;
+                if self.tabs.len() > 1 {
+                    self.active_tab = if self.active_tab == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab - 1
+                    };
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
         match code {
             KeyCode::Esc => {
                 self.thread_compose_buffer = self.input_buffer.clone();
