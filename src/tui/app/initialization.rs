@@ -11,8 +11,8 @@ use ratatui::widgets::ListState;
 use crate::store::{Store, TaskStatus};
 
 use super::{
-    App, DeleteTarget, Focus, InputMode, PaletteAction, PaletteItem, Tab, ToastStyle,
-    build_project_summaries,
+    App, DeleteTarget, Focus, InputMode, InspectorTab, PaletteAction, PaletteItem, Tab, ToastStyle,
+    WorkbenchView, build_project_summaries,
 };
 
 impl App {
@@ -59,12 +59,13 @@ impl App {
             }
         }
 
-        let (sessions, tasks) = if let Some(project) = projects.first() {
+        let (sessions, tasks, threads) = if let Some(project) = projects.first() {
             let sessions = store.list_sessions_for_project(&project.id)?;
             let tasks = store.list_tasks_for_project(&project.id)?;
-            (sessions, tasks)
+            let threads = store.list_threads_for_project(&project.id)?;
+            (sessions, tasks, threads)
         } else {
-            (vec![], vec![])
+            (vec![], vec![], vec![])
         };
 
         let project_stats = projects
@@ -134,16 +135,31 @@ impl App {
         let (sc_tx, sc_rx) = mpsc::channel();
         let (so_tx, so_rx) = mpsc::channel();
         let (up_tx, up_rx) = mpsc::channel();
+        let (gh_tx, gh_rx) = mpsc::channel();
+        let (gm_tx, gm_rx) = mpsc::channel();
 
         let config = crate::config::load().unwrap_or_default();
         let theme = config.theme.build();
+        let github_settings_show_advanced =
+            crate::github_app::custom_app_configured(&config.github_app);
         let board_columns: Vec<String> = config
             .board
             .columns
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let config_warning = crate::configure::check_config_status();
+        let tool_status = super::ToolStatusSnapshot {
+            claude: crate::configure::check_command_exists("claude"),
+            codex: crate::configure::check_command_exists("codex"),
+            node: crate::configure::check_command_exists("node"),
+            gh: crate::configure::check_command_exists("gh"),
+            rtk: crate::configure::check_command_exists("rtk"),
+        };
+        let config_warning = crate::configure::check_config_status()
+            .filter(|warning| !warning.contains("rtk not installed"));
+        let github_status = crate::github_app::local_status(&config.github_app).unwrap_or_default();
+        let (gh_install_tx, gh_install_rx) = std::sync::mpsc::channel();
+        let (gh_sync_tx, gh_sync_rx) = std::sync::mpsc::channel();
 
         let mut app = App {
             store,
@@ -151,17 +167,60 @@ impl App {
             theme,
             keymap: super::super::keymap::KeyMap::default_keymap(),
             should_quit: false,
+            workbench_view: WorkbenchView::MyTasks,
+            inspector_tab: InspectorTab::Issue,
             focus: Focus::Projects,
             input_mode: InputMode::Normal,
+            leader_pending: false,
+            loading: true,
             tabs: vec![Tab::Dashboard],
             active_tab: 0,
             projects,
             sessions,
             tasks,
+            threads,
             project_summaries,
             project_stats,
+            tool_status,
+            github_status,
+            github_installations: vec![],
+            github_projects_v2: vec![],
+            sidebar_cursor: 0,
             project_index: 0,
             task_index: 0,
+            thread_index: 0,
+            review_index: 0,
+            review_queue_tab: super::ReviewQueueTab::Authored,
+            settings_section_index: 0,
+            github_installation_index: 0,
+            github_project_index: 0,
+            project_picker_index: 0,
+            github_settings_show_advanced,
+            my_task_items: vec![],
+            cached_my_task_indices: vec![],
+            inspector_scroll: 0,
+            workbench_sidebar_width: 30,
+            workbench_inspector_width: 56,
+            workbench_drag_target: None,
+            settings_edit_target: None,
+            settings_picker_options: vec![],
+            settings_picker_index: 0,
+            settings_picker_target: None,
+            launch_thread_draft: None,
+            launch_thread_field_index: 0,
+            thread_provider_picker_index: 0,
+            available_workflow_names: {
+                let mut names = vec![String::new()]; // "" = none
+                if let Ok(defs) = crate::workflows::load_workflow_definitions(None) {
+                    names.extend(defs.into_iter().map(|d| d.name));
+                }
+                names
+            },
+            thread_compose_thread_id: None,
+            thread_compose_buffer: String::new(),
+            thread_compose_cursor: 0,
+            slash_suggestions: vec![],
+            slash_suggestion_index: 0,
             task_list_state: ListState::default(),
             input_buffer: String::new(),
             input_cursor: 0,
@@ -180,15 +239,48 @@ impl App {
             board_columns,
             board_column_index: 0,
             board_issue_index: 0,
-            board_milestone_filter: None,
-            board_milestones: vec![],
-            board_milestone_index: 0,
+            board_project_title: None,
+            board_sprint_filter: None,
+            board_sprints: vec![],
+            board_sprint_index: 0,
+            board_scope: super::BoardScope::AssignedToMe,
             board_loading: false,
             board_error: None,
+            board_scroll_offset: 0,
+            board_confirm_close: false,
             board_filter: String::new(),
             board_filter_cursor: 0,
             board_first_load: true,
             board_all_issues: vec![],
+            board_source_items: vec![],
+            board_selected_comments: vec![],
+            my_task_selected_comments: vec![],
+            comment_compose_buffer: String::new(),
+            comment_compose_cursor: 0,
+            comment_compose_target: None,
+            comment_compose_return_mode: InputMode::BoardIssueDrawer,
+            github_issue_form_title: String::new(),
+            github_issue_form_body: String::new(),
+            github_issue_form_labels: String::new(),
+            github_issue_form_assignees: String::new(),
+            github_issue_form_field: 0,
+            github_issue_editing_number: None,
+            field_picker_options: vec![],
+            field_picker_index: 0,
+            field_picker_field_name: None,
+            field_picker_field_id: None,
+            field_picker_project_node_id: None,
+            field_picker_item_node_id: None,
+            github_mutation_tx: gm_tx,
+            github_mutation_rx: gm_rx,
+            review_authored_items: vec![],
+            review_requested_items: vec![],
+            review_selected_comments: vec![],
+            review_selected_reviews: vec![],
+            review_selected_review_comments: vec![],
+            inspector_expanded: false,
+            review_drawer_tab: super::ReviewDrawerTab::Description,
+            review_drawer_scroll: 0,
             path_suggestions: vec![],
             path_suggestion_index: 0,
             show_path_suggestions: false,
@@ -249,8 +341,15 @@ impl App {
             review_loop_spawned: HashSet::new(),
             last_slow_tick: Instant::now(),
             last_terminal_area: Rect::default(),
+            diff_preview_cache_key: None,
+            diff_preview_cache: String::new(),
+            diff_preview_generated_at: None,
             paused_sessions: HashSet::new(),
+            pty_activity_preview: HashMap::new(),
             waiting_sessions: HashSet::new(),
+            pty_idle_sessions: HashSet::new(),
+            working_no_indicator_since: HashMap::new(),
+            workflow_stage_injected: HashSet::new(),
             cached_visible_indices: Vec::new(),
             update_check_in_progress: Arc::new(AtomicBool::new(false)),
             config_warning,
@@ -260,6 +359,19 @@ impl App {
             last_update_check: Instant::now(),
             updated_version: None,
             available_version: None,
+            github_auth_in_progress: Arc::new(AtomicBool::new(false)),
+            github_auth_tx: gh_tx,
+            github_auth_rx: gh_rx,
+            github_auth_prompt: None,
+            github_auth_error: None,
+            github_installations_in_progress: Arc::new(AtomicBool::new(false)),
+            github_installations_tx: gh_install_tx,
+            github_installations_rx: gh_install_rx,
+            github_sync_in_progress: Arc::new(AtomicBool::new(false)),
+            github_sync_tx: gh_sync_tx,
+            github_sync_rx: gh_sync_rx,
+            conversation_cache: None,
+            quick_reply_choices: Vec::new(),
         };
 
         app.recompute_visible_tasks();

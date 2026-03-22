@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::store::TaskStatus;
 
@@ -11,6 +11,161 @@ use super::{
 };
 
 impl App {
+    pub(super) fn spawn_github_auth(&mut self) {
+        if self.github_auth_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let config = self.config.github_app.clone();
+        let use_app_auth = crate::github_app::app_auth_available(&config);
+        let flag = self.github_auth_in_progress.clone();
+        let tx = self.github_auth_tx.clone();
+        self.github_auth_error = None;
+        flag.store(true, Ordering::SeqCst);
+
+        std::thread::spawn(move || {
+            if use_app_auth {
+                let result = crate::github_app::authenticate_device_flow(&config, |event| {
+                    let _ = tx.send(event);
+                });
+                if let Err(error) = result {
+                    let _ = tx.send(crate::github_app::GitHubAuthMessage::Failed(
+                        error.to_string(),
+                    ));
+                }
+            } else {
+                match crate::github_app::github_cli_connect() {
+                    Ok(login) => {
+                        let _ = tx.send(crate::github_app::GitHubAuthMessage::CliSuccess(login));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(crate::github_app::GitHubAuthMessage::Failed(
+                            error.to_string(),
+                        ));
+                    }
+                }
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub(super) fn spawn_github_installations_fetch(&mut self) {
+        if self.github_installations_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let config = self.config.github_app.clone();
+        let flag = self.github_installations_in_progress.clone();
+        let tx = self.github_installations_tx.clone();
+        flag.store(true, Ordering::SeqCst);
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Vec<crate::github_app::GitHubInstallation>> {
+                let token = crate::github_app::ensure_access_token(&config)?
+                    .ok_or_else(|| anyhow::anyhow!("GitHub App is not authenticated"))?;
+                crate::github_app::list_installations(&token)
+            })()
+            .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub(super) fn poll_github_auth_results(&mut self) {
+        while let Ok(message) = self.github_auth_rx.try_recv() {
+            match message {
+                crate::github_app::GitHubAuthMessage::Prompt(prompt) => {
+                    self.github_auth_prompt = Some(prompt);
+                    self.github_auth_error = None;
+                }
+                crate::github_app::GitHubAuthMessage::Success(session) => {
+                    self.github_auth_prompt = None;
+                    self.github_auth_error = None;
+                    self.github_status = crate::github_app::local_status(&self.config.github_app)
+                        .unwrap_or_default();
+                    let login = session
+                        .user_login
+                        .as_deref()
+                        .unwrap_or("unknown user")
+                        .to_string();
+                    self.show_toast(
+                        format!("GitHub App authenticated as {login}"),
+                        ToastStyle::Success,
+                    );
+                    self.spawn_github_installations_fetch();
+                }
+                crate::github_app::GitHubAuthMessage::CliSuccess(login) => {
+                    self.github_auth_prompt = None;
+                    self.github_auth_error = None;
+                    self.github_status = crate::github_app::local_status(&self.config.github_app)
+                        .unwrap_or_default();
+                    self.show_toast(
+                        format!(
+                            "GitHub connected via CLI as {}",
+                            login.as_deref().unwrap_or("unknown user")
+                        ),
+                        ToastStyle::Success,
+                    );
+                }
+                crate::github_app::GitHubAuthMessage::Failed(error) => {
+                    self.github_auth_error = Some(error.clone());
+                    self.show_toast(format!("GitHub auth failed: {error}"), ToastStyle::Error);
+                }
+                crate::github_app::GitHubAuthMessage::Disconnected => {
+                    self.github_auth_prompt = None;
+                    self.github_auth_error = None;
+                    self.github_status = crate::github_app::local_status(&self.config.github_app)
+                        .unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    pub(super) fn poll_github_installation_results(&mut self) {
+        while let Ok(result) = self.github_installations_rx.try_recv() {
+            match result {
+                Ok(mut installations) => {
+                    installations.sort_by(|left, right| {
+                        left.account
+                            .login
+                            .cmp(&right.account.login)
+                            .then(left.id.cmp(&right.id))
+                    });
+                    self.github_installations = installations;
+                    if let Some(default_installation) = self
+                        .config
+                        .github_app
+                        .default_installation_id
+                        .as_deref()
+                        .and_then(|id| id.parse::<i64>().ok())
+                        && let Some(index) = self
+                            .github_installations
+                            .iter()
+                            .position(|installation| installation.id == default_installation)
+                    {
+                        self.github_installation_index = index;
+                    } else if self.github_installation_index >= self.github_installations.len() {
+                        self.github_installation_index =
+                            self.github_installations.len().saturating_sub(1);
+                    }
+                    self.show_toast(
+                        format!(
+                            "Loaded {} GitHub installation(s)",
+                            self.github_installations.len()
+                        ),
+                        ToastStyle::Success,
+                    );
+                }
+                Err(error) => {
+                    self.show_toast(
+                        format!("Failed to load GitHub installations: {error}"),
+                        ToastStyle::Error,
+                    );
+                }
+            }
+        }
+    }
+
     /// Spawn a background thread to fetch usage from the Anthropic OAuth API
     /// and write the result to the shared cache file.
     pub(super) fn spawn_usage_fetch(&self) {
@@ -428,80 +583,130 @@ impl App {
         }
     }
 
+    /// Drain background GitHub mutation results and update UI accordingly.
+    pub(super) fn poll_github_mutations(&mut self) {
+        while let Ok(result) = self.github_mutation_rx.try_recv() {
+            match result {
+                super::GitHubMutationResult::CommentCreated { message } => {
+                    self.show_toast(message, super::ToastStyle::Success);
+                    self.refresh_board_selected_comments();
+                }
+                super::GitHubMutationResult::StateChanged { message }
+                | super::GitHubMutationResult::IssueCreated { message }
+                | super::GitHubMutationResult::IssueEdited { message }
+                | super::GitHubMutationResult::FieldUpdated { message } => {
+                    self.show_toast(message, super::ToastStyle::Success);
+                    // Use the non-blocking cache read instead of a full GitHub sync
+                    // to avoid freezing the TUI on the main thread.
+                    self.load_board_issues_from_cache();
+                    self.refresh_board_selected_comments();
+                }
+                super::GitHubMutationResult::Error { message } => {
+                    self.show_toast(message, super::ToastStyle::Error);
+                }
+            }
+        }
+    }
+
     /// Drain background session operation results, spawn PTYs for new sessions, and show toasts.
     pub(super) fn poll_session_ops(&mut self) {
         while let Ok(result) = self.session_op_rx.try_recv() {
             match result {
                 SessionOpResult::Created(setup) => {
-                    let term_size = crossterm::terminal::size().unwrap_or((80, 24));
-                    let cols = term_size.0;
-                    let rows = term_size.1.saturating_sub(2);
+                    self.spawn_session_tab(*setup);
+                }
+                SessionOpResult::ThreadLaunched { result } => {
+                    let crate::threads::LaunchThreadResult {
+                        thread,
+                        workflow: _,
+                        session_setup,
+                    } = *result;
+                    let _ = self.refresh_data();
 
-                    // Claude terminal: spawn directly as a local PTY (same as shell)
-                    let wrapped = setup.claude_cmd.unwrap_or_else(|| {
-                        // No task: bare `claude` session
-                        crate::session::wrap_cmd_with_shell_fallback(vec!["claude".to_string()])
-                    });
-                    let claude_result = {
-                        let mut cmd = portable_pty::CommandBuilder::new(&wrapped[0]);
-                        for arg in &wrapped[1..] {
-                            cmd.arg(arg);
-                        }
-                        cmd.cwd(&setup.worktree_path);
-                        crate::pty::EmbeddedTerminal::spawn(cmd, rows, cols / 2)
-                    };
+                    // Step 1: spawn a new session tab from the setup if available
+                    if let Some(setup) = session_setup {
+                        let sid = setup.session.id.clone();
+                        self.spawn_session_tab(setup);
+                        // goto_session_tab also sets Conversation view mode
+                        let _ = self.goto_session_tab(&sid);
+                    }
 
-                    let terminals_result = match claude_result {
-                        Ok(claude) => {
-                            if let Some(ref layout_config) = self.config.layout {
-                                crate::pty::SessionTerminals::from_layout(
-                                    claude,
-                                    &setup.worktree_path,
-                                    layout_config,
-                                    rows,
-                                    cols,
-                                )
-                            } else {
-                                // Default: spawn shell + use from_parts
-                                let shell_path =
-                                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-                                let mut shell_cmd = portable_pty::CommandBuilder::new(&shell_path);
-                                shell_cmd.cwd(&setup.worktree_path);
-                                crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).map(
-                                    |shell| {
-                                        crate::pty::SessionTerminals::from_parts(
-                                            shell,
-                                            claude,
-                                            &setup.worktree_path,
-                                        )
-                                    },
-                                )
+                    // Step 2: ensure we're on a session tab — try every
+                    // strategy until one works.
+                    if self.active_session_id().is_none() {
+                        // Get a fresh session_id from the DB (the thread object
+                        // from the background thread may be stale).
+                        let fresh_sid = self
+                            .store
+                            .get_thread(&thread.id)
+                            .ok()
+                            .and_then(|t| t.session_id)
+                            .or_else(|| thread.session_id.clone());
+                        if let Some(ref sid) = fresh_sid {
+                            eprintln!("[claustre] Step2: trying goto_session_tab({sid})");
+                            if !self.goto_session_tab(sid) {
+                                eprintln!("[claustre] Step2: goto failed, trying restore");
+                                match self.store.get_session(sid) {
+                                    Ok(session) if session.closed_at.is_none() => {
+                                        eprintln!("[claustre] Step2: session open, restoring tab");
+                                        match self.restore_session_tab(&session) {
+                                            Ok(()) => {
+                                                eprintln!(
+                                                    "[claustre] Step2: restore OK, tabs={}",
+                                                    self.tabs.len()
+                                                );
+                                                let _ = self.goto_session_tab(sid);
+                                            }
+                                            Err(err) => {
+                                                eprintln!(
+                                                    "[claustre] Step2: restore FAILED: {err:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(session) => {
+                                        eprintln!(
+                                            "[claustre] Step2: session closed at {:?}",
+                                            session.closed_at
+                                        );
+                                    }
+                                    Err(err) => {
+                                        eprintln!("[claustre] Step2: get_session failed: {err:#}");
+                                    }
+                                }
                             }
+                        } else {
+                            eprintln!("[claustre] Step2: no session_id found");
                         }
-                        Err(e) => Err(e),
-                    };
+                    }
 
-                    match terminals_result {
-                        Ok(mut terminals) => {
-                            let sizes = compute_pane_sizes_for_resize(
-                                &terminals.layout,
-                                term_size.0,
-                                term_size.1,
-                            );
-                            let _ = terminals.resize_panes_with_clear(&sizes);
-                            self.add_session_tab(
-                                setup.session.id.clone(),
-                                Box::new(terminals),
-                                setup.tab_label,
-                            );
-                            self.show_toast("Session launched", ToastStyle::Success);
-                        }
-                        Err(e) => {
-                            self.show_toast(
-                                format!("Session launch failed: {e}"),
-                                ToastStyle::Error,
-                            );
-                        }
+                    // Step 3: absolute last resort — switch to most recent tab
+                    if self.active_session_id().is_none() && self.tabs.len() > 1 {
+                        self.active_tab = self.tabs.len() - 1;
+                    }
+
+                    let switched = self.active_session_id().is_some();
+                    if switched {
+                        self.show_toast(
+                            format!("Thread launched via {}", thread.provider_kind),
+                            ToastStyle::Success,
+                        );
+                    } else {
+                        self.show_toast(
+                            format!(
+                                "Thread launched via {} (no session tab — press Ctrl+K/J to find it)",
+                                thread.provider_kind
+                            ),
+                            ToastStyle::Info,
+                        );
+                        eprintln!(
+                            "[claustre] ThreadLaunched: tab switch failed. \
+                             thread_id={}, session_id={:?}, active_tab={}, tabs={}",
+                            thread.id,
+                            thread.session_id,
+                            self.active_tab,
+                            self.tabs.len(),
+                        );
                     }
                 }
                 SessionOpResult::CreatedNoTask { message }
@@ -526,4 +731,209 @@ impl App {
             self.show_toast(format!("Relaunch failed: {e}"), ToastStyle::Error);
         }
     }
+
+    fn spawn_session_tab(&mut self, setup: crate::session::SessionSetup) {
+        let term_size = crossterm::terminal::size().unwrap_or((80, 24));
+        let cols = term_size.0;
+        let rows = term_size.1.saturating_sub(2);
+
+        let wrapped = setup.claude_cmd.unwrap_or_else(|| {
+            crate::session::wrap_cmd_with_shell_fallback(vec!["claude".to_string()])
+        });
+
+        let agent_result: anyhow::Result<Box<dyn crate::pty::Terminal>> =
+            spawn_session_host_terminal(
+                &setup.session.id,
+                &setup.worktree_path,
+                &wrapped,
+                rows,
+                cols / 2,
+            )
+            .or_else(|host_err| {
+                // Fallback to in-process EmbeddedTerminal if session-host fails
+                eprintln!("session-host failed ({host_err}), falling back to embedded PTY");
+                let mut cmd = portable_pty::CommandBuilder::new(&wrapped[0]);
+                for arg in &wrapped[1..] {
+                    cmd.arg(arg);
+                }
+                cmd.cwd(&setup.worktree_path);
+                crate::pty::EmbeddedTerminal::spawn(cmd, rows, cols / 2)
+                    .map(|term| Box::new(term) as Box<dyn crate::pty::Terminal>)
+            });
+
+        let terminals_result = match agent_result {
+            Ok(agent) => {
+                if let Some(ref layout_config) = self.config.layout {
+                    crate::pty::SessionTerminals::from_layout(
+                        agent,
+                        &setup.worktree_path,
+                        layout_config,
+                        rows,
+                        cols,
+                    )
+                } else {
+                    let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let mut shell_cmd = portable_pty::CommandBuilder::new(&shell_path);
+                    shell_cmd.cwd(&setup.worktree_path);
+                    crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).map(|shell| {
+                        crate::pty::SessionTerminals::from_parts(shell, agent, &setup.worktree_path)
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        };
+
+        match terminals_result {
+            Ok(mut terminals) => {
+                let sizes =
+                    compute_pane_sizes_for_resize(&terminals.layout, term_size.0, term_size.1);
+                let _ = terminals.resize_panes_with_clear(&sizes);
+                self.add_session_tab(
+                    setup.session.id.clone(),
+                    Box::new(terminals),
+                    setup.tab_label,
+                );
+            }
+            Err(error) => {
+                self.show_toast(format!("Session launch failed: {error}"), ToastStyle::Error);
+            }
+        }
+    }
+
+    /// Spawn a background thread to sync GitHub data for the selected project.
+    pub(super) fn spawn_github_sync(&self) {
+        if self.github_sync_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        if !project.is_git_linked {
+            return;
+        }
+        let flag = self.github_sync_in_progress.clone();
+        flag.store(true, Ordering::SeqCst);
+        let tx = self.github_sync_tx.clone();
+        let db_path = crate::config::db_path().ok();
+        let selected_project_hint = self.config.github_app.default_project_id.clone();
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<crate::github::GitHubProjectBoardSnapshot, String> {
+                let path = db_path.ok_or_else(|| "cannot resolve db path".to_string())?;
+                let store = crate::store::Store::open_at(&path).map_err(|e| format!("db: {e}"))?;
+                // Full repo sync: issues, PRs, comments, Projects v2 items, linked PRs
+                let _ = crate::github::sync_project_repo(&store, &project)
+                    .map_err(|e| tracing::warn!("repo sync: {e:#}"));
+                // Then load the board snapshot from the updated cache
+                crate::github::load_project_board_from_cache(
+                    &store,
+                    &project,
+                    selected_project_hint.as_deref(),
+                )
+                .map_err(|e| format!("{e:#}"))
+            })();
+            let _ = tx.send(result);
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Drain results from a background GitHub sync.
+    pub(super) fn poll_github_sync_results(&mut self) {
+        while let Ok(result) = self.github_sync_rx.try_recv() {
+            match result {
+                Ok(snapshot) => {
+                    let selected_project_hint = self.config.github_app.default_project_id.clone();
+                    self.apply_board_snapshot(snapshot, selected_project_hint.as_deref());
+                    self.show_toast("GitHub sync complete", ToastStyle::Success);
+                }
+                Err(error) => {
+                    self.show_toast(format!("GitHub sync failed: {error}"), ToastStyle::Error);
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a `claustre session-host` subprocess for the given session, wait for
+/// its Unix socket to appear, and connect a `RemoteTerminal`.
+///
+/// Falls back to a direct `EmbeddedTerminal::spawn` if the session-host fails
+/// to start within the timeout.
+pub(super) fn spawn_session_host_terminal(
+    session_id: &str,
+    worktree_path: &str,
+    cmd_args: &[String],
+    rows: u16,
+    cols: u16,
+) -> Result<Box<dyn crate::pty::Terminal>> {
+    let claustre_exe = std::env::current_exe().context("failed to resolve claustre binary path")?;
+    let socket_path = crate::config::session_socket_path(session_id)?;
+
+    // Remove stale socket if it exists
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // Spawn session-host as a detached subprocess.
+    let mut host_cmd = std::process::Command::new(&claustre_exe);
+    host_cmd
+        .arg("session-host")
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--worktree-path")
+        .arg(worktree_path)
+        .arg("--");
+    for arg in cmd_args {
+        host_cmd.arg(arg);
+    }
+    let stderr_cfg = crate::config::base_dir()
+        .ok()
+        .and_then(|dir| std::fs::File::create(dir.join("session-host.log")).ok())
+        .map_or_else(std::process::Stdio::null, std::process::Stdio::from);
+    host_cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_cfg);
+
+    // SAFETY: setsid() is safe — it creates a new session so the child survives parent exit.
+    // pre_exec runs between fork and exec in the child process.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is an async-signal-safe POSIX function with no memory
+        // safety implications. Calling it between fork and exec is permitted.
+        unsafe {
+            host_cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    host_cmd
+        .spawn()
+        .context("failed to spawn claustre session-host")?;
+
+    // Wait for socket to appear (poll ~50ms intervals, max 2s)
+    let max_wait = Duration::from_secs(2);
+    let poll_interval = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    while start.elapsed() < max_wait {
+        if socket_path.exists() {
+            break;
+        }
+        std::thread::sleep(poll_interval);
+    }
+
+    if !socket_path.exists() {
+        anyhow::bail!(
+            "session-host socket did not appear at {} within {}s",
+            socket_path.display(),
+            max_wait.as_secs()
+        );
+    }
+
+    let remote = crate::pty::RemoteTerminal::connect(session_id, rows, cols)
+        .context("failed to connect to session-host")?;
+    Ok(Box::new(remote))
 }

@@ -162,6 +162,19 @@ pub struct TaskStatusCounts {
     pub error: usize,
 }
 
+impl TaskStatusCounts {
+    pub fn active_total(&self) -> usize {
+        self.draft
+            + self.pending
+            + self.working
+            + self.interrupted
+            + self.in_review
+            + self.conflict
+            + self.ci_failed
+            + self.error
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskMode {
@@ -423,6 +436,700 @@ pub struct ExternalSession {
     pub ended_at: Option<String>,
     pub last_scanned_at: String,
     pub jsonl_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubItemKind {
+    Issue,
+    PullRequest,
+    ProjectItem,
+}
+
+impl GitHubItemKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull_request",
+            Self::ProjectItem => "project_item",
+        }
+    }
+}
+
+impl fmt::Display for GitHubItemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for GitHubItemKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "issue" => Ok(Self::Issue),
+            "pull_request" | "pr" => Ok(Self::PullRequest),
+            "project_item" => Ok(Self::ProjectItem),
+            _ => Err(format!("unknown GitHub item kind: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Claude,
+    Codex,
+    Gemini,
+    Local,
+    Unknown,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Local => "local",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "gemini" => Ok(Self::Gemini),
+            "local" | "ollama" => Ok(Self::Local),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!("unknown provider kind: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatus {
+    Draft,
+    RuntimePreparing,
+    Ready,
+    Running,
+    WaitingUser,
+    WaitingReview,
+    Blocked,
+    Done,
+    Error,
+}
+
+impl ThreadStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::RuntimePreparing => "runtime_preparing",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::WaitingUser => "waiting_user",
+            Self::WaitingReview => "waiting_review",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for ThreadStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ThreadStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "draft" => Ok(Self::Draft),
+            "runtime_preparing" => Ok(Self::RuntimePreparing),
+            "ready" => Ok(Self::Ready),
+            "running" => Ok(Self::Running),
+            "waiting_user" => Ok(Self::WaitingUser),
+            "waiting_review" => Ok(Self::WaitingReview),
+            "blocked" => Ok(Self::Blocked),
+            "done" => Ok(Self::Done),
+            "error" => Ok(Self::Error),
+            _ => Err(format!("unknown thread status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadRunStatus {
+    Pending,
+    Running,
+    WaitingUser,
+    WaitingApproval,
+    Done,
+    Error,
+}
+
+impl ThreadRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingUser => "waiting_user",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for ThreadRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ThreadRunStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "waiting_user" => Ok(Self::WaitingUser),
+            "waiting_approval" => Ok(Self::WaitingApproval),
+            "done" => Ok(Self::Done),
+            "error" => Ok(Self::Error),
+            _ => Err(format!("unknown thread run status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentSource {
+    Clipboard,
+    File,
+}
+
+impl AttachmentSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::File => "file",
+        }
+    }
+}
+
+impl fmt::Display for AttachmentSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AttachmentSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "clipboard" => Ok(Self::Clipboard),
+            "file" => Ok(Self::File),
+            _ => Err(format!("unknown attachment source: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeServiceKind {
+    Command,
+    Compose,
+}
+
+impl RuntimeServiceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Compose => "compose",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeServiceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RuntimeServiceKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "command" => Ok(Self::Command),
+            "compose" => Ok(Self::Compose),
+            _ => Err(format!("unknown runtime service kind: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeServiceStatus {
+    Stopped,
+    Starting,
+    Running,
+    Healthy,
+    Failed,
+}
+
+impl RuntimeServiceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Healthy => "healthy",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeServiceStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RuntimeServiceStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stopped" => Ok(Self::Stopped),
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "healthy" => Ok(Self::Healthy),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("unknown runtime service status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunStatus {
+    Pending,
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl WorkflowRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl fmt::Display for WorkflowRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WorkflowRunStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "waiting_approval" => Ok(Self::WaitingApproval),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(format!("unknown workflow run status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStageStatus {
+    Pending,
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+impl WorkflowStageStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl fmt::Display for WorkflowStageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WorkflowStageStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "waiting_approval" => Ok(Self::WaitingApproval),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            _ => Err(format!("unknown workflow stage status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubRepoCache {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub owner: String,
+    pub name: String,
+    pub full_name: String,
+    pub repo_url: Option<String>,
+    pub default_branch: Option<String>,
+    pub synced_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubProjectV2Cache {
+    pub id: String,
+    pub repo_id: String,
+    pub project_number: i64,
+    pub title: String,
+    pub url: Option<String>,
+    pub node_id: Option<String>,
+    pub synced_at: Option<String>,
+    pub created_at: String,
+}
+
+impl GitHubProjectV2Cache {
+    pub fn display_label(&self) -> String {
+        format!("{} (#{})", self.title, self.project_number)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubItem {
+    pub id: String,
+    pub repo_id: String,
+    pub project_v2_id: Option<String>,
+    pub node_id: Option<String>,
+    pub number: i64,
+    pub kind: GitHubItemKind,
+    pub title: String,
+    pub state: String,
+    pub url: String,
+    pub body_text: Option<String>,
+    pub assignee_logins: Vec<String>,
+    pub label_names: Vec<String>,
+    /// Maps label name → hex colour string (e.g. `"d73a4a"`).
+    pub label_colors: serde_json::Value,
+    pub project_field_values: serde_json::Value,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    pub github_updated_at: Option<String>,
+    pub synced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub linked_pr_number: Option<i64>,
+    pub linked_pr_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubIssueCache {
+    pub item_id: String,
+    pub body: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub author_login: Option<String>,
+    pub milestone_title: Option<String>,
+    pub json_payload: Option<String>,
+    pub cached_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubPrCache {
+    pub item_id: String,
+    pub body: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub review_decision: Option<String>,
+    pub is_draft: bool,
+    pub json_payload: Option<String>,
+    pub cached_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubCommentCache {
+    pub id: String,
+    pub item_id: String,
+    pub github_comment_id: String,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub json_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubReviewCache {
+    pub id: String,
+    pub item_id: String,
+    pub github_review_id: String,
+    pub state: String,
+    pub commit_id: Option<String>,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub submitted_at: Option<String>,
+    pub json_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubReviewCommentCache {
+    pub id: String,
+    pub review_id: Option<String>,
+    pub item_id: String,
+    pub github_comment_id: String,
+    pub author_login: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub side: Option<String>,
+    pub start_line: Option<i64>,
+    pub diff_hunk: Option<String>,
+    pub in_reply_to_id: Option<String>,
+    pub body: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub json_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Thread {
+    pub id: String,
+    pub project_id: String,
+    pub github_item_id: Option<String>,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub title: String,
+    pub status: ThreadStatus,
+    pub provider_kind: ProviderKind,
+    pub provider_profile: Option<String>,
+    pub worktree_path: Option<String>,
+    pub branch_name: Option<String>,
+    pub runtime_profile: Option<String>,
+    pub workflow_run_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMessage {
+    pub id: String,
+    pub thread_id: String,
+    pub run_id: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub attachments: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRun {
+    pub id: String,
+    pub thread_id: String,
+    pub provider_kind: ProviderKind,
+    pub provider_profile: Option<String>,
+    pub status: ThreadRunStatus,
+    pub prompt: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadAttachment {
+    pub id: String,
+    pub thread_id: String,
+    pub message_id: Option<String>,
+    pub draft_key: Option<String>,
+    pub mime_type: String,
+    pub file_name: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub local_path: String,
+    pub source: AttachmentSource,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRuntimeState {
+    pub id: String,
+    pub thread_id: String,
+    pub profile_name: Option<String>,
+    pub build_status: Option<String>,
+    pub services_json: String,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeCard {
+    pub id: String,
+    pub project_id: String,
+    pub github_item_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub run_id: Option<String>,
+    pub repo_owner: Option<String>,
+    pub repo_name: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub content_md: String,
+    pub confidence: Option<f64>,
+    pub tags: Vec<String>,
+    pub source_commit: Option<String>,
+    pub source_branch: Option<String>,
+    pub extractor: Option<String>,
+    pub created_at: String,
+    pub accepted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDraft {
+    pub id: String,
+    pub project_id: String,
+    pub github_item_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub run_id: Option<String>,
+    pub repo_owner: Option<String>,
+    pub repo_name: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub content_md: String,
+    pub confidence: Option<f64>,
+    pub tags: Vec<String>,
+    pub source_commit: Option<String>,
+    pub source_branch: Option<String>,
+    pub extractor: Option<String>,
+    pub created_at: String,
+    pub promoted_card_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeLink {
+    pub id: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub relation: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDef {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub source_path: Option<String>,
+    pub description: Option<String>,
+    pub definition_yaml: String,
+    pub built_in: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub workflow_def_id: String,
+    pub thread_id: Option<String>,
+    pub github_item_id: Option<String>,
+    pub status: WorkflowRunStatus,
+    pub current_stage: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStageRun {
+    pub id: String,
+    pub workflow_run_id: String,
+    pub stage_name: String,
+    pub status: WorkflowStageStatus,
+    pub provider_kind: Option<ProviderKind>,
+    pub provider_profile: Option<String>,
+    pub runtime_profile: Option<String>,
+    pub prompt: Option<String>,
+    pub gate_state: Option<String>,
+    pub output_summary: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowArtifact {
+    pub id: String,
+    pub workflow_run_id: String,
+    pub stage_run_id: Option<String>,
+    pub artifact_name: String,
+    pub artifact_type: String,
+    pub local_path: Option<String>,
+    pub content_text: Option<String>,
+    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -709,5 +1416,52 @@ mod tests {
             all.len(),
             "each status must have a unique sort priority"
         );
+    }
+
+    #[test]
+    fn provider_kind_round_trip() {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+            ProviderKind::Local,
+            ProviderKind::Unknown,
+        ] {
+            assert_eq!(provider.as_str().parse::<ProviderKind>().unwrap(), provider);
+        }
+    }
+
+    #[test]
+    fn thread_status_round_trip() {
+        for status in [
+            ThreadStatus::Draft,
+            ThreadStatus::RuntimePreparing,
+            ThreadStatus::Ready,
+            ThreadStatus::Running,
+            ThreadStatus::WaitingUser,
+            ThreadStatus::WaitingReview,
+            ThreadStatus::Blocked,
+            ThreadStatus::Done,
+            ThreadStatus::Error,
+        ] {
+            assert_eq!(status.as_str().parse::<ThreadStatus>().unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn workflow_status_round_trip() {
+        for status in [
+            WorkflowRunStatus::Pending,
+            WorkflowRunStatus::Running,
+            WorkflowRunStatus::WaitingApproval,
+            WorkflowRunStatus::Completed,
+            WorkflowRunStatus::Failed,
+            WorkflowRunStatus::Cancelled,
+        ] {
+            assert_eq!(
+                status.as_str().parse::<WorkflowRunStatus>().unwrap(),
+                status
+            );
+        }
     }
 }
