@@ -383,8 +383,6 @@ impl App {
         if code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL {
             if self.interrupt_active_session_claude() {
                 self.show_toast("Sent interrupt (Ctrl+C) to Claude", ToastStyle::Info);
-                // Clear any queued message since user wants to interrupt
-                self.queued_compose_message = None;
             }
             return Ok(());
         }
@@ -2857,60 +2855,6 @@ impl App {
         self.input_mode = InputMode::ConfirmDelete;
     }
 
-    /// Drain a queued compose message if Claude has become idle.
-    /// Called on every tick after `detect_paused_sessions`.
-    pub(super) fn drain_queued_compose_message(&mut self) {
-        let Some((ref thread_id, _)) = self.queued_compose_message else {
-            return;
-        };
-        // Find the session tab for this thread
-        let session_id = self
-            .threads
-            .iter()
-            .find(|t| t.id == *thread_id)
-            .and_then(|t| t.session_id.clone());
-        let Some(ref sid) = session_id else {
-            return;
-        };
-        // Check if this session's Claude pane is now idle
-        let is_idle = self
-            .tabs
-            .iter()
-            .find_map(|tab| match tab {
-                Tab::Session {
-                    session_id: tab_sid,
-                    terminals,
-                    ..
-                } if tab_sid == sid => terminals
-                    .with_claude_live_screen(|screen| super::screen_shows_idle_prompt(screen)),
-                _ => None,
-            })
-            .unwrap_or(false);
-        if !is_idle {
-            return;
-        }
-        // Claude is idle — send the queued message now
-        let (thread_id, content) = self.queued_compose_message.take().expect("checked above");
-        if let Ok(thread) = self.store.get_thread(&thread_id) {
-            let sent = self.send_to_active_session_claude(&content)
-                || self.send_prompt_to_live_thread_session(&thread, &content);
-            if sent {
-                self.show_toast("Queued message sent to agent", ToastStyle::Success);
-                if let Some(ref mut cache) = self.conversation_cache {
-                    cache
-                        .entries
-                        .push(crate::conversation::ConversationEntry::UserMessage {
-                            timestamp: chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S")
-                                .to_string(),
-                            text: content,
-                        });
-                }
-            } else {
-                self.show_toast("Failed to send queued message", ToastStyle::Error);
-            }
-        }
-    }
 
     /// Check the Claude pane's screen state in the active session tab.
     /// Returns: `Some(true)` = Claude is at idle prompt (❯), `Some(false)` = Claude
@@ -3161,67 +3105,9 @@ impl App {
         // Clear quick-reply choices since the user is responding
         self.quick_reply_choices.clear();
 
-        // Check Claude's state before sending to avoid sending to the wrong target
-        let claude_idle = self.is_claude_idle_in_active_session();
-        let claude_exited = self.is_claude_exited_in_active_session();
-
-        if claude_exited {
-            // Claude has exited — restart it with the user's message
-            let restarted = self.restart_claude_with_message(&thread, &content);
-            if restarted {
-                self.show_toast("Resuming Claude session...", ToastStyle::Info);
-                if let Some(ref mut cache) = self.conversation_cache {
-                    cache
-                        .entries
-                        .push(crate::conversation::ConversationEntry::UserMessage {
-                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            text: content,
-                        });
-                }
-            } else {
-                self.show_toast(
-                    "Claude has exited — relaunch session to continue",
-                    ToastStyle::Error,
-                );
-            }
-
-            self.thread_compose_buffer.clear();
-            self.thread_compose_cursor = 0;
-            self.input_buffer.clear();
-            self.input_cursor = 0;
-            self.input_mode = InputMode::ThreadCompose;
-            self.thread_compose_thread_id = Some(thread.id.clone());
-            self.refresh_data()?;
-            return Ok(());
-        }
-
-        // Only queue when we're CERTAIN Claude is actively working:
-        // DB says Working AND session is NOT in the idle detection set AND
-        // the idle prompt is definitely not showing.
-        let session_db_working = thread.session_id.as_deref().is_some_and(|sid| {
-            self.sessions
-                .iter()
-                .any(|s| s.id == sid && s.claude_status == crate::store::ClaudeStatus::Working)
-                && !self.pty_idle_sessions.contains(sid)
-        });
-        if session_db_working && claude_idle == Some(false) {
-            // Claude is confirmed busy — queue the message for later
-            self.queued_compose_message = Some((thread.id.clone(), content));
-            self.show_toast(
-                "Message queued — Claude is busy. Will send when idle.",
-                ToastStyle::Info,
-            );
-
-            self.thread_compose_buffer.clear();
-            self.thread_compose_cursor = 0;
-            self.input_buffer.clear();
-            self.input_cursor = 0;
-            self.input_mode = InputMode::ThreadCompose;
-            self.thread_compose_thread_id = Some(thread.id.clone());
-            return Ok(());
-        }
-
-        // Claude is idle or state unknown — send directly
+        // Always send directly to the PTY. If Claude is busy, the input
+        // buffers in the PTY and Claude processes it after the current turn.
+        // No queueing — it was unreliable and blocked valid user messages.
         let sent = self.send_to_active_session_claude(&content)
             || self.send_prompt_to_live_thread_session(&thread, &content);
         if sent {

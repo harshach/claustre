@@ -946,9 +946,8 @@ pub(crate) struct App {
     // from "idle after injection (Claude finished processing)".
     pub workflow_stage_injected: HashSet<String>,
 
-    // Queued compose message: when the user sends a message while Claude is busy,
-    // store it here and inject it when Claude becomes idle (at ❯ prompt).
-    // (thread_id, message_content)
+    // Reserved for future use — message queueing was removed as unreliable.
+    #[expect(dead_code, reason = "field kept for binary compatibility during development")]
     pub queued_compose_message: Option<(String, String)>,
 
     // Cached result of visible_tasks() — indices into self.tasks, filtered and sorted.
