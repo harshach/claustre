@@ -192,6 +192,7 @@ impl App {
             review_index: 0,
             review_queue_tab: super::ReviewQueueTab::Authored,
             settings_section_index: 0,
+            settings_workflow_index: 0,
             github_installation_index: 0,
             github_project_index: 0,
             project_picker_index: 0,

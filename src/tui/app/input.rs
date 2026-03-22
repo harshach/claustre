@@ -1559,6 +1559,18 @@ impl App {
                 self.start_settings_edit(SettingsEditTarget::RuntimeAttachmentsDir);
                 Ok(true)
             }
+            KeyCode::Char('J') if section == SettingsSection::Workflows => {
+                let count = self.store.list_workflow_defs().map_or(0, |d| d.len());
+                if count > 0 {
+                    self.settings_workflow_index =
+                        (self.settings_workflow_index + 1).min(count.saturating_sub(1));
+                }
+                Ok(true)
+            }
+            KeyCode::Char('K') if section == SettingsSection::Workflows => {
+                self.settings_workflow_index = self.settings_workflow_index.saturating_sub(1);
+                Ok(true)
+            }
             KeyCode::Char('n') if section == SettingsSection::Workflows => {
                 // Create a minimal custom workflow with one stage
                 let name = format!("custom_{}", chrono::Utc::now().timestamp());
@@ -1577,15 +1589,8 @@ impl App {
                 };
                 match crate::workflows::save_workflow_definition(&definition) {
                     Ok(()) => {
-                        // Refresh available workflow names and sync to DB
                         let _ = crate::workflows::sync_workflow_definitions(&self.store, None);
-                        self.available_workflow_names = {
-                            let mut names = vec![String::new()];
-                            if let Ok(defs) = crate::workflows::load_workflow_definitions(None) {
-                                names.extend(defs.into_iter().map(|d| d.name));
-                            }
-                            names
-                        };
+                        self.refresh_available_workflow_names();
                         self.show_toast(format!("Created workflow: {name}"), ToastStyle::Success);
                     }
                     Err(err) => {
@@ -1598,27 +1603,26 @@ impl App {
                 Ok(true)
             }
             KeyCode::Char('d') if section == SettingsSection::Workflows => {
-                // Delete the selected custom workflow from the list
+                // Delete the currently selected custom workflow
                 let defs = self.store.list_workflow_defs().unwrap_or_default();
-                if let Some(def) = defs.first() {
+                if let Some(def) = defs.get(self.settings_workflow_index) {
                     if crate::workflows::is_builtin_workflow(&def.name) {
                         self.show_toast("Cannot delete built-in workflows", ToastStyle::Info);
                     } else {
-                        match crate::workflows::delete_workflow_definition(&def.name) {
+                        let name = def.name.clone();
+                        match crate::workflows::delete_workflow_definition(&name) {
                             Ok(true) => {
                                 let _ =
                                     crate::workflows::sync_workflow_definitions(&self.store, None);
-                                self.available_workflow_names = {
-                                    let mut names = vec![String::new()];
-                                    if let Ok(defs) =
-                                        crate::workflows::load_workflow_definitions(None)
-                                    {
-                                        names.extend(defs.into_iter().map(|d| d.name));
-                                    }
-                                    names
-                                };
+                                self.refresh_available_workflow_names();
+                                // Adjust selection if we deleted the last item
+                                let new_count =
+                                    self.store.list_workflow_defs().map_or(0, |d| d.len());
+                                if self.settings_workflow_index >= new_count && new_count > 0 {
+                                    self.settings_workflow_index = new_count - 1;
+                                }
                                 self.show_toast(
-                                    format!("Deleted workflow: {}", def.name),
+                                    format!("Deleted workflow: {name}"),
                                     ToastStyle::Success,
                                 );
                             }
@@ -1632,6 +1636,23 @@ impl App {
                                 );
                             }
                         }
+                    }
+                }
+                Ok(true)
+            }
+            KeyCode::Char('e') if section == SettingsSection::Workflows => {
+                // Edit the selected workflow's name (custom only)
+                let defs = self.store.list_workflow_defs().unwrap_or_default();
+                if let Some(def) = defs.get(self.settings_workflow_index) {
+                    if crate::workflows::is_builtin_workflow(&def.name) {
+                        self.show_toast("Cannot edit built-in workflows", ToastStyle::Info);
+                    } else {
+                        // Use the input buffer for inline editing
+                        self.input_buffer = def.name.clone();
+                        self.input_cursor = self.input_buffer.len();
+                        self.input_mode = InputMode::SettingsEdit;
+                        self.settings_edit_target =
+                            Some(SettingsEditTarget::WorkflowName);
                     }
                 }
                 Ok(true)
@@ -2018,6 +2039,16 @@ impl App {
         crate::config::save_settings_config(&self.config)?;
         self.show_toast(format!("Saved {label}"), ToastStyle::Success);
         Ok(())
+    }
+
+    fn refresh_available_workflow_names(&mut self) {
+        self.available_workflow_names = {
+            let mut names = vec![String::new()];
+            if let Ok(defs) = crate::workflows::load_workflow_definitions(None) {
+                names.extend(defs.into_iter().map(|d| d.name));
+            }
+            names
+        };
     }
 
     fn selected_launch_thread_field(&self) -> LaunchThreadField {
@@ -3648,24 +3679,61 @@ impl App {
                     self.input_mode = InputMode::Normal;
                     return Ok(());
                 };
-                target.apply(&mut self.config, &self.input_buffer)?;
-                if matches!(
-                    target,
-                    SettingsEditTarget::ClientId
-                        | SettingsEditTarget::AppSlug
-                        | SettingsEditTarget::InstallUrl
-                        | SettingsEditTarget::RelayUrl
-                        | SettingsEditTarget::InstallationId
-                ) {
-                    crate::config::save_github_app_config(&self.config.github_app)?;
+                if target == SettingsEditTarget::WorkflowName {
+                    // Special handling: rename workflow file
+                    let new_name = self.input_buffer.trim().to_string();
+                    if new_name.is_empty() {
+                        self.show_toast("Workflow name cannot be empty", ToastStyle::Error);
+                        return Ok(());
+                    }
+                    let defs = self.store.list_workflow_defs().unwrap_or_default();
+                    if let Some(old_def) = defs.get(self.settings_workflow_index) {
+                        let old_name = old_def.name.clone();
+                        if old_name != new_name {
+                            // Load, rename, save new, delete old
+                            if let Ok(mut definition) =
+                                serde_yaml::from_str::<crate::workflows::WorkflowDefinition>(
+                                    &old_def.definition_yaml,
+                                )
+                            {
+                                definition.name = new_name.clone();
+                                let _ = crate::workflows::save_workflow_definition(&definition);
+                                let _ = crate::workflows::delete_workflow_definition(&old_name);
+                                let _ = crate::workflows::sync_workflow_definitions(
+                                    &self.store,
+                                    None,
+                                );
+                                self.refresh_available_workflow_names();
+                                self.show_toast(
+                                    format!("Renamed: {old_name} → {new_name}"),
+                                    ToastStyle::Success,
+                                );
+                            }
+                        }
+                    }
+                    self.settings_edit_target = None;
+                    self.input_mode = InputMode::Normal;
                 } else {
-                    crate::config::save_settings_config(&self.config)?;
+                    target.apply(&mut self.config, &self.input_buffer)?;
+                    if matches!(
+                        target,
+                        SettingsEditTarget::ClientId
+                            | SettingsEditTarget::AppSlug
+                            | SettingsEditTarget::InstallUrl
+                            | SettingsEditTarget::RelayUrl
+                            | SettingsEditTarget::InstallationId
+                    ) {
+                        crate::config::save_github_app_config(&self.config.github_app)?;
+                    } else {
+                        crate::config::save_settings_config(&self.config)?;
+                    }
+                    self.github_status =
+                        crate::github_app::local_status(&self.config.github_app)
+                            .unwrap_or_default();
+                    self.settings_edit_target = None;
+                    self.input_mode = InputMode::Normal;
+                    self.show_toast(format!("Saved {}", target.label()), ToastStyle::Success);
                 }
-                self.github_status =
-                    crate::github_app::local_status(&self.config.github_app).unwrap_or_default();
-                self.settings_edit_target = None;
-                self.input_mode = InputMode::Normal;
-                self.show_toast(format!("Saved {}", target.label()), ToastStyle::Success);
             }
             _ => {
                 let _ = apply_text_edit(

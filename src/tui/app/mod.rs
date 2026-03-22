@@ -222,6 +222,7 @@ pub(crate) enum SettingsEditTarget {
     RuntimeDefaultProfile,
     RuntimeSandboxPath,
     RuntimeAttachmentsDir,
+    WorkflowName,
     ClientId,
     AppSlug,
     InstallUrl,
@@ -243,6 +244,7 @@ impl SettingsEditTarget {
             Self::RuntimeDefaultProfile => "Default Runtime Profile",
             Self::RuntimeSandboxPath => "Sandbox Path",
             Self::RuntimeAttachmentsDir => "Attachments Directory",
+            Self::WorkflowName => "Workflow Name",
             Self::ClientId => "GitHub Client ID",
             Self::AppSlug => "GitHub App Slug",
             Self::InstallUrl => "GitHub Install URL",
@@ -268,6 +270,7 @@ impl SettingsEditTarget {
             Self::RuntimeAttachmentsDir => {
                 config.runtime.attachments_dir.clone().unwrap_or_default()
             }
+            Self::WorkflowName => String::new(), // handled specially in settings key handler
             Self::ClientId => config.github_app.client_id.clone().unwrap_or_default(),
             Self::AppSlug => config.github_app.app_slug.clone().unwrap_or_default(),
             Self::InstallUrl => config.github_app.install_url.clone().unwrap_or_default(),
@@ -329,6 +332,10 @@ impl SettingsEditTarget {
             }
             Self::RuntimeAttachmentsDir => {
                 config.runtime.attachments_dir = (!value.is_empty()).then(|| value.to_string());
+            }
+            Self::WorkflowName => {
+                // Handled specially in handle_settings_edit_key — workflow rename
+                // requires file operations, not just config changes.
             }
             Self::ClientId => {
                 config.github_app.client_id = (!value.is_empty()).then(|| value.to_string());
@@ -678,6 +685,7 @@ pub(crate) struct App {
     pub review_index: usize,
     pub review_queue_tab: ReviewQueueTab,
     pub settings_section_index: usize,
+    pub settings_workflow_index: usize,
     pub github_installation_index: usize,
     pub github_project_index: usize,
     pub project_picker_index: usize,

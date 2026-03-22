@@ -2646,39 +2646,113 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled("Workflows", heading)));
             lines.push(Line::from(""));
             if workflow_defs.is_empty() {
-                lines.push(Line::from(Span::styled("  No workflows defined.", dim)));
+                lines.push(Line::from(Span::styled(
+                    "  No workflows defined. Press [n] to create one.",
+                    dim,
+                )));
             } else {
-                for def in &workflow_defs {
+                let selected_idx = app.settings_workflow_index;
+                for (i, def) in workflow_defs.iter().enumerate() {
+                    let is_selected = i == selected_idx;
                     let scope_label = match def.scope.as_str() {
                         "builtin" => "[built-in]",
                         "repo" => "[repo]",
                         _ => "[custom]",
                     };
-                    let stage_count: usize = serde_yaml::from_str::<
-                        crate::workflows::WorkflowDefinition,
-                    >(&def.definition_yaml)
-                    .map_or(0, |d| d.stages.len());
+                    let parsed: Option<crate::workflows::WorkflowDefinition> =
+                        serde_yaml::from_str(&def.definition_yaml).ok();
+                    let stage_count = parsed.as_ref().map_or(0, |d| d.stages.len());
                     let scope_style = if def.scope == "builtin" { dim } else { on_s };
+                    let marker = if is_selected { "\u{25B8} " } else { "  " };
+                    let name_style = if is_selected {
+                        Style::default()
+                            .fg(theme.accent_primary)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text_primary)
+                    };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {:<24}", def.name),
-                            Style::default().fg(theme.text_primary),
-                        ),
+                        Span::styled(marker, name_style),
+                        Span::styled(format!("{:<24}", def.name), name_style),
                         Span::styled(
                             format!("{stage_count} stages  "),
                             Style::default().fg(theme.text_secondary),
                         ),
                         Span::styled(scope_label, scope_style),
                     ]));
+
+                    // Show stage details for the selected workflow
+                    if is_selected {
+                        if let Some(ref description) = def.description {
+                            lines.push(Line::from(Span::styled(
+                                format!("    {description}"),
+                                Style::default().fg(theme.text_secondary),
+                            )));
+                        }
+                        if let Some(ref def) = parsed {
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(Span::styled(
+                                "    Stages:",
+                                Style::default()
+                                    .fg(theme.text_primary)
+                                    .add_modifier(Modifier::BOLD),
+                            )));
+                            for (si, stage) in def.stages.iter().enumerate() {
+                                let gate_marker = if stage.gate.is_some() {
+                                    " \u{23F8}"
+                                } else {
+                                    ""
+                                };
+                                let provider = stage
+                                    .provider
+                                    .as_deref()
+                                    .unwrap_or("none");
+                                let prompt_hint = stage
+                                    .prompt_template
+                                    .as_deref()
+                                    .map(|p| {
+                                        if p.len() > 40 {
+                                            format!(" \u{2192} {}...", &p[..37])
+                                        } else {
+                                            format!(" \u{2192} {p}")
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                lines.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("    {}. ", si + 1),
+                                        Style::default().fg(theme.text_secondary),
+                                    ),
+                                    Span::styled(
+                                        format!("{}{gate_marker}", stage.name),
+                                        Style::default().fg(theme.accent_tertiary),
+                                    ),
+                                    Span::styled(
+                                        format!("  [{provider}]"),
+                                        Style::default().fg(theme.text_secondary),
+                                    ),
+                                    Span::styled(
+                                        prompt_hint,
+                                        Style::default().fg(theme.text_secondary),
+                                    ),
+                                ]));
+                            }
+                        }
+                        lines.push(Line::from(""));
+                    }
                 }
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  ", dim),
                 Span::styled("[n]", key_s),
-                Span::styled(" New workflow  ", dim),
+                Span::styled(" New  ", dim),
+                Span::styled("[e]", key_s),
+                Span::styled(" Edit name  ", dim),
                 Span::styled("[d]", key_s),
-                Span::styled(" Delete (custom only)", dim),
+                Span::styled(" Delete  ", dim),
+                Span::styled("[j/k]", key_s),
+                Span::styled(" Navigate", dim),
             ]));
         }
         SettingsSection::General => {
@@ -3891,7 +3965,7 @@ fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
                 " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  Enter/i:interval  p:prompt  Tab:cycle focus "
             }
             SettingsSection::Workflows => {
-                " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  n:new  d:delete  Tab:cycle focus "
+                " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  J/K:workflow  n:new  e:edit  d:delete  Tab:cycle focus "
             }
             SettingsSection::Sandbox => {
                 " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  Enter/p:profile  s:path  a:attachments  Tab:cycle focus "
