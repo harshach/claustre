@@ -1250,9 +1250,11 @@ pub(super) fn draw_thread_chat(
     };
     // Line 1: title on left, session status on right
     let status_color = match session_state {
-        "live" => app.theme.status_working,
-        "claude exited" | "no session" | "closed" => app.theme.status_error,
-        "needs approval" | "waiting for input" => app.theme.status_paused,
+        "working" => app.theme.status_working,
+        "idle" => app.theme.accent_tertiary,
+        "claude exited" | "no session" | "closed" | "error" => app.theme.status_error,
+        "needs approval" | "waiting for input" | "interrupted" => app.theme.status_paused,
+        "done" => app.theme.status_done,
         _ => app.theme.accent_tertiary,
     };
     let status_right = format!(
@@ -1810,8 +1812,19 @@ fn thread_session_state(app: &App, thread: &crate::store::Thread) -> &'static st
     let session = app.sessions.iter().find(|session| session.id == session_id);
     match session {
         Some(session) if session.closed_at.is_some() => "closed",
-        Some(_) => {
-            // Session is open in DB — but is Claude actually alive?
+        Some(session) => {
+            // Check if a session tab exists and Claude pane is alive
+            let has_live_tab = app.tabs.iter().any(|tab| {
+                matches!(tab, super::super::app::Tab::Session { session_id: sid, terminals, .. }
+                    if sid == session_id
+                    && terminals.with_claude_live_screen(|_| ()).is_some())
+            });
+
+            if !has_live_tab {
+                // No tab or Claude pane exited
+                return "claude exited";
+            }
+
             if app.pty_idle_sessions.contains(session_id) {
                 "claude exited"
             } else if app.paused_sessions.contains(session_id) {
@@ -1819,7 +1832,13 @@ fn thread_session_state(app: &App, thread: &crate::store::Thread) -> &'static st
             } else if app.waiting_sessions.contains(session_id) {
                 "waiting for input"
             } else {
-                "live"
+                match session.claude_status {
+                    crate::store::ClaudeStatus::Idle => "idle",
+                    crate::store::ClaudeStatus::Working => "working",
+                    crate::store::ClaudeStatus::Interrupted => "interrupted",
+                    crate::store::ClaudeStatus::Done => "done",
+                    crate::store::ClaudeStatus::Error => "error",
+                }
             }
         }
         None => "no session",
