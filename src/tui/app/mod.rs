@@ -951,6 +951,11 @@ pub(crate) struct App {
     // Ctrl+C to interrupt Claude and force-send the queued message.
     pub queued_compose_message: Option<(String, String)>,
 
+    // Compose history: stores previously sent messages so the user can cycle
+    // through them with Up/Down arrows (like shell history). Never lose a message.
+    pub compose_history: Vec<String>,
+    pub compose_history_index: Option<usize>,
+
     // Cached result of visible_tasks() — indices into self.tasks, filtered and sorted.
     // Recomputed by recompute_visible_tasks() after data changes.
     cached_visible_indices: Vec<usize>,

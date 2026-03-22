@@ -352,6 +352,8 @@ impl App {
             working_no_indicator_since: HashMap::new(),
             workflow_stage_injected: HashSet::new(),
             queued_compose_message: None,
+            compose_history: Vec::new(),
+            compose_history_index: None,
             cached_visible_indices: Vec::new(),
             update_check_in_progress: Arc::new(AtomicBool::new(false)),
             config_warning,

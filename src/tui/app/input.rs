@@ -3132,10 +3132,16 @@ impl App {
         };
 
         let content = self.thread_compose_buffer.trim().to_string();
+        eprintln!("[compose] submit called, content={:?}, thread_id={thread_id}", content.chars().take(40).collect::<String>());
         if content.is_empty() {
+            eprintln!("[compose] empty content, aborting");
             self.show_toast("Compose a message first", ToastStyle::Info);
             return Ok(());
         }
+
+        // Record in compose history so user can cycle back with Up arrow
+        self.compose_history.push(content.clone());
+        self.compose_history_index = None;
 
         let thread = self.store.get_thread(&thread_id)?;
         let latest_run_id = self
@@ -3174,8 +3180,14 @@ impl App {
                 && self.is_claude_idle_in_active_session() != Some(true)
         });
 
+        eprintln!(
+            "[compose] state: session_id={:?}, claude_dead={claude_dead}, claude_working={claude_working}, idle={:?}",
+            session_id,
+            self.is_claude_idle_in_active_session()
+        );
+
         if claude_dead {
-            // Claude process exited — restart with --resume and the message
+            eprintln!("[compose] path: claude_dead → restart");
             let restarted = self.restart_claude_with_message(&thread, &content);
             if restarted {
                 self.show_toast("Restarting Claude with your message...", ToastStyle::Info);
@@ -3188,22 +3200,32 @@ impl App {
                         });
                 }
             } else {
+                eprintln!("[compose] restart failed — preserving message in buffer");
+                // Keep the message in the compose buffer so user doesn't lose it
+                self.thread_compose_buffer = content;
+                self.thread_compose_cursor = self.thread_compose_buffer.len();
+                self.input_buffer.clone_from(&self.thread_compose_buffer);
+                self.input_cursor = self.input_buffer.len();
                 self.show_toast(
-                    "Claude has exited — relaunch session to continue",
+                    "Claude has exited — press l to relaunch, your message is preserved",
                     ToastStyle::Error,
                 );
+                self.input_mode = InputMode::ThreadCompose;
+                self.thread_compose_thread_id = Some(thread.id.clone());
+                return Ok(());
             }
         } else if claude_working {
-            // Claude is actively working — queue message for delivery when idle
+            eprintln!("[compose] path: claude_working → queue");
             self.queued_compose_message = Some((thread.id.clone(), content));
             self.show_toast(
                 "Message queued — will send when Claude finishes",
                 ToastStyle::Info,
             );
         } else {
-            // Claude is idle or state unknown — send directly
-            let sent = self.send_to_active_session_claude(&content)
-                || self.send_prompt_to_live_thread_session(&thread, &content);
+            eprintln!("[compose] path: idle/unknown → send directly");
+            let sent_active = self.send_to_active_session_claude(&content);
+            let sent = sent_active || self.send_prompt_to_live_thread_session(&thread, &content);
+            eprintln!("[compose] send result: sent_active={sent_active}, sent={sent}");
             if sent {
                 self.show_toast("Sent to agent", ToastStyle::Success);
                 if let Some(ref mut cache) = self.conversation_cache {
@@ -3575,6 +3597,35 @@ impl App {
             KeyCode::Char('v') if modifiers == KeyModifiers::CONTROL => {
                 self.smart_paste_into_compose()?;
             }
+            // Up arrow: cycle to previous compose history entry
+            KeyCode::Up if modifiers.is_empty() && !self.compose_history.is_empty() => {
+                let new_idx = match self.compose_history_index {
+                    None => self.compose_history.len() - 1,
+                    Some(0) => 0,
+                    Some(i) => i - 1,
+                };
+                self.compose_history_index = Some(new_idx);
+                self.input_buffer.clone_from(&self.compose_history[new_idx]);
+                self.input_cursor = self.input_buffer.len();
+                self.thread_compose_buffer.clone_from(&self.input_buffer);
+                self.thread_compose_cursor = self.input_cursor;
+            }
+            // Down arrow: cycle to next compose history entry (or clear)
+            KeyCode::Down if modifiers.is_empty() && self.compose_history_index.is_some() => {
+                let current = self.compose_history_index.unwrap();
+                if current + 1 < self.compose_history.len() {
+                    let new_idx = current + 1;
+                    self.compose_history_index = Some(new_idx);
+                    self.input_buffer.clone_from(&self.compose_history[new_idx]);
+                } else {
+                    // Past the end — clear to empty (new message)
+                    self.compose_history_index = None;
+                    self.input_buffer.clear();
+                }
+                self.input_cursor = self.input_buffer.len();
+                self.thread_compose_buffer.clone_from(&self.input_buffer);
+                self.thread_compose_cursor = self.input_cursor;
+            }
             _ => {
                 let _ = apply_text_edit(
                     &mut self.input_buffer,
@@ -3587,6 +3638,8 @@ impl App {
 
                 // Update slash command suggestions
                 self.update_slash_suggestions();
+                // Reset history browsing when user types
+                self.compose_history_index = None;
             }
         }
         Ok(())
