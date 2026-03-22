@@ -98,18 +98,35 @@ impl App {
                     }
                 }
                 AppEvent::Tick => {
+                    if self.loading {
+                        self.refresh_data()?;
+                        self.loading = false;
+                    }
                     self.process_pty_output();
                     self.detect_paused_sessions();
+                    self.drain_queued_compose_message();
+                    self.cache_pty_activity_previews();
 
                     // Fast-path tick work (always runs)
                     self.tick_toast();
                     self.poll_title_results()?;
                     self.poll_session_ops();
+                    self.poll_github_mutations();
+                    self.poll_github_sync_results();
                     self.auto_launch_pending_tasks();
                     self.poll_pr_merge_results()?;
                     self.poll_git_stats_results();
                     self.poll_scanner_results();
+                    self.poll_github_auth_results();
+                    self.poll_github_installation_results();
                     self.poll_update_results();
+                    // Refresh JSONL conversation on every tick when on a
+                    // session tab so new messages appear quickly.  The method
+                    // does an mtime check internally and is a no-op when the
+                    // file hasn't changed.
+                    if self.active_tab > 0 {
+                        self.refresh_conversation_cache();
+                    }
 
                     // Slow-path tick work (DB refresh, background polls)
                     // Throttled on all tabs: dashboard ticks are now 200 ms,
@@ -123,6 +140,8 @@ impl App {
                         self.maybe_poll_update_check();
                         self.maybe_teardown_push_mode_sessions();
                         self.refresh_data()?;
+                        self.refresh_conversation_cache();
+                        self.maybe_advance_workflow_stages();
                     }
                 }
                 AppEvent::Resize(cols, rows) => {
