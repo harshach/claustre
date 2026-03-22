@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::store::TaskStatus;
 
 use super::{
-    App, Tab, ToastStyle, compute_pane_sizes_for_resize, screen_shows_idle_prompt,
+    App, InputMode, Tab, ToastStyle, compute_pane_sizes_for_resize, screen_shows_idle_prompt,
     screen_shows_permission_prompt, screen_shows_question_prompt,
 };
 
@@ -178,6 +178,9 @@ impl App {
     pub(super) fn next_tab(&mut self) {
         if self.tabs.len() > 1 {
             self.active_tab = (self.active_tab + 1) % self.tabs.len();
+            // Always reset input mode when switching tabs to prevent
+            // compose/edit modes from leaking across tabs.
+            self.input_mode = InputMode::Normal;
         }
     }
 
@@ -189,6 +192,7 @@ impl App {
             } else {
                 self.active_tab -= 1;
             }
+            self.input_mode = InputMode::Normal;
         }
     }
 

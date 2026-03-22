@@ -194,6 +194,7 @@ impl App {
         use super::super::keymap::Action;
         match action {
             Action::ReturnToDashboard => {
+                self.input_mode = InputMode::Normal;
                 self.active_tab = 0;
             }
             Action::FocusPrevPane => {
@@ -315,6 +316,7 @@ impl App {
 
         match action {
             Action::ReturnToDashboard => {
+                self.input_mode = InputMode::Normal;
                 self.active_tab = 0;
             }
             Action::PrevTab => self.prev_tab(),
