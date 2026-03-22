@@ -382,6 +382,33 @@ impl App {
 
         // Reconnect to any session-host processes that survived a TUI restart
         app.reconnect_running_sessions();
+
+        // Fix stale claude_status: sessions that show Working in the DB but
+        // whose session-host is dead or tab restoration failed should be Idle.
+        for session in &app.sessions {
+            if session.closed_at.is_none()
+                && session.claude_status == crate::store::ClaudeStatus::Working
+            {
+                let has_tab = app.tabs.iter().any(|tab| {
+                    matches!(tab, super::Tab::Session { session_id, .. } if *session_id == session.id)
+                });
+                if !has_tab {
+                    let _ = app.store.update_session_status(
+                        &session.id,
+                        crate::store::ClaudeStatus::Idle,
+                        "Session restored — Claude status unknown",
+                    );
+                }
+            }
+        }
+        // Refresh sessions to pick up the status updates
+        if let Some(project) = app.projects.first() {
+            app.sessions = app
+                .store
+                .list_sessions_for_project(&project.id)
+                .unwrap_or_default();
+        }
+
         // Always start on the dashboard, even if sessions were restored above
         app.active_tab = 0;
 
