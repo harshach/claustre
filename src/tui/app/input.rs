@@ -533,6 +533,10 @@ impl App {
                     self.close_active_thread_session()?;
                     return Ok(());
                 }
+                KeyCode::Char('R') => {
+                    self.restart_claude_in_session()?;
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -3091,6 +3095,45 @@ impl App {
         true
     }
 
+    /// Restart Claude in the current session. Closes the dead session and
+    /// relaunches the thread — preserving worktree, branch, and conversation.
+    fn restart_claude_in_session(&mut self) -> Result<()> {
+        let Some(thread) = self.active_session_thread() else {
+            self.show_toast("No active thread", ToastStyle::Info);
+            return Ok(());
+        };
+        self.show_toast("Restarting Claude session...", ToastStyle::Info);
+
+        // Close the dead session's tab
+        if let Some(session_id) = thread.session_id.clone() {
+            self.store.close_session(&session_id)?;
+            self.remove_session_tab(&session_id);
+        }
+
+        // Relaunch the thread (creates new worktree + session + PTY)
+        let thread_id = thread.id.clone();
+        let tx = self.session_op_tx.clone();
+        let cfg = self.config.clone();
+        self.session_op_in_progress = true;
+        std::thread::spawn(move || {
+            let result = match crate::store::Store::open() {
+                Ok(store) => match crate::threads::relaunch_thread(&store, &cfg, &thread_id) {
+                    Ok(result) => super::SessionOpResult::ThreadLaunched {
+                        result: Box::new(result),
+                    },
+                    Err(error) => super::SessionOpResult::Error {
+                        message: format!("Restart failed: {error}"),
+                    },
+                },
+                Err(error) => super::SessionOpResult::Error {
+                    message: format!("Restart failed (DB): {error}"),
+                },
+            };
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+
     fn approve_active_workflow_gate(&mut self) -> Result<()> {
         let Some(thread) = self.active_session_thread() else {
             return Ok(());
@@ -3187,7 +3230,7 @@ impl App {
         );
 
         if claude_dead {
-            eprintln!("[compose] path: claude_dead → trying restart, then direct send");
+            // Claude is dead — try restart, then direct send, then tell user
             let restarted = self.restart_claude_with_message(&thread, &content);
             if restarted {
                 self.show_toast("Restarting Claude with your message...", ToastStyle::Info);
@@ -3200,30 +3243,13 @@ impl App {
                         });
                 }
             } else {
-                // Restart failed — fall through to direct send instead of
-                // trapping the user in a loop. The message goes to the PTY
-                // (shell or dead terminal) but at least the user isn't stuck.
-                eprintln!("[compose] restart failed — falling through to direct send");
+                // Restart failed — try direct send as fallback
                 let sent = self.send_to_active_session_claude(&content)
                     || self.send_prompt_to_live_thread_session(&thread, &content);
-                if sent {
+                if !sent {
+                    // Nothing works — preserve message and tell user to press R
                     self.show_toast(
-                        "Sent (Claude may have exited — check Ctrl+O terminal)",
-                        ToastStyle::Info,
-                    );
-                    if let Some(ref mut cache) = self.conversation_cache {
-                        cache
-                            .entries
-                            .push(crate::conversation::ConversationEntry::UserMessage {
-                                timestamp: chrono::Utc::now()
-                                    .format("%Y-%m-%dT%H:%M:%S")
-                                    .to_string(),
-                                text: content,
-                            });
-                    }
-                } else {
-                    self.show_toast(
-                        "Claude has exited — press l to relaunch session",
+                        "Claude exited — press Esc then R to restart session",
                         ToastStyle::Error,
                     );
                 }
