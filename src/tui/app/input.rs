@@ -3195,8 +3195,17 @@ impl App {
             return Ok(());
         }
 
-        if claude_idle == Some(false) {
-            // Claude is busy (mid-tool-call) — queue the message for later
+        // Only queue when we're CERTAIN Claude is actively working:
+        // DB says Working AND session is NOT in the idle detection set AND
+        // the idle prompt is definitely not showing.
+        let session_db_working = thread.session_id.as_deref().is_some_and(|sid| {
+            self.sessions
+                .iter()
+                .any(|s| s.id == sid && s.claude_status == crate::store::ClaudeStatus::Working)
+                && !self.pty_idle_sessions.contains(sid)
+        });
+        if session_db_working && claude_idle == Some(false) {
+            // Claude is confirmed busy — queue the message for later
             self.queued_compose_message = Some((thread.id.clone(), content));
             self.show_toast(
                 "Message queued — Claude is busy. Will send when idle.",
