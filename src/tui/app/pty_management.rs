@@ -327,10 +327,62 @@ impl App {
         // Show stuck session warning toast (deferred from loop to avoid borrow conflict)
         if let Some(label) = stuck_session_label {
             self.show_toast(
-                format!("Session '{label}' may be stuck — no activity for 5 min. Press Ctrl+O to check"),
+                format!(
+                    "Session '{label}' may be stuck — no activity for 5 min. Press Ctrl+O to check"
+                ),
                 ToastStyle::Error,
             );
         }
+
+        // Fire OS notifications for sessions that just became paused or waiting.
+        // Only notify once per paused/waiting transition (tracked via notified_paused_sessions).
+        if self.config.notifications.rules.approval_required {
+            for sid in &self.paused_sessions {
+                if !self.notified_paused_sessions.contains(sid) {
+                    self.notified_paused_sessions.insert(sid.clone());
+                    let label = self
+                        .tabs
+                        .iter()
+                        .find_map(|tab| match tab {
+                            Tab::Session {
+                                session_id, label, ..
+                            } if session_id == sid => Some(label.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "Session".to_string());
+                    crate::config::NotificationConfig::system_notify_static(
+                        &label,
+                        "Permission required — check terminal",
+                        None,
+                    );
+                }
+            }
+        }
+        if self.config.notifications.rules.ask_user {
+            for sid in &self.waiting_sessions {
+                if !self.notified_paused_sessions.contains(sid) {
+                    self.notified_paused_sessions.insert(sid.clone());
+                    let label = self
+                        .tabs
+                        .iter()
+                        .find_map(|tab| match tab {
+                            Tab::Session {
+                                session_id, label, ..
+                            } if session_id == sid => Some(label.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "Session".to_string());
+                    crate::config::NotificationConfig::system_notify_static(
+                        &label,
+                        "Waiting for your answer",
+                        None,
+                    );
+                }
+            }
+        }
+        // Clear notification tracking for sessions no longer paused/waiting
+        self.notified_paused_sessions
+            .retain(|sid| self.paused_sessions.contains(sid) || self.waiting_sessions.contains(sid));
 
         // Clean up stale entries for sessions that are no longer working
         self.working_no_indicator_since.retain(|sid, _| {

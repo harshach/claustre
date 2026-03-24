@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
-use crate::store::{CiStatus, ClaudeStatus, TaskStatus};
+use crate::store::{CiStatus, ClaudeStatus, TaskStatus, ThreadStatus};
 
 /// Semantic colour theme for the entire TUI.
 ///
@@ -68,60 +68,106 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
+        // Modern palette inspired by Charmbracelet Crush.
+        // Cool blues and purples dominate; warm tones are soft peach/coral
+        // instead of saturated yellow.
         Self {
-            border_focused: Color::Cyan,
-            border_unfocused: Color::DarkGray,
+            border_focused: Color::Rgb(138, 108, 255), // soft violet
+            border_unfocused: Color::Rgb(55, 60, 82),  // slate
 
-            text_primary: Color::White,
-            text_secondary: Color::DarkGray,
-            text_accent: Color::Cyan,
+            text_primary: Color::Rgb(230, 225, 245), // cool white-lavender
+            text_secondary: Color::Rgb(140, 148, 178), // muted slate
+            text_accent: Color::Rgb(120, 200, 255),  // sky blue
 
-            status_draft: Color::Cyan,
-            status_pending: Color::DarkGray,
-            status_working: Color::Green,
-            status_interrupted: Color::Magenta,
-            status_in_review: Color::Yellow,
-            status_conflict: Color::Rgb(255, 165, 0),
-            status_ci_failed: Color::LightRed,
-            status_ci_running: Color::Yellow,
-            status_ci_passed: Color::Green,
-            status_done: Color::Blue,
-            status_error: Color::Red,
-            status_paused: Color::Yellow,
-            status_waiting: Color::Cyan,
+            status_draft: Color::Rgb(120, 200, 255), // sky blue
+            status_pending: Color::Rgb(110, 116, 148), // dim slate
+            status_working: Color::Rgb(80, 220, 200), // teal-mint
+            status_interrupted: Color::Rgb(240, 130, 210), // soft pink
+            status_in_review: Color::Rgb(255, 180, 128), // warm peach
+            status_conflict: Color::Rgb(255, 150, 90), // coral-orange
+            status_ci_failed: Color::Rgb(255, 110, 120), // soft red
+            status_ci_running: Color::Rgb(180, 160, 255), // lavender
+            status_ci_passed: Color::Rgb(80, 220, 200), // teal-mint
+            status_done: Color::Rgb(130, 170, 255),  // periwinkle
+            status_error: Color::Rgb(255, 100, 100), // red
+            status_paused: Color::Rgb(255, 180, 128), // warm peach
+            status_waiting: Color::Rgb(120, 200, 255), // sky blue
 
-            accent_primary: Color::Cyan,
-            accent_secondary: Color::Yellow,
-            accent_tertiary: Color::Magenta,
+            accent_primary: Color::Rgb(120, 200, 255), // sky blue
+            accent_secondary: Color::Rgb(180, 160, 255), // lavender
+            accent_tertiary: Color::Rgb(220, 120, 255), // orchid
 
-            toast_info: Color::Cyan,
-            toast_success: Color::Green,
-            toast_error: Color::Red,
+            toast_info: Color::Rgb(120, 200, 255),   // sky blue
+            toast_success: Color::Rgb(80, 220, 200), // teal-mint
+            toast_error: Color::Rgb(255, 100, 100),  // red
 
-            usage_low: Color::Green,
-            usage_medium: Color::Yellow,
-            usage_high: Color::Red,
+            usage_low: Color::Rgb(80, 220, 200),     // teal-mint
+            usage_medium: Color::Rgb(255, 180, 128), // peach
+            usage_high: Color::Rgb(255, 100, 100),   // red
 
-            form_border_task: Color::Yellow,
-            form_border_project: Color::Magenta,
-            form_highlight: Color::Yellow,
-            form_dim: Color::DarkGray,
+            form_border_task: Color::Rgb(180, 160, 255), // lavender
+            form_border_project: Color::Rgb(220, 120, 255), // orchid
+            form_highlight: Color::Rgb(120, 200, 255),   // sky blue
+            form_dim: Color::Rgb(80, 85, 110),           // dark slate
 
-            tab_active: Color::Cyan,
-            tab_inactive: Color::DarkGray,
+            tab_active: Color::Rgb(138, 108, 255), // soft violet
+            tab_inactive: Color::Rgb(105, 112, 140), // muted slate
 
-            selection_indicator: Color::Cyan,
-            pr_link: Color::Magenta,
-            spinner: Color::Yellow,
-            rate_limit_warning: Color::Red,
+            selection_indicator: Color::Rgb(120, 200, 255), // sky blue
+            pr_link: Color::Rgb(220, 120, 255),             // orchid
+            spinner: Color::Rgb(180, 160, 255),             // lavender
+            rate_limit_warning: Color::Rgb(255, 100, 100),  // red
         }
     }
 }
 
 impl Theme {
+    /// Background style for the navigation/sidebar rail.
+    pub fn sidebar_surface(&self) -> Style {
+        Style::default().bg(Color::Rgb(22, 24, 38))
+    }
+
+    /// Background style for primary work surfaces.
+    pub fn main_surface(&self) -> Style {
+        Style::default().bg(Color::Rgb(18, 20, 32))
+    }
+
+    /// Background style for the detail inspector rail.
+    pub fn inspector_surface(&self) -> Style {
+        Style::default().bg(Color::Rgb(16, 18, 28))
+    }
+
+    /// Background style for elevated cards and overlays.
+    pub fn overlay_surface(&self) -> Style {
+        Style::default().bg(Color::Rgb(26, 24, 42))
+    }
+
+    /// Background style for nested cards inside panels.
+    pub fn card_surface(&self) -> Style {
+        Style::default().bg(Color::Rgb(28, 32, 46))
+    }
+
+    /// Filled style for selected rows and focus chips.
+    pub fn selected_fill(&self) -> Style {
+        Style::default()
+            .fg(self.text_primary)
+            .bg(Color::Rgb(50, 55, 80))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Filled chip style used for tabs and compact badges.
+    pub fn chip_style(&self, color: Color) -> Style {
+        Style::default()
+            .fg(self.text_primary)
+            .bg(color)
+            .add_modifier(Modifier::BOLD)
+    }
+
     /// Style for a focused panel border.
     pub fn focused_border(&self) -> Style {
-        Style::default().fg(self.border_focused)
+        Style::default()
+            .fg(self.border_focused)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Style for an unfocused panel border.
@@ -177,11 +223,27 @@ impl Theme {
         Style::default().fg(self.status_waiting)
     }
 
+    /// Map a `ThreadStatus` to its display style (foreground colour).
+    pub fn thread_status_style(&self, status: ThreadStatus) -> Style {
+        let color = match status {
+            ThreadStatus::Draft => self.status_draft,
+            ThreadStatus::RuntimePreparing => self.status_pending,
+            ThreadStatus::Ready | ThreadStatus::Done => self.status_done,
+            ThreadStatus::Running => self.status_working,
+            ThreadStatus::WaitingUser => self.status_waiting,
+            ThreadStatus::WaitingReview => self.status_in_review,
+            ThreadStatus::Blocked => self.status_conflict,
+            ThreadStatus::Error => self.status_error,
+        };
+        Style::default().fg(color)
+    }
+
     /// Style for the active tab label.
     pub fn tab_active_style(&self) -> Style {
         Style::default()
-            .fg(self.tab_active)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            .fg(self.text_primary)
+            .bg(self.tab_active)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Style for an inactive tab label.
@@ -196,7 +258,10 @@ impl Theme {
             super::app::ToastStyle::Success => self.toast_success,
             super::app::ToastStyle::Error => self.toast_error,
         };
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Rgb(21, 24, 35))
+            .bg(color)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Colour for a usage bar at the given percentage.
@@ -208,6 +273,47 @@ impl Theme {
         } else {
             self.usage_low
         }
+    }
+
+    /// Build a pill-style `Style` for a GitHub label with an optional hex colour.
+    ///
+    /// When a colour is provided, auto-selects a contrasting foreground (black
+    /// or white) based on relative luminance.
+    pub fn label_pill_style(&self, hex_color: Option<&str>) -> Style {
+        let Some(bg) = hex_color.and_then(parse_hex_color) else {
+            return Style::default()
+                .fg(self.text_primary)
+                .bg(Color::Rgb(50, 55, 75))
+                .add_modifier(Modifier::BOLD);
+        };
+        let fg = contrasting_fg(bg);
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Parse a hex colour string (e.g. `"d73a4a"` or `"#d73a4a"`) into an RGB colour.
+pub fn parse_hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+/// Pick black or white foreground based on background luminance (WCAG contrast).
+fn contrasting_fg(bg: Color) -> Color {
+    let Color::Rgb(r, g, b) = bg else {
+        return Color::White;
+    };
+    // Relative luminance (sRGB linearised, simplified)
+    let luminance = 0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b);
+    if luminance > 140.0 {
+        Color::Rgb(30, 30, 30)
+    } else {
+        Color::Rgb(255, 255, 255)
     }
 }
 
@@ -377,9 +483,11 @@ mod tests {
     #[test]
     fn default_theme_has_expected_colors() {
         let t = Theme::default();
-        assert_eq!(t.border_focused, Color::Cyan);
-        assert_eq!(t.status_conflict, Color::Rgb(255, 165, 0));
-        assert_eq!(t.text_primary, Color::White);
+        assert_eq!(t.border_focused, Color::Rgb(138, 108, 255));
+        assert_eq!(t.status_conflict, Color::Rgb(255, 150, 90));
+        assert_eq!(t.text_primary, Color::Rgb(230, 225, 245));
+        assert_eq!(t.sidebar_surface().bg, Some(Color::Rgb(22, 24, 38)));
+        assert_eq!(t.overlay_surface().bg, Some(Color::Rgb(26, 24, 42)));
     }
 
     #[test]
@@ -414,7 +522,7 @@ mod tests {
         assert_eq!(t.border_focused, Color::Red);
         assert_eq!(t.status_conflict, Color::Rgb(100, 200, 50));
         // Non-overridden field keeps default
-        assert_eq!(t.text_primary, Color::White);
+        assert_eq!(t.text_primary, Color::Rgb(230, 225, 245));
     }
 
     #[test]
@@ -422,11 +530,11 @@ mod tests {
         let t = Theme::default();
         assert_eq!(
             t.task_status_style(TaskStatus::Working),
-            Style::default().fg(Color::Green)
+            Style::default().fg(t.status_working)
         );
         assert_eq!(
             t.task_status_style(TaskStatus::Error),
-            Style::default().fg(Color::Red)
+            Style::default().fg(t.status_error)
         );
     }
 
@@ -435,36 +543,58 @@ mod tests {
         let t = Theme::default();
         assert_eq!(
             t.claude_status_style(ClaudeStatus::Working),
-            Style::default().fg(Color::Green)
+            Style::default().fg(t.status_working)
         );
         assert_eq!(
             t.claude_status_style(ClaudeStatus::Done),
-            Style::default().fg(Color::Blue)
+            Style::default().fg(t.status_done)
+        );
+    }
+
+    #[test]
+    fn thread_status_style_maps_correctly() {
+        let t = Theme::default();
+        assert_eq!(
+            t.thread_status_style(ThreadStatus::Running),
+            Style::default().fg(t.status_working)
+        );
+        assert_eq!(
+            t.thread_status_style(ThreadStatus::WaitingReview),
+            Style::default().fg(t.status_in_review)
         );
     }
 
     #[test]
     fn usage_bar_color_thresholds() {
         let t = Theme::default();
-        assert_eq!(t.usage_bar_color(50.0), Color::Green);
-        assert_eq!(t.usage_bar_color(75.0), Color::Yellow);
-        assert_eq!(t.usage_bar_color(95.0), Color::Red);
+        assert_eq!(t.usage_bar_color(50.0), t.usage_low);
+        assert_eq!(t.usage_bar_color(75.0), t.usage_medium);
+        assert_eq!(t.usage_bar_color(95.0), t.usage_high);
     }
 
     #[test]
     fn focused_and_unfocused_border_styles() {
         let t = Theme::default();
-        assert_eq!(t.focused_border(), Style::default().fg(Color::Cyan));
-        assert_eq!(t.unfocused_border(), Style::default().fg(Color::DarkGray));
+        assert_eq!(
+            t.focused_border(),
+            Style::default()
+                .fg(t.border_focused)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            t.unfocused_border(),
+            Style::default().fg(t.border_unfocused)
+        );
     }
 
     #[test]
     fn tab_styles() {
         let t = Theme::default();
         let active = t.tab_active_style();
-        assert_eq!(active.fg, Some(t.tab_active));
+        assert_eq!(active.fg, Some(t.text_primary));
+        assert_eq!(active.bg, Some(t.tab_active));
         assert!(active.add_modifier.contains(Modifier::BOLD));
-        assert!(active.add_modifier.contains(Modifier::REVERSED));
+        assert!(!active.add_modifier.contains(Modifier::REVERSED));
 
         let inactive = t.tab_inactive_style();
         assert_eq!(inactive.fg, Some(t.tab_inactive));
@@ -488,14 +618,14 @@ mod tests {
         let t = Theme::default();
 
         let info = t.toast_style(ToastStyle::Info);
-        assert_eq!(info.fg, Some(t.toast_info));
+        assert_eq!(info.bg, Some(t.toast_info));
         assert!(info.add_modifier.contains(Modifier::BOLD));
 
         let success = t.toast_style(ToastStyle::Success);
-        assert_eq!(success.fg, Some(t.toast_success));
+        assert_eq!(success.bg, Some(t.toast_success));
 
         let error = t.toast_style(ToastStyle::Error);
-        assert_eq!(error.fg, Some(t.toast_error));
+        assert_eq!(error.bg, Some(t.toast_error));
     }
 
     #[test]
@@ -538,10 +668,10 @@ mod tests {
     fn usage_bar_color_boundary_values() {
         let t = Theme::default();
         // Exactly at thresholds
-        assert_eq!(t.usage_bar_color(70.0), Color::Yellow);
-        assert_eq!(t.usage_bar_color(90.0), Color::Yellow);
-        assert_eq!(t.usage_bar_color(90.1), Color::Red);
-        assert_eq!(t.usage_bar_color(0.0), Color::Green);
-        assert_eq!(t.usage_bar_color(69.9), Color::Green);
+        assert_eq!(t.usage_bar_color(70.0), t.usage_medium);
+        assert_eq!(t.usage_bar_color(90.0), t.usage_medium);
+        assert_eq!(t.usage_bar_color(90.1), t.usage_high);
+        assert_eq!(t.usage_bar_color(0.0), t.usage_low);
+        assert_eq!(t.usage_bar_color(69.9), t.usage_low);
     }
 }

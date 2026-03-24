@@ -781,6 +781,21 @@ impl App {
         self.build_thread_context(thread)
     }
 
+    /// Refresh the cached thread context for the active session tab.
+    /// Called from slow tick (1s) so the chat panel has fresh data without
+    /// running ~15 DB queries on every 60fps frame.
+    pub(crate) fn refresh_session_thread_context(&mut self) {
+        let session_id = self.active_session_id().map(str::to_string);
+        if session_id != self.cached_session_thread_ctx_session_id {
+            // Session changed — clear cache and rebuild
+            self.cached_session_thread_ctx = None;
+            self.cached_session_thread_ctx_session_id = session_id.clone();
+        }
+        if session_id.is_some() {
+            self.cached_session_thread_ctx = self.active_session_thread_context();
+        }
+    }
+
     pub fn selected_thread_context(&self) -> Option<SelectedThreadContext> {
         let thread = self.selected_thread()?.clone();
         self.build_thread_context(thread)
@@ -906,13 +921,22 @@ impl App {
                 continue;
             };
 
-            // Check if session is idle
-            let session_idle = self
+            // Check if Claude is idle or has exited — either way, the current
+            // stage's turn is over and the workflow can advance.
+            let db_idle = self
                 .sessions
                 .iter()
                 .find(|s| s.id == session_id)
                 .is_some_and(|s| s.claude_status == ClaudeStatus::Idle);
-            if !session_idle {
+            let pty_idle = self.pty_idle_sessions.contains(session_id);
+            let claude_pane_exited = self.tabs.iter().any(|tab| {
+                matches!(tab, super::Tab::Session { session_id: sid, terminals, .. }
+                    if sid == session_id
+                    && terminals
+                        .terminal(terminals.claude_pane_id)
+                        .is_some_and(|t| t.exited()))
+            });
+            if !db_idle && !pty_idle && !claude_pane_exited {
                 continue;
             }
 
@@ -933,23 +957,107 @@ impl App {
                 continue;
             };
 
-            if self.workflow_stage_injected.contains(&current_stage.id) {
-                // Prompt was already sent → Claude finished → advance to next stage
+            // Check if Claude has been working since the prompt was injected.
+            // If not, mark it as seen-working now (if session IS working).
+            if let Some(seen_working) = self.workflow_stage_injected.get_mut(&current_stage.id) {
+                if !*seen_working {
+                    let is_working = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .is_some_and(|s| s.claude_status == ClaudeStatus::Working);
+                    if is_working {
+                        *seen_working = true;
+                    }
+                    // Don't advance yet — haven't confirmed Claude processed the prompt
+                    continue;
+                }
+            }
+
+            if self.workflow_stage_injected.contains_key(&current_stage.id) {
+                // Prompt was injected AND Claude was seen working AND is now idle → advance
                 self.workflow_stage_injected.remove(&current_stage.id);
 
-                // Capture the last assistant message as stage output summary
-                // so it can be shown inline during gate approval review.
-                if let Ok(messages) = self.store.list_thread_messages(&thread.id)
-                    && let Some(last_assistant) = messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
-                {
+                // Capture a stage output summary for the chat timeline.
+                // Try: 1) thread messages, 2) JSONL cache, 3) PTY screen buffer.
+                let summary = self
+                    .store
+                    .list_thread_messages(&thread.id)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+                            .map(|m| m.content.clone())
+                    })
+                    .or_else(|| {
+                        // Fallback 1: extract from JSONL conversation cache
+                        let sid = thread.session_id.as_deref()?;
+                        let cache = self
+                            .conversation_cache
+                            .as_ref()
+                            .filter(|c| c.session_id == sid && !c.entries.is_empty())?;
+                        let mut parts = Vec::new();
+                        for entry in cache.entries.iter().rev().take(20) {
+                            if let crate::conversation::ConversationEntry::AssistantText {
+                                text,
+                                ..
+                            } = entry
+                            {
+                                if !text.trim().is_empty() {
+                                    parts.push(text.clone());
+                                    if parts.len() >= 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if parts.is_empty() {
+                            return None;
+                        }
+                        parts.reverse();
+                        Some(parts.join("\n\n"))
+                    })
+                    .or_else(|| {
+                        // Fallback 2: capture from the PTY screen buffer (Codex etc.)
+                        let tab = self.tabs.iter().find(|tab| {
+                            matches!(tab, super::Tab::Session { session_id: sid, .. } if sid == session_id)
+                        })?;
+                        let super::Tab::Session { terminals, .. } = tab else {
+                            return None;
+                        };
+                        terminals.with_claude_live_screen(|screen| {
+                            let rows = screen.size().0;
+                            let cols = screen.size().1;
+                            let mut lines: Vec<String> = Vec::new();
+                            // Read all non-empty lines from the screen
+                            for row in 0..rows {
+                                let line = screen
+                                    .contents_between(row, 0, row, cols)
+                                    .trim()
+                                    .to_string();
+                                if !line.is_empty() {
+                                    lines.push(line);
+                                }
+                            }
+                            // Skip the last few lines (prompt, status bar)
+                            if lines.len() > 4 {
+                                lines.truncate(lines.len() - 3);
+                            }
+                            if lines.is_empty() {
+                                return None;
+                            }
+                            Some(lines.join("\n"))
+                        })?
+                    });
+
+                if let Some(summary) = summary {
                     // Truncate to first 2000 chars to keep DB lean
-                    let summary = if last_assistant.content.len() > 2000 {
-                        format!("{}...", &last_assistant.content[..1997])
+                    let summary = if summary.len() > 2000 {
+                        format!("{}...", &summary[..1997])
                     } else {
-                        last_assistant.content.clone()
+                        summary
                     };
                     let _ = self.store.update_workflow_stage_run_status(
                         &current_stage.id,
@@ -994,9 +1102,13 @@ impl App {
                     }
                 };
 
-                if self.send_prompt_to_live_thread_session(&thread, &prompt) {
+                // Try sending directly; if Claude pane is dead, restart via shell
+                let sent = self.send_prompt_to_live_thread_session(&thread, &prompt)
+                    || self.restart_claude_with_message(&thread, &prompt, &[]);
+                if sent {
+                    // false = haven't seen Claude working yet since injection
                     self.workflow_stage_injected
-                        .insert(current_stage.id.clone());
+                        .insert(current_stage.id.clone(), false);
 
                     // Record a system message for the stage only after
                     // successful injection — otherwise this runs every tick
@@ -1097,7 +1209,11 @@ impl App {
             && cache.jsonl_path.as_deref() == Some(path.as_path())
         {
             // Append to existing cache
-            cache.entries.extend(new_entries);
+            if !new_entries.is_empty() {
+                cache.entries.extend(new_entries);
+                // Invalidate rendered line cache — new data arrived
+                self.cached_chat_lines = None;
+            }
             cache.file_offset = new_offset;
             cache.file_mtime = current_mtime;
         } else {
@@ -1109,6 +1225,7 @@ impl App {
                 file_mtime: current_mtime,
                 jsonl_path: jsonl_path.clone(),
             });
+            self.cached_chat_lines = None;
         }
 
         // Detect quick-reply choices from the latest assistant message

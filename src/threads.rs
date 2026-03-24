@@ -73,31 +73,41 @@ pub fn relaunch_thread(
     let thread = store.get_thread(thread_id)?;
     if let Some(session_id) = thread.session_id.as_deref()
         && let Ok(session) = store.get_session(session_id)
-        && session.closed_at.is_none()
     {
-        // Check if session-host is truly alive (socket + PID + worktree).
-        // If not, the session is stale — close it so we can relaunch.
-        let worktree_exists = std::path::Path::new(&session.worktree_path).exists();
-        let host_alive = config::session_socket_path(session_id)
-            .ok()
-            .is_some_and(|sock| {
-                sock.exists()
-                    && config::session_pid_path(session_id)
-                        .ok()
-                        .and_then(|pid_path| std::fs::read_to_string(pid_path).ok())
-                        .and_then(|pid_str| pid_str.trim().parse::<i32>().ok())
-                        // SAFETY: kill(pid, 0) just checks if process exists
-                        .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
-            });
-        if host_alive && worktree_exists {
-            return Ok(LaunchThreadResult {
-                thread,
-                workflow: None,
-                session_setup: None,
-            });
+        if session.closed_at.is_none() {
+            // Check if session-host is truly alive (socket + PID + worktree).
+            // If not, the session is stale — close it so we can relaunch.
+            let worktree_exists = std::path::Path::new(&session.worktree_path).exists();
+            let host_alive = config::session_socket_path(session_id)
+                .ok()
+                .is_some_and(|sock| {
+                    sock.exists()
+                        && config::session_pid_path(session_id)
+                            .ok()
+                            .and_then(|pid_path| std::fs::read_to_string(pid_path).ok())
+                            .and_then(|pid_str| pid_str.trim().parse::<i32>().ok())
+                            // SAFETY: kill(pid, 0) just checks if process exists
+                            .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
+                });
+            if host_alive && worktree_exists {
+                return Ok(LaunchThreadResult {
+                    thread,
+                    workflow: None,
+                    session_setup: None,
+                });
+            }
+            // Stale session (host dead or worktree removed) — close it
+            store.close_session(session_id)?;
         }
-        // Stale session (host dead or worktree removed) — close it
-        store.close_session(session_id)?;
+
+        // Session is closed but worktree may still exist on disk.
+        // Remove the stale worktree so create_session can start fresh.
+        if Path::new(&session.worktree_path).exists() {
+            let _ = session::remove_worktree(
+                Path::new(&store.get_project(&thread.project_id)?.repo_path),
+                Path::new(&session.worktree_path),
+            );
+        }
     }
 
     let project = store.get_project(&thread.project_id)?;
@@ -177,7 +187,7 @@ pub fn relaunch_thread(
     )?;
 
     let worktree_path = PathBuf::from(&session_setup.worktree_path);
-    if thread.runtime_profile.is_some() || cfg.runtime.default_profile.is_some() {
+    if thread.runtime_profile.is_some() {
         runtime::up_profile(
             store,
             &thread.id,
@@ -474,7 +484,7 @@ fn launch_common(
     )?;
 
     let worktree_path = PathBuf::from(&session_setup.worktree_path);
-    if args.runtime_profile.is_some() || cfg.runtime.default_profile.is_some() {
+    if args.runtime_profile.is_some() {
         runtime::up_profile(
             store,
             &thread.id,

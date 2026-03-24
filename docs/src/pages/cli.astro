@@ -5,18 +5,19 @@ import DocsLayout from "../layouts/DocsLayout.astro";
 <DocsLayout title="CLI Reference">
   <h1>CLI Reference</h1>
   <p>
-    The primary way to use claustre is the TUI dashboard — just run
+    The primary way to use claustre is the TUI workbench — just run
     <code>claustre</code>. The CLI commands below are an alternative for
     scripting or when you prefer the terminal.
   </p>
 
-  <h2>Dashboard</h2>
+  <h2>Workbench</h2>
   <pre><code>claustre                  # Launch TUI (default command)
 claustre dashboard        # Same as above, explicit</code></pre>
   <p>
-    The default command opens the terminal dashboard where you can manage
-    projects, create and launch tasks, monitor sessions, and interact with
-    embedded Claude Code terminals.
+    The default command opens the terminal workbench with a sidebar, main
+    buffer, right-hand inspector, and bottom status rows. From there you can
+    manage projects, create and launch tasks, inspect GitHub-backed threads and
+    reviews, and interact with embedded Claude Code terminals.
   </p>
 
   <h2>Project Management</h2>
@@ -190,6 +191,94 @@ claustre shell-init                   # Print shell integration script</code></p
   <p>
     See <a href="/sync">Sync Across Machines</a> for setup guides and
     detailed workflows.
+  </p>
+
+  <h2>GitHub Cache</h2>
+  <pre><code>claustre github status                # Show GitHub App / gh auth and cache summary
+claustre github login                 # Authenticate via GitHub App device flow (or gh fallback)
+claustre github sync [--project name] # Hydrate issue / PR / review / Projects v2 caches
+claustre github disconnect            # Clear GitHub App session (or gh fallback)</code></pre>
+
+  <p>
+    <strong>github login</strong> now follows the same setup-first flow as the TUI:
+    it uses a bundled or custom GitHub App device flow when app metadata is
+    available, and otherwise falls back to a browser-based <code>gh auth login</code>
+    flow. On the GitHub CLI fallback path, Claustre requests
+    <code>repo</code>, <code>read:org</code>, <code>read:project</code>, and
+    <code>project</code> so Projects v2 board APIs are available. GitHub App sessions are stored under
+    <code>~/.claustre/github-app-session.json</code>; GitHub CLI sessions stay in
+    the normal <code>gh</code> credential store.
+  </p>
+  <p>
+    <strong>github sync</strong> hydrates the GitHub cache tables for each
+    registered project. Claustre now prefers GitHub App user tokens for REST
+    calls and falls back to the local <code>gh</code> CLI when no GitHub App
+    session is available. Issue bodies, PR bodies, review events, and inline
+    review comments are stored in raw markdown, plain text, and rendered HTML
+    forms when available. Claustre also discovers GitHub Projects v2 for the
+    selected repo owner, caches the selected project's items, and uses that
+    data to drive the Sprint Board.
+  </p>
+
+  <h2>Threads</h2>
+  <pre><code>claustre thread launch --task-id &lt;id&gt; [--provider claude|codex|gemini|local] [--profile name] [--runtime-profile name] [--workflow name]
+claustre thread focus --thread-id &lt;id&gt;
+claustre thread switch-provider --thread-id &lt;id&gt; --provider claude|codex|gemini|local [--profile name]
+claustre thread paste-clipboard --thread-id &lt;id&gt; [--draft-key key]</code></pre>
+
+  <p>
+    <strong>thread launch</strong> creates a GitHub-native thread workspace for
+    an existing task while preserving compatibility with the current
+    task/session engine. It creates a shadow session/worktree, records the
+    thread metadata, optionally starts the selected runtime profile from
+    <code>sandbox.yaml</code>, and can attach a named workflow immediately.
+  </p>
+  <p>
+    <strong>thread paste-clipboard</strong> performs smart clipboard paste for a
+    thread. If the clipboard contains text, it prints the text. If it contains
+    an image, Claustre stores the image under
+    <code>~/.claustre/attachments/&lt;thread-id&gt;/</code>, records a
+    <code>thread_attachments</code> row, and prints the stored asset path.
+  </p>
+
+  <h2>Workflows</h2>
+  <pre><code>claustre workflow list [--project name]
+claustre workflow run --name &lt;workflow&gt; --thread-id &lt;id&gt;
+claustre workflow resume --run-id &lt;id&gt;
+claustre workflow approve --run-id &lt;id&gt; --stage &lt;stage&gt;
+claustre workflow artifact --run-id &lt;id&gt;</code></pre>
+
+  <p>
+    Workflows are ordered multi-stage pipelines such as
+    <code>plan_first_tdd</code>, <code>review_fix_loop</code>,
+    <code>bug_triage_then_patch</code>, and
+    <code>research_then_plan</code>. Definitions are loaded from built-ins,
+    <code>~/.claustre/workflows/</code>, and repo-local
+    <code>.claustre/workflows/</code>.
+  </p>
+
+  <h2>Runtime</h2>
+  <pre><code>claustre runtime up --thread-id &lt;id&gt; [--profile name]
+claustre runtime down --thread-id &lt;id&gt;
+claustre runtime restart --thread-id &lt;id&gt;
+claustre runtime health --thread-id &lt;id&gt;
+claustre runtime logs --thread-id &lt;id&gt; --service &lt;name&gt;</code></pre>
+
+  <p>
+    Runtime commands operate on the current thread worktree and are driven by
+    <code>sandbox.yaml</code>. Claustre supports named build steps, command and
+    docker-compose services, named checks, and runtime profiles. Service state
+    is persisted locally in <code>thread_runtime_state</code>.
+  </p>
+
+  <h2>Open Targets</h2>
+  <pre><code>claustre open --thread &lt;id&gt;</code></pre>
+
+  <p>
+    <strong>open</strong> is a lightweight deep-link target for notifications
+    and external automation. It prints the linked thread metadata today and is
+    intended to become the hand-off point for focusing an existing thread in
+    the TUI.
   </p>
 
   <h2>Internal Commands</h2>

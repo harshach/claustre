@@ -12,10 +12,11 @@ use super::layout::{
     remove_leaf, replace_leaf,
 };
 use super::selection::Selection;
+use super::terminal_trait::Terminal;
 
 /// Information about a single terminal pane.
 pub(crate) struct PaneInfo {
-    pub(crate) terminal: EmbeddedTerminal,
+    pub(crate) terminal: Box<dyn Terminal>,
     pub(crate) label: String,
 }
 
@@ -30,23 +31,28 @@ pub struct SessionTerminals {
     next_id: PaneId,
     /// Which pane holds the Claude terminal (for paused detection).
     pub claude_pane_id: PaneId,
+    /// Which pane holds the neovim editor (spawned on first `Ctrl+E`).
+    pub editor_pane_id: Option<PaneId>,
     pub selection: Option<Selection>,
     /// Worktree path — needed to spawn new shell panes on split.
     pub worktree_path: String,
 }
 
 impl SessionTerminals {
-    /// Create from a shell + Claude terminal pair with default side-by-side layout.
-    pub fn from_parts(
+    /// Create from a shell + Claude terminal pair.
+    ///
+    /// Default layout shows Claude full-width. The shell terminal is kept
+    /// alive but hidden — the user can split to reveal it via `Ctrl+B`.
+    pub(crate) fn from_parts(
         shell: EmbeddedTerminal,
-        claude: EmbeddedTerminal,
+        claude: Box<dyn Terminal>,
         worktree_path: &str,
     ) -> Self {
         let mut panes = HashMap::new();
         panes.insert(
             0,
             PaneInfo {
-                terminal: shell,
+                terminal: Box::new(shell),
                 label: "Shell".to_string(),
             },
         );
@@ -59,15 +65,13 @@ impl SessionTerminals {
         );
         Self {
             panes,
-            layout: LayoutNode::Split {
-                direction: SplitDirection::Horizontal,
-                ratio: 50,
-                first: Box::new(LayoutNode::Pane(0)),
-                second: Box::new(LayoutNode::Pane(1)),
-            },
+            // Claude full-width by default. Shell is alive but not in the
+            // layout tree — user can add it back with Ctrl+B (split).
+            layout: LayoutNode::Pane(1),
             focused: 1,
             next_id: 2,
             claude_pane_id: 1,
+            editor_pane_id: None,
             selection: None,
             worktree_path: worktree_path.to_string(),
         }
@@ -77,8 +81,8 @@ impl SessionTerminals {
     ///
     /// The `claude` terminal is placed at the "claude" leaf in the config tree.
     /// Every "shell" leaf gets a freshly-spawned shell in the worktree.
-    pub fn from_layout(
-        claude: EmbeddedTerminal,
+    pub(crate) fn from_layout(
+        claude: Box<dyn Terminal>,
         worktree_path: &str,
         layout_config: &crate::config::LayoutConfig,
         rows: u16,
@@ -110,6 +114,7 @@ impl SessionTerminals {
             focused: claude_pane_id,
             next_id,
             claude_pane_id,
+            editor_pane_id: None,
             selection: None,
             worktree_path: worktree_path.to_string(),
         })
@@ -120,7 +125,7 @@ impl SessionTerminals {
     /// Falls back to the first pane in layout order if the focused pane id is
     /// not in the map.  Returns `None` only if the pane map is empty (which
     /// should never happen — `close_focused` prevents closing the last pane).
-    pub fn focused_terminal(&mut self) -> Option<&mut EmbeddedTerminal> {
+    pub(crate) fn focused_terminal(&mut self) -> Option<&mut (dyn Terminal + 'static)> {
         if !self.panes.contains_key(&self.focused)
             && let Some(&first_id) = self.pane_ids_in_order().first()
         {
@@ -128,17 +133,24 @@ impl SessionTerminals {
         }
         self.panes
             .get_mut(&self.focused)
-            .map(|info| &mut info.terminal)
+            .map(|info| info.terminal.as_mut())
     }
 
     /// Get the terminal for a specific pane.
-    pub fn terminal(&self, id: PaneId) -> Option<&EmbeddedTerminal> {
-        self.panes.get(&id).map(|info| &info.terminal)
+    pub(crate) fn terminal(&self, id: PaneId) -> Option<&(dyn Terminal + 'static)> {
+        self.panes.get(&id).map(|info| info.terminal.as_ref())
     }
 
     /// Get mutable terminal for a specific pane.
-    pub fn terminal_mut(&mut self, id: PaneId) -> Option<&mut EmbeddedTerminal> {
-        self.panes.get_mut(&id).map(|info| &mut info.terminal)
+    pub(crate) fn terminal_mut(&mut self, id: PaneId) -> Option<&mut (dyn Terminal + 'static)> {
+        self.panes.get_mut(&id).map(|info| info.terminal.as_mut())
+    }
+
+    /// Reset scrollback on all panes to show the live screen.
+    pub(crate) fn reset_all_scrollback(&mut self) {
+        for info in self.panes.values_mut() {
+            info.terminal.reset_scrollback();
+        }
     }
 
     /// Get label for a pane.
@@ -202,7 +214,7 @@ impl SessionTerminals {
         self.panes.insert(
             new_id,
             PaneInfo {
-                terminal,
+                terminal: Box::new(terminal),
                 label: "Shell".to_string(),
             },
         );
@@ -252,7 +264,7 @@ impl SessionTerminals {
         self.panes.insert(
             new_id,
             PaneInfo {
-                terminal,
+                terminal: Box::new(terminal),
                 label: label.to_string(),
             },
         );
@@ -274,6 +286,57 @@ impl SessionTerminals {
         }
 
         self.focused = new_id;
+        Ok(())
+    }
+
+    /// Ensure the editor pane exists, spawning neovim if needed.
+    /// The editor pane is NOT part of the layout tree — it's rendered
+    /// full-screen in Editor mode. Returns the editor pane ID.
+    pub fn ensure_editor(&mut self, rows: u16, cols: u16) -> Result<PaneId> {
+        if let Some(id) = self.editor_pane_id {
+            // Check if still alive
+            if self.panes.get(&id).is_some_and(|p| !p.terminal.exited()) {
+                return Ok(id);
+            }
+            // Dead — remove and respawn
+            self.panes.remove(&id);
+            self.editor_pane_id = None;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut cmd = CommandBuilder::new("nvim");
+        // Don't pass "." — NvimTree opens automatically via VimEnter autocmd.
+        // Passing "." causes netrw to activate before plugins load.
+        cmd.cwd(&self.worktree_path);
+        cmd.env("NVIM_APPNAME", "claustre");
+
+        let terminal = EmbeddedTerminal::spawn(cmd, rows, cols)?;
+        self.panes.insert(
+            id,
+            PaneInfo {
+                terminal: Box::new(terminal),
+                label: "Editor".to_string(),
+            },
+        );
+        self.editor_pane_id = Some(id);
+        Ok(id)
+    }
+
+    /// Replace the provider pane with a new command while keeping the worktree,
+    /// layout tree, and pane id stable.
+    pub fn replace_claude_command(&mut self, cmd: CommandBuilder, label: &str) -> Result<()> {
+        let Some(info) = self.panes.get_mut(&self.claude_pane_id) else {
+            anyhow::bail!("provider pane not found");
+        };
+
+        let (rows, cols) = info.terminal.screen().size();
+        let terminal = EmbeddedTerminal::spawn(cmd, rows, cols)?;
+        info.terminal = Box::new(terminal);
+        info.label = label.to_string();
+        self.focused = self.claude_pane_id;
+        self.selection = None;
         Ok(())
     }
 

@@ -53,7 +53,7 @@ pub struct EmbeddedTerminal {
     /// Terminal state machine — parses ANSI sequences into a screen buffer.
     pub(crate) parser: Parser,
     /// Whether the child process has exited (reader thread ended).
-    pub exited: bool,
+    pub(crate) exited: bool,
     /// User-controlled scroll position: 0 = live screen, >0 = lines into history.
     /// Pure arithmetic — never touches the parser's scrollback state.
     pub(crate) scroll_offset: usize,
@@ -389,5 +389,71 @@ impl EmbeddedTerminal {
     /// phase.
     pub fn restore_after_render(&mut self) {
         self.parser.set_scrollback(0);
+    }
+}
+
+impl super::terminal_trait::Terminal for EmbeddedTerminal {
+    fn process_output(&mut self) {
+        self.process_output();
+    }
+
+    fn process_output_full(&mut self) {
+        self.process_output_full();
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.send_bytes(bytes)
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.resize(rows, cols)
+    }
+
+    fn clear_screen(&mut self) {
+        self.clear_screen();
+    }
+
+    fn screen(&self) -> &vt100::Screen {
+        self.screen()
+    }
+
+    fn scrollback(&self) -> usize {
+        self.scrollback()
+    }
+
+    fn should_forward_mouse(&self) -> bool {
+        self.should_forward_mouse()
+    }
+
+    fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
+        self.mouse_protocol_mode()
+    }
+
+    fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
+        self.mouse_protocol_encoding()
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll_up(lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.scroll_down(lines);
+    }
+
+    fn reset_scrollback(&mut self) {
+        self.reset_scrollback();
+    }
+
+    fn prepare_for_render(&mut self) {
+        self.prepare_for_render();
+    }
+
+    fn restore_after_render(&mut self) {
+        self.restore_after_render();
+    }
+
+    fn exited(&self) -> bool {
+        self.exited
     }
 }

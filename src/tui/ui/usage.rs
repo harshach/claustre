@@ -8,7 +8,12 @@ use ratatui::{
 
 use super::super::app::App;
 
-pub(super) fn draw_usage_bars(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_usage_bars(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    token_usage: Option<(i64, i64)>,
+) {
     let state = &app.rate_limit_state;
 
     let block = Block::default()
@@ -89,6 +94,25 @@ pub(super) fn draw_usage_bars(frame: &mut Frame, app: &App, area: Rect) {
         max_reset_len,
         &app.theme,
     ));
+
+    // Token usage for active thread/task
+    if let Some((input, output)) = token_usage
+        && (input > 0 || output > 0)
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  Tokens: ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                format_tokens(input),
+                Style::default().fg(app.theme.accent_secondary),
+            ),
+            Span::styled(" in / ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                format_tokens(output),
+                Style::default().fg(app.theme.accent_secondary),
+            ),
+            Span::styled(" out", Style::default().fg(app.theme.text_secondary)),
+        ]));
+    }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);

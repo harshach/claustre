@@ -3,6 +3,7 @@
 //! Reads `~/.claustre/config.toml`, provides paths for the database, worktrees,
 //! hooks, and sockets, and handles merging global + project `CLAUDE.md` files.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,6 +58,22 @@ pub struct Config {
     /// Sprint board column configuration.
     #[serde(default)]
     pub board: BoardConfig,
+
+    /// GitHub App / relay integration settings.
+    #[serde(default)]
+    pub github_app: GithubAppConfig,
+
+    /// Provider profile configuration keyed by profile name.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderProfileConfig>,
+
+    /// Runtime / sandbox settings.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+
+    /// UI-specific settings beyond theme/layout.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 /// Sprint board column configuration.
@@ -98,6 +115,89 @@ pub struct BoardColumn {
     /// Empty means no label matching — the first column with empty labels is the catch-all.
     #[serde(default)]
     pub labels: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct GithubAppConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub app_slug: Option<String>,
+    #[serde(default)]
+    pub install_url: Option<String>,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    #[serde(default)]
+    pub default_installation_id: Option<String>,
+    #[serde(default)]
+    pub default_project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProviderProfileConfig {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ProviderProfileConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            model: None,
+            effort: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub sandbox_path: Option<String>,
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub attachments_dir: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub keymap: KeymapConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct KeymapConfig {
+    #[serde(default = "default_keymap_preset")]
+    pub preset: String,
+    #[serde(default = "default_keymap_leader")]
+    pub leader: String,
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_keymap_preset(),
+            leader: default_keymap_leader(),
+            overrides: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_keymap_preset() -> String {
+    "nvim".to_string()
+}
+
+fn default_keymap_leader() -> String {
+    "space".to_string()
 }
 
 impl Default for BoardConfig {
@@ -370,6 +470,36 @@ pub struct NotificationConfig {
     /// Speaking rate for the say command (words per minute). Default: none (system default)
     #[serde(default)]
     pub rate: Option<u32>,
+
+    /// Rule-based thread/runtime/review notification preferences.
+    #[serde(default)]
+    pub rules: NotificationRulesConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NotificationRulesConfig {
+    #[serde(default = "default_true")]
+    pub ask_user: bool,
+    #[serde(default = "default_true")]
+    pub approval_required: bool,
+    #[serde(default = "default_true")]
+    pub run_complete: bool,
+    #[serde(default = "default_true")]
+    pub review_requested: bool,
+    #[serde(default = "default_true")]
+    pub ci_failed: bool,
+}
+
+impl Default for NotificationRulesConfig {
+    fn default() -> Self {
+        Self {
+            ask_user: true,
+            approval_required: true,
+            run_complete: true,
+            review_requested: true,
+            ci_failed: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -406,6 +536,7 @@ impl Default for NotificationConfig {
             template: default_notification_template(),
             voice: None,
             rate: None,
+            rules: NotificationRulesConfig::default(),
         }
     }
 }
@@ -475,6 +606,12 @@ impl NotificationConfig {
             return None;
         }
         Some(path)
+    }
+
+    /// Send a macOS system banner notification (static, no config needed).
+    /// Used by the TUI for paused/waiting session alerts.
+    pub fn system_notify_static(title: &str, message: &str, url: Option<&str>) {
+        Self::system_notify(title, message, url);
     }
 
     /// Send a macOS system banner notification.
@@ -559,6 +696,11 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("claustre.db"))
 }
 
+/// Returns the path to the main config file: ~/.claustre/config.toml
+pub fn config_path() -> Result<PathBuf> {
+    Ok(base_dir()?.join("config.toml"))
+}
+
 /// Returns the path to the global CLAUDE.md
 pub fn global_claude_md_path() -> Result<PathBuf> {
     Ok(base_dir()?.join("claude.md"))
@@ -602,6 +744,120 @@ pub fn pids_dir() -> Result<PathBuf> {
 /// Returns the sync git repo directory: ~/.claustre/sync/
 pub fn sync_dir() -> Result<PathBuf> {
     Ok(base_dir()?.join("sync"))
+}
+
+/// Returns the attachments directory: ~/.claustre/attachments/
+pub fn attachments_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("attachments"))
+}
+
+/// Returns the per-thread attachment directory: ~/.claustre/attachments/<thread-id>/
+pub fn thread_attachments_dir(thread_id: &str) -> Result<PathBuf> {
+    Ok(attachments_dir()?.join(thread_id))
+}
+
+/// Returns the runtime logs directory: ~/.claustre/runtime/
+pub fn runtime_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("runtime"))
+}
+
+/// Returns the per-thread runtime directory: ~/.claustre/runtime/<thread-id>/
+pub fn thread_runtime_dir(thread_id: &str) -> Result<PathBuf> {
+    Ok(runtime_dir()?.join(thread_id))
+}
+
+/// Returns the port allocation directory: ~/.claustre/ports/
+pub fn ports_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("ports"))
+}
+
+/// Returns the global workflows directory: ~/.claustre/workflows/
+pub fn workflows_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("workflows"))
+}
+
+/// Seed the claustre neovim editor config to `~/.config/claustre/init.lua`.
+/// Uses `NVIM_APPNAME=claustre` so it doesn't interfere with the user's own nvim config.
+/// Re-writes when the bundled version is newer (detected via version marker comment).
+pub fn seed_editor_config() -> Result<()> {
+    let config_dir = dirs::config_dir()
+        .context("cannot determine config directory")?
+        .join("claustre");
+    fs::create_dir_all(&config_dir)?;
+    let init_path = config_dir.join("init.lua");
+    let bundled = include_str!("../../assets/editor/init.lua");
+    // Always overwrite if existing file doesn't contain the current version marker
+    let should_write = if init_path.exists() {
+        let existing = fs::read_to_string(&init_path).unwrap_or_default();
+        // Check for version marker in both files
+        let bundled_version = bundled
+            .lines()
+            .find(|l| l.contains("-- claustre-editor-version:"))
+            .unwrap_or("");
+        let existing_version = existing
+            .lines()
+            .find(|l| l.contains("-- claustre-editor-version:"))
+            .unwrap_or("");
+        bundled_version.is_empty() || bundled_version != existing_version
+    } else {
+        true
+    };
+    if should_write {
+        fs::write(&init_path, bundled)?;
+    }
+    Ok(())
+}
+
+/// Returns the global markdown command pack directory: ~/.claustre/commands/
+pub fn commands_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("commands"))
+}
+
+/// Returns the knowledge root directory: ~/.claustre/knowledge/
+pub fn knowledge_dir() -> Result<PathBuf> {
+    Ok(base_dir()?.join("knowledge"))
+}
+
+/// Returns the per-repository knowledge directory: ~/.claustre/knowledge/repos/<owner>__<repo>/
+pub fn knowledge_repo_dir(owner: &str, repo: &str) -> Result<PathBuf> {
+    Ok(knowledge_dir()?
+        .join("repos")
+        .join(format!("{owner}__{repo}")))
+}
+
+/// Returns the reviewed knowledge cards directory for a repo.
+pub fn knowledge_cards_dir(owner: &str, repo: &str) -> Result<PathBuf> {
+    Ok(knowledge_repo_dir(owner, repo)?.join("cards"))
+}
+
+/// Returns the draft knowledge directory for a repo.
+pub fn knowledge_drafts_dir(owner: &str, repo: &str) -> Result<PathBuf> {
+    Ok(knowledge_repo_dir(owner, repo)?.join("drafts"))
+}
+
+/// Returns the generated knowledge artifacts directory for a repo.
+pub fn knowledge_artifacts_dir(owner: &str, repo: &str) -> Result<PathBuf> {
+    Ok(knowledge_repo_dir(owner, repo)?.join("artifacts"))
+}
+
+/// Returns the repo-local claustre directory.
+pub fn repo_claustre_dir(repo_root: &std::path::Path) -> PathBuf {
+    repo_root.join(".claustre")
+}
+
+/// Returns the repo-local workflows directory.
+pub fn repo_workflows_dir(repo_root: &std::path::Path) -> PathBuf {
+    repo_claustre_dir(repo_root).join("workflows")
+}
+
+/// Returns the repo-local command pack directory.
+pub fn repo_commands_dir(repo_root: &std::path::Path) -> PathBuf {
+    repo_claustre_dir(repo_root).join("commands")
+}
+
+/// Returns the repo-local sandbox file path.
+pub fn repo_sandbox_path(repo_root: &std::path::Path) -> PathBuf {
+    repo_claustre_dir(repo_root).join("sandbox.yaml")
 }
 
 /// Returns the PID file path for a session host
@@ -653,12 +909,20 @@ pub fn ensure_dirs() -> Result<()> {
     fs::create_dir_all(base_dir()?.join("tmp")).context("failed to create ~/.claustre/tmp/")?;
     fs::create_dir_all(sockets_dir()?).context("failed to create ~/.claustre/sockets/")?;
     fs::create_dir_all(pids_dir()?).context("failed to create ~/.claustre/pids/")?;
+    fs::create_dir_all(sync_dir()?).context("failed to create ~/.claustre/sync/")?;
+    fs::create_dir_all(attachments_dir()?).context("failed to create ~/.claustre/attachments/")?;
+    fs::create_dir_all(runtime_dir()?).context("failed to create ~/.claustre/runtime/")?;
+    fs::create_dir_all(ports_dir()?).context("failed to create ~/.claustre/ports/")?;
+    fs::create_dir_all(workflows_dir()?).context("failed to create ~/.claustre/workflows/")?;
+    fs::create_dir_all(commands_dir()?).context("failed to create ~/.claustre/commands/")?;
+    fs::create_dir_all(knowledge_dir()?.join("repos"))
+        .context("failed to create ~/.claustre/knowledge/repos/")?;
     Ok(())
 }
 
 /// Load config from ~/.claustre/config.toml (or return defaults if it doesn't exist)
 pub fn load() -> Result<Config> {
-    let path = base_dir()?.join("config.toml");
+    let path = config_path()?;
     if path.exists() {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -668,6 +932,273 @@ pub fn load() -> Result<Config> {
     } else {
         Ok(Config::default())
     }
+}
+
+/// Persist the `[github_app]` section of `config.toml` without overwriting
+/// unrelated user configuration.
+pub fn save_github_app_config(github_app: &GithubAppConfig) -> Result<()> {
+    let path = config_path()?;
+    let existing = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let merged = merge_github_app_config(&existing, github_app)?;
+    fs::write(&path, merged).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Persist the editable workbench settings to `config.toml` while preserving
+/// unrelated sections the user may already have defined.
+pub fn save_settings_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    let existing = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut root = if existing.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str::<toml::Value>(&existing).context("failed to parse existing config.toml")?
+    };
+
+    let root_table = root
+        .as_table_mut()
+        .context("config.toml root must be a TOML table")?;
+
+    root_table.insert(
+        "remote_enabled".to_string(),
+        toml::Value::Boolean(config.remote_enabled),
+    );
+    root_table.insert(
+        "auto_update".to_string(),
+        toml::Value::Boolean(config.auto_update),
+    );
+
+    root_table.insert(
+        "claude".to_string(),
+        toml::Value::Table(build_claude_table(&config.claude)),
+    );
+    root_table.insert(
+        "notifications".to_string(),
+        toml::Value::Table(build_notifications_table(&config.notifications)),
+    );
+    root_table.insert(
+        "review_loop".to_string(),
+        toml::Value::Table(build_review_loop_table(&config.review_loop)?),
+    );
+    root_table.insert(
+        "runtime".to_string(),
+        toml::Value::Table(build_runtime_table(&config.runtime)),
+    );
+    root_table.insert(
+        "ui".to_string(),
+        toml::Value::Table(build_ui_table(&config.ui)),
+    );
+    root_table.insert(
+        "sync".to_string(),
+        toml::Value::Table(build_sync_table(&config.sync)),
+    );
+    root_table.insert(
+        "rtk".to_string(),
+        toml::Value::Table(build_rtk_table(&config.rtk)),
+    );
+
+    let merged = toml::to_string_pretty(&root).context("failed to serialize config.toml")?;
+    fs::write(&path, merged).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn merge_github_app_config(existing: &str, github_app: &GithubAppConfig) -> Result<String> {
+    let mut root = if existing.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str::<toml::Value>(existing).context("failed to parse existing config.toml")?
+    };
+
+    let root_table = root
+        .as_table_mut()
+        .context("config.toml root must be a TOML table")?;
+
+    let mut section = toml::map::Map::new();
+    insert_optional_toml_string(&mut section, "client_id", github_app.client_id.as_deref());
+    insert_optional_toml_string(&mut section, "app_slug", github_app.app_slug.as_deref());
+    insert_optional_toml_string(
+        &mut section,
+        "install_url",
+        github_app.install_url.as_deref(),
+    );
+    insert_optional_toml_string(&mut section, "relay_url", github_app.relay_url.as_deref());
+    insert_optional_toml_string(
+        &mut section,
+        "default_installation_id",
+        github_app.default_installation_id.as_deref(),
+    );
+    insert_optional_toml_string(
+        &mut section,
+        "default_project_id",
+        github_app.default_project_id.as_deref(),
+    );
+
+    if section.is_empty() {
+        root_table.remove("github_app");
+    } else {
+        root_table.insert("github_app".to_string(), toml::Value::Table(section));
+    }
+
+    toml::to_string_pretty(&root).context("failed to serialize config.toml")
+}
+
+fn insert_optional_toml_string(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        table.insert(key.to_string(), toml::Value::String(value.to_string()));
+    }
+}
+
+fn insert_optional_toml_u32(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: Option<u32>,
+) {
+    if let Some(value) = value {
+        table.insert(key.to_string(), toml::Value::Integer(i64::from(value)));
+    }
+}
+
+fn build_claude_table(claude: &ClaudeConfig) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "model".to_string(),
+        toml::Value::String(claude.model.clone()),
+    );
+    table.insert(
+        "effort".to_string(),
+        toml::Value::String(claude.effort.clone()),
+    );
+    table
+}
+
+fn build_notifications_table(
+    notifications: &NotificationConfig,
+) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "enabled".to_string(),
+        toml::Value::Boolean(notifications.enabled),
+    );
+    table.insert(
+        "system".to_string(),
+        toml::Value::Boolean(notifications.system),
+    );
+    table.insert(
+        "command".to_string(),
+        toml::Value::String(notifications.command.clone()),
+    );
+    table.insert(
+        "template".to_string(),
+        toml::Value::String(notifications.template.clone()),
+    );
+    insert_optional_toml_string(&mut table, "voice", notifications.voice.as_deref());
+    insert_optional_toml_u32(&mut table, "rate", notifications.rate);
+
+    let mut rules = toml::map::Map::new();
+    rules.insert(
+        "ask_user".to_string(),
+        toml::Value::Boolean(notifications.rules.ask_user),
+    );
+    rules.insert(
+        "approval_required".to_string(),
+        toml::Value::Boolean(notifications.rules.approval_required),
+    );
+    rules.insert(
+        "run_complete".to_string(),
+        toml::Value::Boolean(notifications.rules.run_complete),
+    );
+    rules.insert(
+        "review_requested".to_string(),
+        toml::Value::Boolean(notifications.rules.review_requested),
+    );
+    rules.insert(
+        "ci_failed".to_string(),
+        toml::Value::Boolean(notifications.rules.ci_failed),
+    );
+    table.insert("rules".to_string(), toml::Value::Table(rules));
+    table
+}
+
+fn build_review_loop_table(
+    review_loop: &ReviewLoopConfig,
+) -> Result<toml::map::Map<String, toml::Value>> {
+    let mut table = toml::map::Map::new();
+    let poll_interval_secs = i64::try_from(review_loop.poll_interval_secs)
+        .context("review_loop.poll_interval_secs exceeds TOML integer range")?;
+    table.insert(
+        "poll_interval_secs".to_string(),
+        toml::Value::Integer(poll_interval_secs),
+    );
+    insert_optional_toml_string(&mut table, "prompt", review_loop.prompt.as_deref());
+    Ok(table)
+}
+
+fn build_runtime_table(runtime: &RuntimeConfig) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    insert_optional_toml_string(&mut table, "sandbox_path", runtime.sandbox_path.as_deref());
+    insert_optional_toml_string(
+        &mut table,
+        "default_profile",
+        runtime.default_profile.as_deref(),
+    );
+    insert_optional_toml_string(
+        &mut table,
+        "attachments_dir",
+        runtime.attachments_dir.as_deref(),
+    );
+    table
+}
+
+fn build_ui_table(ui: &UiConfig) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    let mut keymap = toml::map::Map::new();
+    keymap.insert(
+        "preset".to_string(),
+        toml::Value::String(ui.keymap.preset.clone()),
+    );
+    keymap.insert(
+        "leader".to_string(),
+        toml::Value::String(ui.keymap.leader.clone()),
+    );
+    if !ui.keymap.overrides.is_empty() {
+        let overrides = ui
+            .keymap
+            .overrides
+            .iter()
+            .map(|(key, value)| (key.clone(), toml::Value::String(value.clone())))
+            .collect();
+        keymap.insert("overrides".to_string(), toml::Value::Table(overrides));
+    }
+    table.insert("keymap".to_string(), toml::Value::Table(keymap));
+    table
+}
+
+fn build_sync_table(sync: &SyncConfig) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "auto_push".to_string(),
+        toml::Value::Boolean(sync.auto_push),
+    );
+    table
+}
+
+fn build_rtk_table(rtk: &RtkConfig) -> toml::map::Map<String, toml::Value> {
+    let mut table = toml::map::Map::new();
+    table.insert("enabled".to_string(), toml::Value::Boolean(rtk.enabled));
+    table
 }
 
 /// Merge global and project CLAUDE.md content.
@@ -924,6 +1455,7 @@ pane = "claude"
             template: "task {task} is done".to_string(),
             voice: None,
             rate: None,
+            rules: NotificationRulesConfig::default(),
         };
         let message = config.template.replace("{task}", "my-task");
         assert_eq!(message, "task my-task is done");
@@ -941,6 +1473,36 @@ pane = "claude"
         assert_eq!(worktree_base_dir().unwrap(), base.join("worktrees"));
         assert_eq!(sockets_dir().unwrap(), base.join("sockets"));
         assert_eq!(pids_dir().unwrap(), base.join("pids"));
+    }
+
+    #[test]
+    fn merge_github_app_config_preserves_other_sections() {
+        let existing = r#"
+[notifications]
+enabled = true
+
+[github_app]
+relay_url = "https://old.example.com"
+"#;
+        let merged = merge_github_app_config(
+            existing,
+            &GithubAppConfig {
+                client_id: Some("Iv1.abc123".to_string()),
+                app_slug: Some("claustre".to_string()),
+                install_url: None,
+                relay_url: Some("https://relay.example.com".to_string()),
+                default_installation_id: Some("123".to_string()),
+                default_project_id: Some("Sprint".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(merged.contains("[notifications]"));
+        assert!(merged.contains("client_id = \"Iv1.abc123\""));
+        assert!(merged.contains("app_slug = \"claustre\""));
+        assert!(merged.contains("relay_url = \"https://relay.example.com\""));
+        assert!(merged.contains("default_installation_id = \"123\""));
+        assert!(merged.contains("default_project_id = \"Sprint\""));
     }
 
     #[test]

@@ -543,7 +543,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect, thread_ctx: Option<&SelectedThreadContext>) {
+fn draw_main(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    thread_ctx: Option<&SelectedThreadContext>,
+) {
     match app.workbench_view {
         WorkbenchView::MyTasks => {
             if app.uses_github_my_tasks() {
@@ -1050,7 +1055,7 @@ fn review_row_meta(app: &App, item: &ReviewQueueItem) -> String {
 
 fn draw_thread_workspace(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     thread_ctx: Option<&SelectedThreadContext>,
 ) {
@@ -1159,7 +1164,7 @@ fn draw_thread_list(frame: &mut Frame, app: &App, area: Rect) {
 
 pub(super) fn draw_thread_chat(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     area: Rect,
     thread_ctx: Option<&SelectedThreadContext>,
 ) {
@@ -1224,9 +1229,11 @@ pub(super) fn draw_thread_chat(
     let max_compose = (inner.height * 2 / 5).max(4);
     let compose_height = compose_content_height.clamp(3, max_compose);
 
-    // Compute header height: 2 base lines + optional pipeline strip
+    // Compute header height: 1 base line (metadata) + optional pipeline strip.
+    // The thread title is already shown in the slim session header above,
+    // so we only show runtime/source metadata + workflow pipeline here.
     let pipeline = workflow_pipeline_line(thread_ctx, &app.theme, inner.width);
-    let header_height: u16 = if pipeline.is_some() { 3 } else { 2 };
+    let header_height: u16 = if pipeline.is_some() { 2 } else { 1 };
 
     // Compute approval banner height
     let approval_banner = workflow_approval_banner(thread_ctx, &app.theme, inner.width);
@@ -1243,45 +1250,8 @@ pub(super) fn draw_thread_chat(
         .split(inner);
 
     let session_state = thread_session_state(app, &thread_ctx.thread);
-    let title_line = if let Some(github_item) = thread_ctx.github_item.as_ref() {
-        format!("#{} {}", github_item.number, github_item.title)
-    } else {
-        thread_ctx.thread.title.clone()
-    };
-    // Line 1: title on left, session status on right
-    let status_color = match session_state {
-        "working" => app.theme.status_working,
-        "idle" => app.theme.accent_tertiary,
-        "claude exited" | "no session" | "closed" | "error" => app.theme.status_error,
-        "needs approval" | "waiting for input" | "interrupted" => app.theme.status_paused,
-        "done" => app.theme.status_done,
-        _ => app.theme.accent_tertiary,
-    };
-    let status_right = format!(
-        "{}  {}",
-        thread_ctx.identity_summary(),
-        session_state
-    );
-    let title_width = inner.width.saturating_sub(status_right.len() as u16 + 2) as usize;
-    let display_title = truncate(&title_line, title_width);
-    let pad = inner
-        .width
-        .saturating_sub(display_title.len() as u16 + status_right.len() as u16)
-        as usize;
+    // Single metadata line: runtime + source
     let mut header = vec![
-        Line::from(vec![
-            Span::styled(
-                display_title,
-                Style::default()
-                    .fg(app.theme.accent_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ".repeat(pad), Style::default()),
-            Span::styled(
-                status_right,
-                Style::default().fg(status_color),
-            ),
-        ]),
         Line::from(vec![
             Span::styled(
                 thread_ctx.runtime_summary(),
@@ -1316,51 +1286,125 @@ pub(super) fn draw_thread_chat(
         vertical[0],
     );
 
-    // Prefer JSONL conversation cache when available for this session
-    let jsonl_lines = thread_ctx
-        .thread
-        .session_id
-        .as_deref()
-        .and_then(|sid| {
-            app.conversation_cache
+    // Prefer JSONL conversation cache when available for this session.
+    // Use pre-built lines cache to avoid rebuilding on every 60fps frame.
+    let width = vertical[1].width;
+    let jsonl_lines: Option<Vec<Line<'static>>> =
+        thread_ctx.thread.session_id.as_deref().and_then(|sid| {
+            let conv = app
+                .conversation_cache
                 .as_ref()
-                .filter(|c| c.session_id == sid && !c.entries.is_empty())
-        })
-        .map(|cache| build_jsonl_conversation_lines(&cache.entries, &app.theme, vertical[1].width));
+                .filter(|c| c.session_id == sid && !c.entries.is_empty())?;
 
+            // Check if cached lines are still valid
+            if let Some(ref cached) = app.cached_chat_lines {
+                if cached.session_id == sid && cached.entry_count == conv.entries.len() {
+                    return Some(cached.lines.clone());
+                }
+            }
+
+            // Rebuild and cache
+            let lines = build_jsonl_conversation_lines(&conv.entries, &app.theme, width);
+            app.cached_chat_lines = Some(super::super::app::CachedChatLines {
+                session_id: sid.to_string(),
+                entry_count: conv.entries.len(),
+                lines: lines.clone(),
+            });
+            Some(lines)
+        });
+
+    let has_jsonl = jsonl_lines.is_some();
     let mut timeline = jsonl_lines.unwrap_or_else(|| build_thread_timeline(app, thread_ctx));
 
-    // Append live "Working..." indicator when the agent is busy
-    if let Some(ref sid) = thread_ctx.thread.session_id {
-        let pty_preview = app.pty_activity_preview.get(sid.as_str());
-        let is_working = app
-            .sessions
-            .iter()
-            .any(|s| s.id == *sid && s.claude_status == crate::store::ClaudeStatus::Working)
-            && !app.pty_idle_sessions.contains(sid.as_str());
-        if is_working {
-            timeline.push(Line::from(""));
-            // Top border to separate working indicator from conversation
-            timeline.push(Line::from(Span::styled(
-                "  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-                Style::default()
-                    .fg(app.theme.border_unfocused)
-                    .add_modifier(Modifier::DIM),
-            )));
-            timeline.push(Line::from(Span::styled(
-                format!("  {} Agent working...", spinner_char()),
-                Style::default()
-                    .fg(app.theme.status_working)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            if let Some(lines) = pty_preview {
-                for line in lines.iter().take(6) {
+    // For sessions without JSONL (Codex, etc.), show live PTY content
+    // in the chat view so the user can see what the provider is doing.
+    if !has_jsonl {
+        if let Some(ref sid) = thread_ctx.thread.session_id {
+            let pty_content: Option<Vec<String>> = app.tabs.iter().find_map(|tab| {
+                let super::super::app::Tab::Session {
+                    session_id,
+                    terminals,
+                    ..
+                } = tab
+                else {
+                    return None;
+                };
+                if session_id != sid {
+                    return None;
+                }
+                terminals.with_claude_live_screen(|screen| {
+                    let rows = screen.size().0;
+                    let cols = screen.size().1;
+                    let mut lines: Vec<String> = Vec::new();
+                    for row in 0..rows {
+                        let line = screen.contents_between(row, 0, row, cols);
+                        lines.push(line);
+                    }
+                    // Trim trailing empty lines
+                    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                        lines.pop();
+                    }
+                    lines
+                })
+            });
+
+            if let Some(ref content) = pty_content {
+                if !content.is_empty() {
+                    timeline.push(Line::from(""));
                     timeline.push(Line::from(Span::styled(
-                        format!("    {line}"),
+                        format!(
+                            "  \u{2500}\u{2500}\u{2500} {} Live Terminal \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                            spinner_char()
+                        ),
                         Style::default()
-                            .fg(app.theme.text_secondary)
+                            .fg(app.theme.accent_secondary)
                             .add_modifier(Modifier::DIM),
                     )));
+                    timeline.push(Line::from(""));
+                    for line in content {
+                        timeline.push(Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(app.theme.text_primary),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Append live "Working..." indicator when the agent is busy (JSONL sessions only).
+    if has_jsonl {
+        if let Some(ref sid) = thread_ctx.thread.session_id {
+            let pty_preview = app.pty_activity_preview.get(sid.as_str());
+            let db_working = app
+                .sessions
+                .iter()
+                .any(|s| s.id == *sid && s.claude_status == crate::store::ClaudeStatus::Working);
+            let not_idle = !app.pty_idle_sessions.contains(sid.as_str());
+            let is_working = db_working && not_idle;
+            if is_working {
+                timeline.push(Line::from(""));
+                timeline.push(Line::from(Span::styled(
+                    "  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                    Style::default()
+                        .fg(app.theme.border_unfocused)
+                        .add_modifier(Modifier::DIM),
+                )));
+                timeline.push(Line::from(Span::styled(
+                    format!("  {} Agent working...", spinner_char()),
+                    Style::default()
+                        .fg(app.theme.status_working)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if let Some(lines) = pty_preview {
+                    for line in lines.iter().take(6) {
+                        timeline.push(Line::from(Span::styled(
+                            format!("    {line}"),
+                            Style::default()
+                                .fg(app.theme.text_secondary)
+                                .add_modifier(Modifier::DIM),
+                        )));
+                    }
                 }
             }
         }
@@ -1371,7 +1415,12 @@ pub(super) fn draw_thread_chat(
         .wrap(Wrap { trim: false });
     // Use visual line count (after wrapping) for scroll calculation
     let visual_lines = timeline_paragraph.line_count(vertical[1].width) as u16;
-    let transcript_scroll = visual_lines.saturating_sub(vertical[1].height);
+    let max_scroll = visual_lines.saturating_sub(vertical[1].height);
+    let transcript_scroll = if app.session_chat_auto_scroll {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.session_chat_scroll)
+    };
     frame.render_widget(
         timeline_paragraph.scroll((transcript_scroll, 0)),
         vertical[1],
@@ -1435,7 +1484,7 @@ pub(super) fn draw_thread_chat(
         let has_queued = app
             .queued_compose_message
             .as_ref()
-            .is_some_and(|(tid, _)| tid == &thread_ctx.thread.id);
+            .is_some_and(|(tid, _, _)| tid == &thread_ctx.thread.id);
         let compose_text = if compose_focused {
             format!(
                 "> {}",
@@ -1474,13 +1523,22 @@ pub(super) fn draw_thread_chat(
                 },
             )
         };
-        vec![
-            Line::from(vec![Span::styled(
-                reply_label,
+        let mut reply_spans = vec![Span::styled(
+            reply_label,
+            Style::default()
+                .fg(reply_color)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if app.clipboard_has_image {
+            reply_spans.push(Span::styled(
+                "  Ctrl+V to attach image",
                 Style::default()
-                    .fg(reply_color)
-                    .add_modifier(Modifier::BOLD),
-            )]),
+                    .fg(app.theme.text_secondary)
+                    .add_modifier(Modifier::DIM),
+            ));
+        }
+        vec![
+            Line::from(reply_spans),
             Line::from(Span::styled(
                 compose_text,
                 Style::default().fg(if compose_focused || has_queued {
@@ -1615,6 +1673,30 @@ fn build_thread_timeline(app: &App, thread_ctx: &SelectedThreadContext) -> Vec<L
                     Style::default().fg(color).add_modifier(Modifier::DIM),
                 ),
             ]));
+
+            // Show stage output summary below the divider if available
+            if let Some(stage) = thread_ctx
+                .workflow_stages
+                .iter()
+                .find(|s| s.stage_name == stage_name)
+            {
+                if let Some(ref summary) = stage.output_summary {
+                    let preview = if summary.len() > 300 {
+                        format!("{}...", &summary[..297])
+                    } else {
+                        summary.clone()
+                    };
+                    for summary_line in preview.lines().take(6) {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {summary_line}"),
+                            Style::default()
+                                .fg(app.theme.text_secondary)
+                                .add_modifier(Modifier::DIM),
+                        )));
+                    }
+                }
+            }
+
             lines.push(Line::from(""));
             continue;
         }
@@ -2786,10 +2868,7 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
                                 } else {
                                     ""
                                 };
-                                let provider = stage
-                                    .provider
-                                    .as_deref()
-                                    .unwrap_or("none");
+                                let provider = stage.provider.as_deref().unwrap_or("none");
                                 let prompt_hint = stage
                                     .prompt_template
                                     .as_deref()

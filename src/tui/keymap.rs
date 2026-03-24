@@ -20,6 +20,8 @@ pub enum Action {
     FocusTasks,
     MoveUp,
     MoveDown,
+    ResizePaneNarrow,
+    ResizePaneWide,
 
     // Task actions
     Select,
@@ -41,6 +43,10 @@ pub enum Action {
     Configure,
     // Board
     OpenBoard,
+    CommentOnIssue,
+    CloseIssue,
+    CreateIssue,
+    EditIssue,
     // Session-only
     ReturnToDashboard,
     FocusPrevPane,
@@ -61,6 +67,7 @@ pub enum HelpCategory {
     Navigation,
     Projects,
     Tasks,
+    Board,
     SkillsPanel,
     SessionTab,
 }
@@ -71,6 +78,7 @@ impl HelpCategory {
             Self::Navigation => "Navigation",
             Self::Projects => "Projects",
             Self::Tasks => "Tasks",
+            Self::Board => "Sprint Board",
             Self::SkillsPanel => "Skills Panel (i)",
             Self::SessionTab => "Session Tab",
         }
@@ -81,6 +89,7 @@ impl HelpCategory {
         Self::Navigation,
         Self::Projects,
         Self::Tasks,
+        Self::Board,
         Self::SkillsPanel,
         Self::SessionTab,
     ];
@@ -330,6 +339,22 @@ fn default_normal_bindings() -> Vec<KeyBinding> {
             category: Navigation,
         },
         KeyBinding {
+            code: KeyCode::Char('['),
+            modifiers: KeyModifiers::NONE,
+            action: ResizePaneNarrow,
+            label: "  [ / ]",
+            description: "Resize side pane",
+            category: Navigation,
+        },
+        KeyBinding {
+            code: KeyCode::Char(']'),
+            modifiers: KeyModifiers::NONE,
+            action: ResizePaneWide,
+            label: "",
+            description: "",
+            category: Navigation,
+        },
+        KeyBinding {
             code: KeyCode::Char('q'),
             modifiers: KeyModifiers::NONE,
             action: Quit,
@@ -470,6 +495,38 @@ fn default_normal_bindings() -> Vec<KeyBinding> {
             category: Tasks,
         },
         KeyBinding {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::NONE,
+            action: CommentOnIssue,
+            label: "  c",
+            description: "Comment on issue",
+            category: Board,
+        },
+        KeyBinding {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            action: CloseIssue,
+            label: "  x",
+            description: "Close/reopen issue",
+            category: Board,
+        },
+        KeyBinding {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::NONE,
+            action: CreateIssue,
+            label: "  n",
+            description: "New issue",
+            category: Board,
+        },
+        KeyBinding {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::NONE,
+            action: EditIssue,
+            label: "  e",
+            description: "Edit issue",
+            category: Board,
+        },
+        KeyBinding {
             code: KeyCode::Char('i'),
             modifiers: KeyModifiers::NONE,
             action: OpenSkills,
@@ -558,14 +615,6 @@ fn default_session_bindings() -> Vec<KeyBinding> {
             action: ScrollPageDown,
             label: "",
             description: "",
-            category: SessionTab,
-        },
-        KeyBinding {
-            code: KeyCode::Char('r'),
-            modifiers: KeyModifiers::CONTROL,
-            action: SplitRight,
-            label: "  Ctrl+R",
-            description: "Split right",
             category: SessionTab,
         },
         KeyBinding {
@@ -662,6 +711,6 @@ mod tests {
     #[test]
     fn session_bindings_has_expected_count() {
         let km = KeyMap::default_keymap();
-        assert_eq!(km.session.len(), 11);
+        assert_eq!(km.session.len(), 10);
     }
 }

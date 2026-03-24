@@ -90,9 +90,9 @@ fn draw_active_impl(frame: &mut Frame, app: &mut App, size: Rect) {
         .split(outer[1]);
 
     let usage_height: u16 = if app.rate_limit_state.is_rate_limited {
-        6
+        7
     } else {
-        4
+        5
     };
 
     // Both columns share the same 60/40 vertical split so panels align horizontally
@@ -116,7 +116,10 @@ fn draw_active_impl(frame: &mut Frame, app: &mut App, size: Rect) {
     draw_project_stats(frame, app, left[1]);
     draw_task_queue(frame, app, right_rows[0]);
     draw_session_detail(frame, app, right_bottom[0]);
-    draw_usage_bars(frame, app, right_bottom[1]);
+    let token_usage = app
+        .selected_task()
+        .map(|t| (t.input_tokens, t.output_tokens));
+    draw_usage_bars(frame, app, right_bottom[1], token_usage);
 
     // Bottom area: always split into status line (row 0) + hints line (row 1)
     let bottom = Layout::default()
@@ -453,6 +456,54 @@ fn draw_session_detail(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("  PR: ", Style::default().fg(app.theme.text_secondary)),
             Span::styled(url, Style::default().fg(app.theme.pr_link)),
         ]));
+    }
+
+    if let Some(thread_ctx) = app.selected_thread_context() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "  Thread Workspace",
+            Style::default()
+                .fg(app.theme.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("  Thread: ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                thread_ctx.identity_summary(),
+                Style::default().fg(app.theme.text_primary),
+            ),
+        ]));
+        if let Some(run_summary) = thread_ctx.latest_run_summary() {
+            lines.push(Line::from(vec![
+                Span::styled("  Agent: ", Style::default().fg(app.theme.text_secondary)),
+                Span::styled(run_summary, Style::default().fg(app.theme.text_primary)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  Runtime: ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                thread_ctx.runtime_summary(),
+                Style::default().fg(app.theme.text_primary),
+            ),
+        ]));
+        if let Some(workflow_summary) = thread_ctx.workflow_summary() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Workflow: ",
+                    Style::default().fg(app.theme.text_secondary),
+                ),
+                Span::styled(
+                    workflow_summary,
+                    Style::default().fg(app.theme.text_primary),
+                ),
+            ]));
+        }
+        if let Some(github_summary) = thread_ctx.github_summary() {
+            lines.push(Line::from(vec![
+                Span::styled("  GitHub: ", Style::default().fg(app.theme.text_secondary)),
+                Span::styled(github_summary, Style::default().fg(app.theme.text_primary)),
+            ]));
+        }
     }
 
     let detail = Paragraph::new(lines)

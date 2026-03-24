@@ -23,7 +23,12 @@ import DocsLayout from "../layouts/DocsLayout.astro";
   hooks/               # Global hooks (copied to worktrees)
   claustre.db          # SQLite database
   worktrees/           # Session worktrees
-  tmp/                 # Session progress files</code></pre>
+  tmp/                 # Session progress files
+  attachments/         # Clipboard image attachments by thread
+  runtime/             # Per-thread runtime logs and state
+  workflows/           # User-defined workflow YAML files
+  commands/            # Markdown-backed command packs
+  knowledge/           # Knowledge cards, drafts, and synthesized context</code></pre>
 
   <p>
     Project-specific configuration lives in a <code>.claustre/</code> directory
@@ -31,7 +36,10 @@ import DocsLayout from "../layouts/DocsLayout.astro";
   </p>
   <pre><code>&lt;your-repo&gt;/.claustre/
   claude.md            # Project-specific CLAUDE.md additions
-  hooks/               # Project hooks (override global by filename)</code></pre>
+  hooks/               # Project hooks (override global by filename)
+  sandbox.yaml         # Repo runtime definition (optional)
+  workflows/           # Repo-local workflow YAML files
+  commands/            # Repo-local markdown command packs</code></pre>
 
   <h2>config.toml</h2>
   <p>
@@ -53,6 +61,36 @@ command = "say"         # Notification command (default: macOS "say")
 template = "completed {'{task}'}"  # Message template ({'{task}'} = task title)
 voice = "Samantha"      # macOS voice (optional)
 rate = 200              # Words per minute (optional)
+
+[notifications.rules]
+ask_user = true
+approval_required = true
+run_complete = true
+review_requested = true
+ci_failed = true
+
+[github_app]
+client_id = "Iv1.custom_app_client_id"
+app_slug = "my-claustre-app"
+install_url = "https://github.com/apps/my-claustre-app/installations/new"
+relay_url = "https://relay.example.com"
+default_installation_id = "123456"
+default_project_id = "12"
+
+[providers.default]
+command = "claude"
+model = "claude-opus-4-6"
+effort = "max"
+enabled = true
+
+[runtime]
+sandbox_path = ""
+default_profile = "default"
+attachments_dir = ""
+
+[ui.keymap]
+preset = "nvim"
+leader = "Space"
 
 [review_loop]
 poll_interval_secs = 120  # Seconds between PR comment checks
@@ -294,6 +332,222 @@ ask = ["Bash(rm:*)"]</code></pre>
     for it to finish. If it fails, a warning is logged but nothing is surfaced
     to the user.
   </p>
+
+  <h3>Notification Rules</h3>
+  <p>
+    <code>[notifications.rules]</code> controls which thread-level events should
+    surface as OS notifications. These rules extend completion notifications to
+    cover interactive thread workflows such as approval waits and CI failures.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Type</th>
+        <th>Default</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ask_user</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Notify when a thread is waiting for a human reply</td>
+      </tr>
+      <tr>
+        <td><code>approval_required</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Notify when a workflow or provider run pauses for approval</td>
+      </tr>
+      <tr>
+        <td><code>run_complete</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Notify when a thread run completes</td>
+      </tr>
+      <tr>
+        <td><code>review_requested</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Notify when GitHub review activity requires attention</td>
+      </tr>
+      <tr>
+        <td><code>ci_failed</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Notify when cached GitHub CI status moves to failed</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>GitHub App</h3>
+  <p>
+    The <code>[github_app]</code> section is optional. Claustre uses bundled app
+    defaults when they are available in a build, falls back to GitHub CLI browser
+    auth when they are not, and only needs this section when you want to override
+    the built-in app or point Claustre at a custom relay. When the fallback
+    backend is GitHub CLI, the CLI token must include <code>read:project</code>
+    and <code>project</code> for Projects v2 boards and edits.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Type</th>
+        <th>Default</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>client_id</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional custom GitHub App OAuth client ID used to override the bundled app</td>
+      </tr>
+      <tr>
+        <td><code>app_slug</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional custom GitHub App slug used to derive the default installation URL</td>
+      </tr>
+      <tr>
+        <td><code>install_url</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional explicit install URL; overrides the slug-derived or bundled install URL</td>
+      </tr>
+      <tr>
+        <td><code>relay_url</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional relay base URL for hosted/custom GitHub App flows</td>
+      </tr>
+      <tr>
+        <td><code>default_installation_id</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Preferred GitHub installation or org slug</td>
+      </tr>
+      <tr>
+        <td><code>default_project_id</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Preferred GitHub Project v2 number (or a title hint) for board and sprint flows. The TUI persists the selected project number here.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Providers</h3>
+  <p>
+    Provider profiles live under <code>[providers.&lt;name&gt;]</code>. They
+    describe how Claustre should launch or route a thread run.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Type</th>
+        <th>Default</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>enabled</code></td>
+        <td>bool</td>
+        <td><code>true</code></td>
+        <td>Whether the profile is available for thread launches and provider switching</td>
+      </tr>
+      <tr>
+        <td><code>command</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional command override used to launch the provider</td>
+      </tr>
+      <tr>
+        <td><code>model</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Default model name for the profile</td>
+      </tr>
+      <tr>
+        <td><code>effort</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional reasoning-effort default carried into thread workflows</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Runtime</h3>
+  <p>
+    The <code>[runtime]</code> section controls how Claustre discovers and
+    launches <code>sandbox.yaml</code> definitions for a thread worktree.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Type</th>
+        <th>Default</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>sandbox_path</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Explicit path to a <code>sandbox.yaml</code> file. When empty, Claustre falls back to worktree, repo-local, then global discovery.</td>
+      </tr>
+      <tr>
+        <td><code>default_profile</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Default runtime profile to use when a thread does not override it</td>
+      </tr>
+      <tr>
+        <td><code>attachments_dir</code></td>
+        <td>string</td>
+        <td><code>""</code></td>
+        <td>Optional override for where clipboard image and file attachments are stored</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>UI Keymap</h3>
+  <p>
+    The <code>[ui.keymap]</code> section reserves UI-keymap settings for the
+    new thread-aware workbench. Today it is mainly used to define the intended
+    preset and leader key.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Type</th>
+        <th>Default</th>
+        <th>Description</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>preset</code></td>
+        <td>string</td>
+        <td><code>"nvim"</code></td>
+        <td>Name of the keymap preset. The current TUI remains vim-first.</td>
+      </tr>
+      <tr>
+        <td><code>leader</code></td>
+        <td>string</td>
+        <td><code>"Space"</code></td>
+        <td>Leader key reserved for future multi-pane thread commands</td>
+      </tr>
+    </tbody>
+  </table>
 
   <h3>Review Loop</h3>
   <p>

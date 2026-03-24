@@ -4,6 +4,8 @@
 //! Uses `anyhow::Context` for actionable error messages on key operations.
 
 mod external_sessions;
+mod github_cache;
+mod knowledge;
 mod projects;
 mod rate_limits;
 mod sessions;
@@ -11,6 +13,8 @@ mod stats;
 mod subtasks;
 mod sync;
 mod tasks;
+mod threads;
+mod workflows;
 
 pub use stats::ProjectStats;
 

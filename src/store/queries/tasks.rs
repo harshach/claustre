@@ -36,6 +36,7 @@ impl Store {
         review_loop: bool,
     ) -> Result<Task> {
         let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
         let max_order: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(sort_order), 0) FROM tasks WHERE project_id = ?1",
             params![project_id],
@@ -43,8 +44,8 @@ impl Store {
         )?;
         self.conn
             .execute(
-                "INSERT INTO tasks (id, project_id, title, description, mode, sort_order, branch, base, push_mode, review_loop) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![id, project_id, title, description, mode.as_str(), max_order + 1, branch, base, push_mode.as_str(), review_loop],
+                "INSERT INTO tasks (id, project_id, title, description, mode, sort_order, branch, base, push_mode, review_loop, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![id, project_id, title, description, mode.as_str(), max_order + 1, branch, base, push_mode.as_str(), review_loop, now],
             )
             .with_context(|| format!("failed to create task '{title}'"))?;
         self.get_task(&id)

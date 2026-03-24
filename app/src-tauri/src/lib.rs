@@ -12,7 +12,9 @@ use std::sync::Mutex;
 use claustre::store::{PushMode, Store, Task, TaskMode, TaskStatus};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
+#[cfg(debug_assertions)]
+use tauri::Manager;
+use tauri::{Emitter, State};
 
 use claustre::skills;
 
@@ -1092,6 +1094,7 @@ pub fn run() {
             get_board_data,
         ])
         .setup(|app| {
+            let _ = &app; // used in debug_assertions below
             #[cfg(debug_assertions)]
             if let Some(window) = app.get_webview_window("main") {
                 window.open_devtools();

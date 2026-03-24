@@ -1,59 +1,307 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders},
+    style::{Modifier, Style},
+    text::{Line as TextLine, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use crate::pty::{LayoutNode, PaneId, SplitDirection, TerminalWidget};
 
-use super::super::app::{App, Tab};
+use super::super::app::{App, SessionTabView, Tab};
 use super::super::form::render_hints;
 use super::tab_bar::draw_tab_bar;
+use super::workbench::draw_thread_session_view;
 
-/// Draw the session terminal view with a dynamic pane layout tree.
-pub(super) fn draw_session_tab(frame: &mut Frame, app: &App) {
+/// Draw the session tab: conversation view (chat + inspector) by default,
+/// terminal PTY view via Ctrl+O toggle.
+pub(super) fn draw_session_tab(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // tab bar
-            Constraint::Min(0),    // terminal area
+            Constraint::Min(0),    // body area
             Constraint::Length(1), // hint bar
         ])
         .split(size);
 
     draw_tab_bar(frame, app, outer[0]);
 
-    if let Some(Tab::Session {
-        terminals, label, ..
-    }) = app.tabs.get(app.active_tab)
-    {
-        render_layout_node(
-            &terminals.layout,
-            terminals,
-            label,
-            &app.theme,
+    let session_label = match app.tabs.get(app.active_tab) {
+        Some(Tab::Session { label, .. }) => label.clone(),
+        _ => String::new(),
+    };
+    let view_mode = match app.tabs.get(app.active_tab) {
+        Some(Tab::Session { view_mode, .. }) => *view_mode,
+        _ => SessionTabView::Terminal,
+    };
+
+    // Use cached thread context (refreshed on slow ticks) to avoid
+    // running ~15 DB queries on every 60fps frame.
+    let thread_ctx = app.cached_session_thread_ctx.take();
+
+    match view_mode {
+        SessionTabView::Conversation => {
+            if let Some(ref ctx) = thread_ctx {
+                draw_thread_session_view(frame, app, outer[1], &session_label, ctx);
+            } else if let Some(Tab::Session {
+                terminals, label, ..
+            }) = app.tabs.get(app.active_tab)
+            {
+                render_layout_node(
+                    &terminals.layout,
+                    terminals,
+                    label,
+                    &app.theme,
+                    frame,
+                    outer[1],
+                );
+            }
+        }
+        SessionTabView::Terminal => {
+            if let Some(Tab::Session {
+                terminals, label, ..
+            }) = app.tabs.get(app.active_tab)
+            {
+                render_layout_node(
+                    &terminals.layout,
+                    terminals,
+                    label,
+                    &app.theme,
+                    frame,
+                    outer[1],
+                );
+            }
+        }
+        SessionTabView::Editor => {
+            // Render the editor pane full-screen (no border, no layout tree)
+            if let Some(Tab::Session { terminals, .. }) = app.tabs.get(app.active_tab)
+                && let Some(editor_id) = terminals.editor_pane_id
+                && let Some(term) = terminals.terminal(editor_id)
+            {
+                frame.render_widget(
+                    TerminalWidget::new(term.screen(), true),
+                    outer[1],
+                );
+            }
+        }
+    }
+
+    // Restore cached context after rendering
+    app.cached_session_thread_ctx = thread_ctx;
+
+    // Hint bar
+    if view_mode == SessionTabView::Conversation && app.cached_session_thread_ctx.is_some() {
+        let expand_hint = if app.inspector_expanded {
+            ("  f", ": collapse  ")
+        } else {
+            ("  f", ": expand  ")
+        };
+        let mut hints: Vec<(&str, &str)> = vec![
+            ("  i", ": compose  "),
+            ("  q", ": close/done  "),
+            expand_hint,
+            ("  j/k", ": scroll  "),
+        ];
+        hints.extend_from_slice(&[
+            ("Ctrl+O", ": terminal  "),
+            ("Ctrl+E", ": editor  "),
+            ("  1-6", ": inspector  "),
+            ("Ctrl+D", ": dashboard"),
+        ]);
+        render_hints(
             frame,
-            outer[1],
+            outer[2],
+            &hints,
+            Style::default().fg(app.theme.accent_secondary),
+            Style::default(),
+        );
+    } else if view_mode == SessionTabView::Editor {
+        render_hints(
+            frame,
+            outer[2],
+            &[
+                ("Ctrl+O", ": chat  "),
+                ("Ctrl+E", ": editor (exit)  "),
+                ("Ctrl+J/K", ": switch tab  "),
+                ("Ctrl+Q", ": close session  "),
+            ],
+            Style::default().fg(app.theme.accent_secondary),
+            Style::default(),
+        );
+    } else {
+        render_hints(
+            frame,
+            outer[2],
+            &[
+                ("  Ctrl+O", ": chat  "),
+                ("Ctrl+E", ": editor  "),
+                ("Ctrl+H/L", ": switch pane  "),
+                ("Ctrl+J/K", ": switch tab  "),
+                ("Ctrl+G", ": scroll bottom  "),
+                ("Ctrl+B", ": split  "),
+                ("Ctrl+W", ": close pane  "),
+                ("Ctrl+Q", ": close session  "),
+            ],
+            Style::default().fg(app.theme.accent_secondary),
+            Style::default(),
         );
     }
 
-    // Hint bar
-    render_hints(
-        frame,
-        outer[2],
-        &[
-            ("  Ctrl+D", ": dashboard  "),
-            ("Ctrl+H/L", ": switch pane  "),
-            ("Ctrl+J/K", ": switch tab  "),
-            ("Ctrl+G", ": scroll bottom  "),
-            ("Ctrl+R/B", ": split  "),
-            ("Ctrl+W", ": close  "),
-        ],
-        Style::default().fg(app.theme.accent_secondary),
-        Style::default(),
-    );
+    // Confirmation overlay (rendered on top of everything)
+    if app.input_mode == super::super::app::InputMode::ConfirmDelete
+        && matches!(
+            app.confirm_delete_kind,
+            super::super::app::DeleteTarget::Session
+        )
+    {
+        let session_name = &app.confirm_target;
+        let dialog_width = (size.width * 2 / 3).max(50).min(size.width - 4);
+        let dialog_height = 9;
+        let dialog_area = Rect {
+            x: (size.width.saturating_sub(dialog_width)) / 2,
+            y: size.height / 2 - dialog_height / 2,
+            width: dialog_width,
+            height: dialog_height,
+        };
+
+        // Gradient title bar (like Crush)
+        let title_bar = " Close Session ".to_string();
+        let bar_fill: String =
+            "\u{2571}".repeat((dialog_width.saturating_sub(title_bar.len() as u16 + 2)) as usize);
+        let block = Block::default()
+            .title(TextLine::from(vec![
+                Span::styled(
+                    title_bar,
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.accent_secondary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {bar_fill}"),
+                    Style::default()
+                        .fg(app.theme.accent_secondary)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent_secondary))
+            .style(app.theme.main_surface());
+        let inner = block.inner(dialog_area);
+        frame.render_widget(ratatui::widgets::Clear, dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let lines = vec![
+            TextLine::from(""),
+            TextLine::from(vec![
+                Span::styled("  Session  ", Style::default().fg(app.theme.text_secondary)),
+                Span::styled(
+                    session_name.to_string(),
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            TextLine::from(Span::styled(
+                "  Worktree and all local changes will be permanently deleted.",
+                Style::default().fg(app.theme.text_secondary),
+            )),
+            TextLine::from(""),
+            TextLine::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    " y: Confirm ",
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.status_error)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    " Esc: Cancel ",
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.border_unfocused),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    // Permission approval dialog — shown when the agent is waiting for tool permission
+    if let Some(sid) = app.active_session_id()
+        && app.paused_sessions.contains(sid)
+        && app.input_mode != super::super::app::InputMode::ConfirmDelete
+    {
+        // Extract the permission details from the PTY screen
+        let permission_text = extract_permission_text(app);
+        let dialog_width = (size.width * 2 / 3).max(50).min(size.width - 4);
+        let dialog_height = 7;
+        let dialog_area = Rect {
+            x: (size.width.saturating_sub(dialog_width)) / 2,
+            y: size.height / 2 - dialog_height / 2,
+            width: dialog_width,
+            height: dialog_height,
+        };
+        let block = Block::default()
+            .title(TextLine::from(Span::styled(
+                " Permission Required ",
+                Style::default()
+                    .fg(app.theme.accent_secondary)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent_secondary))
+            .style(app.theme.main_surface());
+        let inner = block.inner(dialog_area);
+        frame.render_widget(ratatui::widgets::Clear, dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let lines = vec![
+            TextLine::from(""),
+            TextLine::from(Span::styled(
+                format!("  {permission_text}"),
+                Style::default().fg(app.theme.text_primary),
+            )),
+            TextLine::from(""),
+            TextLine::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    " Enter: Allow ",
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.accent_tertiary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    " Esc: Deny ",
+                    Style::default()
+                        .fg(app.theme.text_primary)
+                        .bg(app.theme.border_unfocused),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+}
+
+/// Extract permission prompt text from the active session's Claude PTY screen.
+fn extract_permission_text(app: &App) -> String {
+    let Some(sid) = app.active_session_id() else {
+        return "Tool permission requested".to_string();
+    };
+    // Try to get the "Allow ..." line from the PTY preview
+    if let Some(lines) = app.pty_activity_preview.get(sid) {
+        for line in lines {
+            if let Some(pos) = line.find("Allow ") {
+                return line[pos..].trim_end().to_string();
+            }
+        }
+    }
+    "Tool permission requested — check terminal for details".to_string()
 }
 
 /// Recursively render a layout node tree into the given area.

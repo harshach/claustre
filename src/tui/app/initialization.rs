@@ -211,6 +211,8 @@ impl App {
             launch_thread_field_index: 0,
             thread_provider_picker_index: 0,
             available_workflow_names: {
+                // Seed built-in workflows as editable YAML files on first run
+                let _ = crate::workflows::seed_builtin_workflows();
                 let mut names = vec![String::new()]; // "" = none
                 if let Ok(defs) = crate::workflows::load_workflow_definitions(None) {
                     names.extend(defs.into_iter().map(|d| d.name));
@@ -348,12 +350,15 @@ impl App {
             paused_sessions: HashSet::new(),
             pty_activity_preview: HashMap::new(),
             waiting_sessions: HashSet::new(),
+            notified_paused_sessions: HashSet::new(),
             pty_idle_sessions: HashSet::new(),
             working_no_indicator_since: HashMap::new(),
-            workflow_stage_injected: HashSet::new(),
+            workflow_stage_injected: HashMap::new(),
+            last_restart_at: HashMap::new(),
             queued_compose_message: None,
             compose_history: Vec::new(),
             compose_history_index: None,
+            clipboard_has_image: false,
             cached_visible_indices: Vec::new(),
             update_check_in_progress: Arc::new(AtomicBool::new(false)),
             config_warning,
@@ -374,8 +379,15 @@ impl App {
             github_sync_in_progress: Arc::new(AtomicBool::new(false)),
             github_sync_tx: gh_sync_tx,
             github_sync_rx: gh_sync_rx,
+            last_github_sync: Instant::now(),
+            github_sync_manual: false,
             conversation_cache: None,
             quick_reply_choices: Vec::new(),
+            session_chat_scroll: 0,
+            session_chat_auto_scroll: true,
+            cached_session_thread_ctx: None,
+            cached_session_thread_ctx_session_id: None,
+            cached_chat_lines: None,
         };
 
         app.recompute_visible_tasks();

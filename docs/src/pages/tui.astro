@@ -5,14 +5,15 @@ import DocsLayout from "../layouts/DocsLayout.astro";
 <DocsLayout title="TUI Guide">
   <h1>TUI Guide</h1>
   <p>
-    The claustre dashboard is a terminal UI built with
+    The claustre workbench is a terminal UI built with
     <a href="https://ratatui.rs" target="_blank" rel="noopener">ratatui</a>. It
-    shows a project sidebar, task queue, and embedded terminal sessions.
+    uses a sidebar, main work buffer, inspector, and embedded session tabs for
+    live agent terminals.
   </p>
 
-  <h2>Dashboard Layout</h2>
+  <h2>Workbench Layout</h2>
   <p>
-    The dashboard is split into two panels with usage bars at the bottom:
+    The root tab is split into four functional regions:
   </p>
   <table>
     <thead>
@@ -23,55 +24,125 @@ import DocsLayout from "../layouts/DocsLayout.astro";
     </thead>
     <tbody>
       <tr>
-        <td>Left sidebar</td>
-        <td>Projects with task counts and status icons</td>
+        <td>Sidebar</td>
+        <td>Navigation, repositories, and focus summary</td>
       </tr>
       <tr>
-        <td>Right panel</td>
-        <td>Task queue (pending / working / in_review)</td>
+        <td>Main buffer</td>
+        <td><code>My Tasks</code>, <code>Sprint Board</code>, <code>Threads</code>, <code>Reviews</code>, <code>Agents</code>, or <code>Settings</code></td>
       </tr>
       <tr>
-        <td>Usage bars</td>
-        <td>5h and 7d rate limit window utilization</td>
+        <td>Inspector</td>
+        <td><code>Issue</code>, <code>Diff</code>, <code>Runtime</code>, <code>Tests</code>, <code>Plan</code>, and <code>Attachments</code> for detail-heavy views like <code>Threads</code> and <code>Reviews</code></td>
+      </tr>
+      <tr>
+        <td>Status / hints</td>
+        <td>Status line, leader prompts, filter entry, delete confirmation, and key hints</td>
       </tr>
     </tbody>
   </table>
   <p>
-    The left sidebar lists all registered projects. Each project entry shows
-    counts of tasks by status so you can see at a glance how many tasks are
-    pending, in progress, or awaiting review. Selecting a project updates the
-    right panel to show that project's task queue with real-time status updates
-    driven by the Stop hook and SQLite polling.
+    The sidebar lists workbench destinations and registered repositories. The
+    main buffer changes with the selected view. <code>Threads</code> and
+    <code>Reviews</code> keep a persistent inspector for diff/runtime/test
+    context, while browse-first views like <code>My Tasks</code> and
+    <code>Sprint Board</code> open detail overlays with <code>v</code>. Use
+    <code>[</code> and <code>]</code> to resize the focused side pane, or drag
+    the pane borders with the mouse.
   </p>
   <p>
-    The right panel displays the task queue for the currently selected project.
-    Tasks are shown in their <code>sort_order</code> with status indicators,
-    mode badges, and PR links. Only active tasks (pending, working, in_review,
-    interrupted) appear in the Active view. Completed tasks move to the History
-    view.
+    When GitHub is connected and the selected repository has been synced,
+    <code>My Tasks</code> uses the local GitHub cache to show items assigned to
+    the authenticated user. Task rows render as compact cards and include
+    Project v2 metadata like <code>Type</code>, <code>Domain</code>,
+    <code>Release</code>, <code>Priority</code>, and <code>Size</code> when
+    those fields are present in the GitHub cache. If Claustre has no GitHub
+    user or no synced repos yet, it falls back to the older local task list.
+  </p>
+  <p>
+    <code>Sprint Board</code> is now backed by GitHub Projects v2. Use
+    <code>p</code> to open the repository switcher, <code>g</code> to open the
+    GitHub board picker, <code>m</code> to choose a sprint or iteration value,
+    <code>v</code> or <code>Enter</code> to open a task-detail dialog for the
+    selected card, and <code>R</code> when you explicitly want to refresh
+    project items from GitHub. Opening the board or changing the selected repo
+    or board reads from Claustre's local GitHub cache first. Claustre shows
+    board titles first and keeps the GitHub project number as secondary
+    metadata. Both the
+    repository picker and the board picker are searchable dialogs, so you can
+    type to filter long project lists before confirming with <code>Enter</code>.
+    The Project v2 <code>Status</code> field is mapped into the board columns
+    defined in your config, and pressing <code>t</code> toggles between
+    `Assigned to me` and `All sprint` scopes for the current board.
+  </p>
+  <p>
+    Claustre now shows an animated spinner in the title and status line for
+    user-triggered background work such as session preparation, GitHub
+    connection, and GitHub installation loading. This makes slow operations
+    visible instead of leaving the workbench looking idle or stuck.
+  </p>
+  <p>
+    Launching coding work is thread-first. From <code>My Tasks</code> or
+    <code>Sprint Board</code>, press <code>l</code> to open a launch modal
+    where you pick the provider, optional runtime/workflow defaults, a thread
+    title, and extra context. <code>Threads</code> is now the continuation
+    workspace: press <code>n</code> to create a new ad hoc thread for the
+    selected repo, just start typing to reply in the native chat surface,
+    use <code>l</code> or <code>Enter</code> to continue it, and press
+    <code>o</code> only when you want the live terminal tab.
+  </p>
+  <p>
+    <code>Reviews</code> is now a PR-first queue instead of a task filter. Use
+    <code>t</code> to switch between <code>Authored PRs</code> and
+    <code>Needs Review</code>. In the authored queue, <code>l</code> continues
+    the selected pull request in a thread/worktree. In the needs-review queue,
+    <code>l</code> launches an AI review thread with a review-specific prompt.
+    The inspector can show the cached PR body and a remote
+    <code>gh pr diff</code> preview even before a local thread exists.
+  </p>
+  <p>
+    In <code>Settings</code>, focus the main pane with <code>2</code>. Use
+    <code>j/k</code> to move between sections, then use <code>Enter</code> or
+    the section-specific shortcuts shown in the bottom hint line to edit or
+    toggle values.
+  </p>
+  <p>
+    Use <code>Space t</code> for <code>My Tasks</code>, <code>Space b</code>
+    for <code>Sprint Board</code>, <code>Space h</code> for
+    <code>Threads</code>, <code>Space r</code> for <code>Reviews</code>,
+    <code>Space a</code> for <code>Agents</code>, and <code>Space s</code> for
+    <code>Settings</code>. Use <code>Space g</code> to jump directly to
+    <code>Settings -&gt; GitHub</code> and <code>Space p</code> to jump to
+    <code>Settings -&gt; AI Providers</code>.
   </p>
 
   <h2>Session Tabs</h2>
   <p>
-    When you launch a task (press <code>l</code>), a new tab appears with
-    embedded terminal panes. The default layout is a shell pane on the left
-    alongside a Claude pane on the right. You can:
+    After you confirm the launch modal, Claustre creates the worktree and live
+    provider session for the thread. The primary surface stays inside the
+    workbench: thread rail on the left, native chat in the middle, inspector on
+    the right. Press <code>o</code> on the selected thread to open a session
+    tab with embedded terminal panes. If the old PTY session is gone, Claustre
+    relaunches the thread from its stored context before opening the fresh live
+    session. The default
+    layout is a shell pane on the left alongside the provider pane on the
+    right. You can:
   </p>
   <ul>
     <li>Split panes horizontally or vertically to add more shells</li>
     <li>Navigate between panes with keyboard shortcuts</li>
     <li>Close extra shell panes when you no longer need them</li>
-    <li>Switch between the dashboard tab and session tabs</li>
+    <li>Switch between the workbench root tab and session tabs</li>
   </ul>
   <p>
     Tab navigation uses <code>Ctrl+K</code> (previous tab) and
     <code>Ctrl+J</code> (next tab). Press <code>Ctrl+D</code> to detach from a
-    session tab and return to the dashboard.
+    session tab and return to the workbench root tab.
   </p>
 
   <h2>Keybindings</h2>
 
-  <h3>Dashboard (Normal Mode)</h3>
+  <h3>Workbench (Normal Mode)</h3>
   <table>
     <thead>
       <tr>
@@ -93,6 +164,14 @@ import DocsLayout from "../layouts/DocsLayout.astro";
         <td>Open command palette</td>
       </tr>
       <tr>
+        <td><code>Space t/b/h/r/a/s</code></td>
+        <td>Switch workbench view</td>
+      </tr>
+      <tr>
+        <td><code>Space g</code> / <code>Space p</code></td>
+        <td>Jump directly to GitHub or AI Provider settings</td>
+      </tr>
+      <tr>
         <td><code>Ctrl+K</code></td>
         <td>Previous tab</td>
       </tr>
@@ -101,12 +180,24 @@ import DocsLayout from "../layouts/DocsLayout.astro";
         <td>Next tab</td>
       </tr>
       <tr>
-        <td><code>1</code> / <code>h</code></td>
-        <td>Focus Projects panel</td>
+        <td><code>1</code></td>
+        <td>Focus sidebar</td>
       </tr>
       <tr>
-        <td><code>2</code> / <code>l</code></td>
-        <td>Focus Tasks panel</td>
+        <td><code>2</code></td>
+        <td>Focus main pane</td>
+      </tr>
+      <tr>
+        <td><code>3</code></td>
+        <td>Focus inspector in views that expose it (<code>Threads</code> / <code>Reviews</code>)</td>
+      </tr>
+      <tr>
+        <td><code>Tab</code> / <code>Shift+Tab</code></td>
+        <td>Cycle pane focus</td>
+      </tr>
+      <tr>
+        <td><code>[</code> / <code>]</code></td>
+        <td>Resize the focused side pane</td>
       </tr>
       <tr>
         <td><code>?</code></td>
@@ -130,7 +221,15 @@ import DocsLayout from "../layouts/DocsLayout.astro";
       </tr>
       <tr>
         <td><code>Enter</code></td>
-        <td>Go to session tab (tasks) / refresh (projects)</td>
+        <td>Open details in browse views, or continue the selected thread from stored context</td>
+      </tr>
+      <tr>
+        <td><code>p</code></td>
+        <td>Open the repository switcher modal (outside GitHub settings)</td>
+      </tr>
+      <tr>
+        <td><code>t</code></td>
+        <td>Toggle board scope in <code>Sprint Board</code> or switch the PR queue in <code>Reviews</code></td>
       </tr>
     </tbody>
   </table>
@@ -146,7 +245,7 @@ import DocsLayout from "../layouts/DocsLayout.astro";
     <tbody>
       <tr>
         <td><code>n</code></td>
-        <td>Create new task (floating panel)</td>
+        <td>Create new task, or open the ad hoc thread modal in <code>Threads</code></td>
       </tr>
       <tr>
         <td><code>e</code></td>
@@ -154,7 +253,11 @@ import DocsLayout from "../layouts/DocsLayout.astro";
       </tr>
       <tr>
         <td><code>l</code></td>
-        <td>Launch pending task (auto-creates session)</td>
+        <td>Open the launch-thread modal for the selected task or board issue, focus a linked thread from task/review queues, or continue the selected thread in <code>Threads</code></td>
+      </tr>
+      <tr>
+        <td><code>i</code></td>
+        <td>Optional alias for the native composer in <code>Threads</code>; typing there starts compose automatically, and <code>i</code> still opens the skills panel elsewhere</td>
       </tr>
       <tr>
         <td><code>s</code></td>
@@ -170,11 +273,15 @@ import DocsLayout from "../layouts/DocsLayout.astro";
       </tr>
       <tr>
         <td><code>o</code></td>
-        <td>Open PR in browser (tasks with a PR URL)</td>
+        <td>Open PR / issue in browser, or open the live terminal from <code>Threads</code></td>
+      </tr>
+      <tr>
+        <td><code>g</code></td>
+        <td>Open the GitHub board picker in <code>Sprint Board</code>, or choose the default board in <code>Settings -&gt; GitHub</code></td>
       </tr>
       <tr>
         <td><code>v</code></td>
-        <td>View task details</td>
+        <td>Open the task / issue detail overlay in browse views</td>
       </tr>
       <tr>
         <td><code>d</code></td>
@@ -197,12 +304,96 @@ import DocsLayout from "../layouts/DocsLayout.astro";
         <td>Add project</td>
       </tr>
       <tr>
-        <td><code>i</code></td>
-        <td>Open skills panel</td>
-      </tr>
-      <tr>
         <td><code>c</code></td>
         <td>Configure Claude permissions</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Settings - GitHub</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>a</code></td>
+        <td>Connect or refresh GitHub using the best available backend (bundled/custom app when available, otherwise GitHub CLI)</td>
+      </tr>
+      <tr>
+        <td><code>f</code></td>
+        <td>Refresh connection state and visible installations</td>
+      </tr>
+      <tr>
+        <td><code>y</code></td>
+        <td>Sync the selected repository into the local GitHub cache, including Projects v2 metadata and board items</td>
+      </tr>
+      <tr>
+        <td><code>p</code></td>
+        <td>Choose the preferred GitHub Project v2 for the selected repository</td>
+      </tr>
+      <tr>
+        <td><code>Enter</code></td>
+        <td>Open the GitHub installation picker after app auth, or start/refresh connection when needed</td>
+      </tr>
+      <tr>
+        <td><code>o</code></td>
+        <td>Open the GitHub App installation page in the browser when available</td>
+      </tr>
+      <tr>
+        <td><code>x</code></td>
+        <td>Disconnect the current GitHub App or GitHub CLI session</td>
+      </tr>
+      <tr>
+        <td><code>.</code></td>
+        <td>Show or hide advanced custom-app overrides</td>
+      </tr>
+      <tr>
+        <td><code>p</code></td>
+        <td>Open the default GitHub Project picker dropdown</td>
+      </tr>
+      <tr>
+        <td><code>c/s/u/r/i</code></td>
+        <td>Edit the GitHub client ID, app slug, install URL, relay URL, and default installation only when advanced mode is visible</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Settings - Other Sections</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Section</th>
+        <th>Examples</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>AI Providers</code></td>
+        <td><code>m</code> edit model, <code>e</code> edit effort, <code>r</code> toggle remote mode, <code>u</code> toggle auto-update</td>
+      </tr>
+      <tr>
+        <td><code>Layout</code></td>
+        <td><code>p</code> edit keymap preset, <code>l</code> edit leader key</td>
+      </tr>
+      <tr>
+        <td><code>Notifications</code></td>
+        <td><code>e</code> toggle voice notifications, <code>s</code> toggle system banners, <code>c</code>/<code>t</code> edit command/template, <code>a/p/r/v/f</code> toggle rules</td>
+      </tr>
+      <tr>
+        <td><code>Review Loop</code></td>
+        <td><code>i</code> edit poll interval, <code>p</code> edit custom prompt</td>
+      </tr>
+      <tr>
+        <td><code>Sandbox</code></td>
+        <td><code>p</code> edit default profile, <code>s</code> edit sandbox path, <code>a</code> edit attachments dir</td>
+      </tr>
+      <tr>
+        <td><code>General</code></td>
+        <td><code>a</code> toggle sync auto-push, <code>r</code> toggle RTK integration</td>
       </tr>
     </tbody>
   </table>

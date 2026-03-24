@@ -528,7 +528,7 @@ pub(super) fn draw_launch_thread_overlay(frame: &mut Frame, app: &App) {
         .copied()
         .unwrap_or(LaunchThreadField::Provider);
     let modal_width = 92u16.min(frame.area().width.saturating_sub(4));
-    let modal_height = 22u16.min(frame.area().height.saturating_sub(4));
+    let modal_height = 30u16.min(frame.area().height.saturating_sub(4));
     let inner = render_modal(
         frame,
         " Launch Thread ",
@@ -705,17 +705,35 @@ pub(super) fn draw_launch_thread_overlay(frame: &mut Frame, app: &App) {
     } else {
         draft.extra_context.clone()
     };
+    let context_style =
+        if draft.extra_context.trim().is_empty() && field != LaunchThreadField::ExtraContext {
+            dim_style
+        } else {
+            summary_style
+        };
+    // Auto-scroll the text area so the cursor line is always visible
+    let scroll_offset = if field == LaunchThreadField::ExtraContext && context_inner.width > 0 {
+        let wrap_width = context_inner.width as usize;
+        // Count visual lines up to the cursor position
+        let text_before_cursor = &app.input_buffer[..app.input_cursor.min(app.input_buffer.len())];
+        let mut visual_lines: u16 = 0;
+        for line in text_before_cursor.split('\n') {
+            let line_visual = if wrap_width > 0 {
+                ((line.len() as u16) / (wrap_width as u16)) + 1
+            } else {
+                1
+            };
+            visual_lines += line_visual;
+        }
+        visual_lines.saturating_sub(context_inner.height)
+    } else {
+        0
+    };
     frame.render_widget(
         Paragraph::new(context_value)
-            .style(
-                if draft.extra_context.trim().is_empty() && field != LaunchThreadField::ExtraContext
-                {
-                    dim_style
-                } else {
-                    summary_style
-                },
-            )
-            .wrap(Wrap { trim: false }),
+            .style(context_style)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset, 0)),
         context_inner,
     );
 
@@ -1539,6 +1557,11 @@ fn board_item_details_markdown(item: &GitHubBoardItem) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         let _ = std::fmt::Write::write_fmt(&mut text, format_args!("- Labels: {labels}\n"));
+    }
+
+    if let Some(pr_number) = item.linked_pr_number {
+        let _ =
+            std::fmt::Write::write_fmt(&mut text, format_args!("- Linked PR: **#{pr_number}**\n"));
     }
 
     if let Some(fields) = item.project_field_values.as_object()

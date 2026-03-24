@@ -8,6 +8,7 @@ use portable_pty::CommandBuilder;
 use super::PaneId;
 use super::embedded::EmbeddedTerminal;
 use super::session_terminals::PaneInfo;
+use super::terminal_trait::Terminal;
 
 // ── Split direction & layout tree ──
 
@@ -101,7 +102,7 @@ pub(crate) fn build_layout_from_config(
     config: &crate::config::LayoutConfig,
     panes: &mut HashMap<PaneId, PaneInfo>,
     next_id: &mut PaneId,
-    claude: &mut Option<EmbeddedTerminal>,
+    claude: &mut Option<Box<dyn Terminal>>,
     worktree_path: &str,
     rows: u16,
     cols: u16,
@@ -111,7 +112,7 @@ pub(crate) fn build_layout_from_config(
             let id = *next_id;
             *next_id += 1;
 
-            let (terminal, label) = if pane == "claude" {
+            let (terminal, label): (Box<dyn Terminal>, String) = if pane == "claude" {
                 let t = claude
                     .take()
                     .context("layout config has multiple 'claude' panes")?;
@@ -121,7 +122,7 @@ pub(crate) fn build_layout_from_config(
                 let mut cmd = CommandBuilder::new(&shell_path);
                 cmd.cwd(worktree_path);
                 let t = EmbeddedTerminal::spawn(cmd, rows, cols)?;
-                (t, "Shell".to_string())
+                (Box::new(t), "Shell".to_string())
             };
 
             panes.insert(id, PaneInfo { terminal, label });

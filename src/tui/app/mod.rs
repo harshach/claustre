@@ -62,6 +62,10 @@ pub(crate) enum Tab {
 pub(crate) enum SessionTabView {
     Conversation,
     Terminal,
+    /// Full-screen neovim editor in the worktree. Spawned on first entry,
+    /// kept alive across mode switches. Uses `NVIM_APPNAME=claustre` for
+    /// a curated config with file tree, treesitter, and diffview.
+    Editor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,7 +388,7 @@ impl InspectorTab {
             Self::Diff => "Diff",
             Self::Runtime => "Runtime",
             Self::Tests => "Tests",
-            Self::Plan => "Plan",
+            Self::Plan => "Workflow",
             Self::Attachments => "Attachments",
         }
     }
@@ -931,6 +935,9 @@ pub(crate) struct App {
 
     // Sessions where Claude asked a question and is waiting for user answer (detected from PTY screen)
     pub waiting_sessions: HashSet<String>,
+    // Sessions that already fired an OS notification for paused/waiting state
+    // (cleared when the session is no longer paused/waiting)
+    notified_paused_sessions: HashSet<String>,
 
     // Sessions where Claude's PTY shows the idle prompt (❯) — fallback for when
     // the Notification hook fails to fire and claude_status stays Working in the DB.
@@ -941,20 +948,34 @@ pub(crate) struct App {
     // the session is assumed to have Claude exited and is added to pty_idle_sessions.
     pub working_no_indicator_since: HashMap<String, std::time::Instant>,
 
-    // Tracks workflow stage_run IDs whose prompts have already been injected into the PTY.
-    // Used by `maybe_advance_workflow_stages()` to distinguish "idle before injection"
-    // from "idle after injection (Claude finished processing)".
-    pub workflow_stage_injected: HashSet<String>,
+    // Tracks workflow stage_run IDs whose prompts have been injected into the PTY.
+    // Value is `true` once Claude has been seen working since injection.
+    // A stage is only considered complete when: prompt injected + seen working + now idle.
+    // This prevents cascading stage advancement when idle fires before Claude
+    // starts processing the injected prompt.
+    pub workflow_stage_injected: HashMap<String, bool>,
+
+    // Tracks when restart_claude_with_message last sent a resume command
+    // to a session's shell pane. Prevents double-restart within a cooldown
+    // window: if a restart was sent recently, we don't declare Claude dead
+    // and try to restart again (which would send garbled text into the
+    // already-running Claude process and eventually block the PTY buffer).
+    pub last_restart_at: HashMap<String, std::time::Instant>,
 
     // Queued compose message: when the user sends while Claude is busy,
     // stored here and delivered when Claude becomes idle. User can press
     // Ctrl+C to interrupt Claude and force-send the queued message.
-    pub queued_compose_message: Option<(String, String)>,
+    // Tuple: (thread_id, content, image_paths).
+    pub queued_compose_message: Option<(String, String, Vec<String>)>,
 
     // Compose history: stores previously sent messages so the user can cycle
     // through them with Up/Down arrows (like shell history). Never lose a message.
     pub compose_history: Vec<String>,
     pub compose_history_index: Option<usize>,
+
+    // Whether the system clipboard currently contains an image.
+    // Checked on slow ticks (~1s) to avoid expensive clipboard reads on every frame.
+    pub clipboard_has_image: bool,
 
     // Cached result of visible_tasks() — indices into self.tasks, filtered and sorted.
     // Recomputed by recompute_visible_tasks() after data changes.
@@ -990,6 +1011,8 @@ pub(crate) struct App {
     pub github_sync_in_progress: Arc<AtomicBool>,
     github_sync_tx: mpsc::Sender<Result<crate::github::GitHubProjectBoardSnapshot, String>>,
     github_sync_rx: mpsc::Receiver<Result<crate::github::GitHubProjectBoardSnapshot, String>>,
+    last_github_sync: Instant,
+    github_sync_manual: bool,
 
     // JSONL conversation cache for the active session tab
     pub conversation_cache: Option<ConversationCache>,
@@ -997,6 +1020,28 @@ pub(crate) struct App {
     // Quick-reply choices detected from Claude's last message (e.g. "1. X  2. Y  3. Both").
     // Pressing the number key auto-sends the corresponding choice.
     pub quick_reply_choices: Vec<String>,
+
+    // Session chat panel scroll: offset from the bottom (0 = latest, auto-scroll).
+    // When the user scrolls up, auto_scroll becomes false and scroll_offset increases.
+    pub session_chat_scroll: u16,
+    pub session_chat_auto_scroll: bool,
+
+    // Cached thread context for the active session tab's chat panel.
+    // Refreshed on slow ticks (1s) to avoid running ~15 DB queries per frame.
+    pub cached_session_thread_ctx: Option<SelectedThreadContext>,
+    cached_session_thread_ctx_session_id: Option<String>,
+
+    // Cached rendered conversation lines for the chat panel.
+    // Rebuilt only when conversation_cache changes (file grows), not every frame.
+    pub cached_chat_lines: Option<CachedChatLines>,
+}
+
+/// Pre-built ratatui Lines for the conversation panel.
+/// Keyed on (session_id, entry_count) so we only rebuild when data changes.
+pub(crate) struct CachedChatLines {
+    pub session_id: String,
+    pub entry_count: usize,
+    pub lines: Vec<ratatui::text::Line<'static>>,
 }
 
 /// Cached JSONL conversation entries for a session's Claude Code log.
@@ -1359,10 +1404,9 @@ fn screen_shows_permission_prompt(screen: &vt100::Screen) -> bool {
     let start = total.saturating_sub(20);
     let bottom_lines = &lines[start..];
 
-    // Look for "Allow <ToolName>" pattern — the tool name starts with an uppercase letter.
-    // This matches Claude Code's permission dialog for any tool (Bash, WebFetch, Read, etc.)
+    // ── Claude Code pattern ──
+    // "Allow <ToolName>" + "Yes/No" choices
     let has_allow = bottom_lines.iter().any(|line| {
-        // Find "Allow " anywhere in the line (may be preceded by box-drawing chars or symbols)
         if let Some(pos) = line.find("Allow ") {
             let after = &line[pos + 6..];
             after.starts_with(|c: char| c.is_ascii_uppercase())
@@ -1370,17 +1414,28 @@ fn screen_shows_permission_prompt(screen: &vt100::Screen) -> bool {
             false
         }
     });
-
-    if !has_allow {
-        return false;
+    if has_allow {
+        let has_yes_no = bottom_lines.iter().any(|line| {
+            (line.contains("Yes") || line.contains("yes"))
+                && (line.contains("No") || line.contains("no"))
+        });
+        if has_yes_no {
+            return true;
+        }
     }
 
-    // Confirm with yes/no options nearby — Claude Code shows interactive choices
-    // like "Yes  No  Always" on the same line
-    bottom_lines.iter().any(|line| {
-        (line.contains("Yes") || line.contains("yes"))
-            && (line.contains("No") || line.contains("no"))
-    })
+    // ── Codex pattern ──
+    // "Would you like to run the following command?" + "Press enter to confirm or esc to cancel"
+    let has_codex_prompt = bottom_lines
+        .iter()
+        .any(|line| line.contains("Would you like to run the following command"));
+    if has_codex_prompt {
+        return bottom_lines
+            .iter()
+            .any(|line| line.contains("Press enter to confirm or esc to cancel"));
+    }
+
+    false
 }
 
 /// Detect Claude Code's `AskUserQuestion` interactive selector in the PTY screen.
@@ -1430,7 +1485,7 @@ fn screen_shows_idle_prompt(screen: &vt100::Screen) -> bool {
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len();
 
-    // Check the bottom few lines for the bare ❯ prompt
+    // Check the bottom few lines for the idle prompt
     let start = total.saturating_sub(5);
     let bottom_lines = &lines[start..];
 
@@ -1441,24 +1496,42 @@ fn screen_shows_idle_prompt(screen: &vt100::Screen) -> bool {
     };
     let trimmed = last_line.trim();
 
-    // The idle prompt is just "❯" possibly followed by typed text.
-    // Must NOT be a question prompt (those have "Other" nearby) or
-    // permission prompt (those have "Allow" nearby).
-    if !trimmed.starts_with('\u{276f}') {
-        return false;
+    // ── Claude Code pattern ──
+    // The idle prompt is just "❯" (U+276F) possibly followed by typed text.
+    if trimmed.starts_with('\u{276f}') {
+        // Exclude question prompts (those have "Other" nearby)
+        if bottom_lines.iter().any(|l| l.trim().starts_with("Other")) {
+            return false;
+        }
+        // Exclude permission prompts (those have "Allow" nearby)
+        if bottom_lines.iter().any(|l| l.contains("Allow ")) {
+            return false;
+        }
+        return true;
     }
 
-    // Exclude question prompts
-    if bottom_lines.iter().any(|l| l.trim().starts_with("Other")) {
-        return false;
+    // ── Codex pattern ──
+    // Codex idle prompt uses "›" (U+203A) or ">" followed by text like "Implement {feature}"
+    // with a model status line nearby (e.g., "gpt-5.4 high · 66% left")
+    if trimmed.starts_with('\u{203a}') || trimmed.starts_with("> ") {
+        // Exclude permission prompts
+        if bottom_lines
+            .iter()
+            .any(|l| l.contains("Would you like to run"))
+        {
+            return false;
+        }
+        // Confirm idle by checking for model/usage info nearby
+        let has_model_info = bottom_lines.iter().any(|l| {
+            let lt = l.trim();
+            lt.contains("% left") || lt.contains("gpt-") || lt.contains("o3-") || lt.contains("o4-")
+        });
+        if has_model_info {
+            return true;
+        }
     }
 
-    // Exclude permission prompts
-    if bottom_lines.iter().any(|l| l.contains("Allow ")) {
-        return false;
-    }
-
-    true
+    false
 }
 
 fn build_project_summaries(store: &Store, projects: &[Project]) -> HashMap<String, ProjectSummary> {
@@ -3652,10 +3725,15 @@ mod tests {
         // Set the session to Working status to simulate Claude being busy
         let thread = app.threads[0].clone();
         if let Some(ref sid) = thread.session_id {
-            let _ = app
+            let _ = app.store.update_session_status(
+                sid,
+                crate::store::ClaudeStatus::Working,
+                "Working",
+            );
+            app.sessions = app
                 .store
-                .update_session_status(sid, crate::store::ClaudeStatus::Working, "Working");
-            app.sessions = app.store.list_sessions_for_project(&thread.project_id).unwrap();
+                .list_sessions_for_project(&thread.project_id)
+                .unwrap();
         }
 
         app.start_thread_compose().unwrap();
@@ -3671,7 +3749,9 @@ mod tests {
         // The message should still be recorded in the DB.
         let messages = app.store.list_thread_messages(&thread.id).unwrap();
         assert!(
-            messages.iter().any(|m| m.content == "please push to remote"),
+            messages
+                .iter()
+                .any(|m| m.content == "please push to remote"),
             "User message should be persisted in DB"
         );
     }
@@ -3777,7 +3857,7 @@ mod tests {
             .unwrap();
         match tab {
             Tab::Session { view_mode, .. } => {
-                assert_eq!(*view_mode, SessionTabView::Terminal);
+                assert_eq!(*view_mode, SessionTabView::Conversation);
             }
             Tab::Dashboard => panic!("expected session tab"),
         }
@@ -3840,7 +3920,7 @@ mod tests {
             .unwrap();
         match tab {
             Tab::Session { view_mode, .. } => {
-                assert_eq!(*view_mode, SessionTabView::Terminal);
+                assert_eq!(*view_mode, SessionTabView::Conversation);
             }
             Tab::Dashboard => panic!("expected session tab"),
         }
@@ -5117,5 +5197,236 @@ mod tests {
         app.pending_titles.insert("task-1".to_string());
         app.session_op_in_progress = true;
         assert_eq!(app.busy_indicator_label(), Some("preparing session"));
+    }
+
+    // ── Session chat panel layout tests ──
+
+    #[test]
+    fn session_chat_scroll_defaults_to_auto_scroll() {
+        let app = test_app();
+        assert_eq!(app.session_chat_scroll, 0);
+        assert!(app.session_chat_auto_scroll);
+    }
+
+    #[test]
+    fn session_tab_view_mode_toggles_between_chat_and_terminal() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        // Find the session tab
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == &session_id))
+            .unwrap();
+        app.active_tab = tab_idx;
+
+        // Default: conversation (chat) focused
+        assert!(matches!(
+            app.tabs[tab_idx],
+            Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            }
+        ));
+
+        // Simulate Ctrl+O toggle to terminal
+        if let Tab::Session { view_mode, .. } = &mut app.tabs[tab_idx] {
+            *view_mode = SessionTabView::Terminal;
+        }
+        assert!(matches!(
+            app.tabs[tab_idx],
+            Tab::Session {
+                view_mode: SessionTabView::Terminal,
+                ..
+            }
+        ));
+
+        // Toggle back to conversation
+        if let Tab::Session { view_mode, .. } = &mut app.tabs[tab_idx] {
+            *view_mode = SessionTabView::Conversation;
+        }
+        assert!(matches!(
+            app.tabs[tab_idx],
+            Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chat_scroll_up_disables_auto_scroll() {
+        let mut app = test_app();
+        assert!(app.session_chat_auto_scroll);
+
+        // Scroll up
+        app.session_chat_auto_scroll = false;
+        app.session_chat_scroll = 5;
+
+        assert!(!app.session_chat_auto_scroll);
+        assert_eq!(app.session_chat_scroll, 5);
+    }
+
+    #[test]
+    fn chat_scroll_to_bottom_re_enables_auto_scroll() {
+        let mut app = test_app();
+        app.session_chat_auto_scroll = false;
+        app.session_chat_scroll = 10;
+
+        // Reset to bottom
+        app.session_chat_scroll = 0;
+        app.session_chat_auto_scroll = true;
+
+        assert!(app.session_chat_auto_scroll);
+        assert_eq!(app.session_chat_scroll, 0);
+    }
+
+    #[test]
+    fn goto_session_tab_resets_chat_scroll() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        // Scroll up
+        app.session_chat_scroll = 15;
+        app.session_chat_auto_scroll = false;
+
+        // Navigate to the session tab
+        app.goto_session_tab(&session_id);
+
+        // Should reset scroll
+        assert_eq!(app.session_chat_scroll, 0);
+        assert!(app.session_chat_auto_scroll);
+    }
+
+    #[test]
+    fn cached_session_thread_ctx_starts_empty() {
+        let app = test_app();
+        assert!(app.cached_session_thread_ctx.is_none());
+        assert!(app.cached_session_thread_ctx_session_id.is_none());
+    }
+
+    #[test]
+    fn refresh_session_thread_context_populates_cache() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        // Navigate to session tab
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == &session_id))
+            .unwrap();
+        app.active_tab = tab_idx;
+
+        // Refresh context
+        app.refresh_session_thread_context();
+
+        assert!(app.cached_session_thread_ctx.is_some());
+        assert_eq!(
+            app.cached_session_thread_ctx_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+    }
+
+    #[test]
+    fn strip_image_markers_removes_references() {
+        use super::input::strip_image_markers;
+        assert_eq!(
+            strip_image_markers("[image: clipboard-abc.png] Look at this"),
+            "Look at this"
+        );
+        assert_eq!(
+            strip_image_markers("Before [image: a.png] middle [image: b.png] after"),
+            "Before  middle  after"
+        );
+        assert_eq!(strip_image_markers("no images here"), "no images here");
+        assert_eq!(strip_image_markers("[image: only.png]"), "");
+    }
+
+    #[test]
+    fn augment_prompt_with_images_adds_paths() {
+        use super::input::augment_prompt_with_images;
+        // No images — returns content unchanged
+        assert_eq!(
+            augment_prompt_with_images("hello", &[]),
+            "hello"
+        );
+        // With images — strips markers and appends path instructions
+        let result = augment_prompt_with_images(
+            "[image: clip.png] Look at this table",
+            &["/tmp/clip.png".to_string()],
+        );
+        assert!(result.contains("Look at this table"));
+        assert!(result.contains("[Attached image: /tmp/clip.png"));
+        assert!(!result.contains("[image: clip.png]"));
+
+        // Image-only (no text) — provides default prompt
+        let result = augment_prompt_with_images(
+            "[image: img.png]",
+            &["/tmp/img.png".to_string()],
+        );
+        assert!(result.contains("Please look at the attached image"));
+        assert!(result.contains("/tmp/img.png"));
     }
 }

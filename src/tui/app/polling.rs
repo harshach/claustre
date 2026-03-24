@@ -197,6 +197,16 @@ impl App {
 
     /// Periodically re-check for updates (every 30 minutes).
     /// Skips if an update was already found or a check is in progress.
+    /// Check if the system clipboard contains an image.
+    /// Called on slow ticks (~1s) to keep `clipboard_has_image` current
+    /// so the compose area can show an indicator.
+    pub(super) fn check_clipboard_for_image(&mut self) {
+        self.clipboard_has_image = arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut cb| cb.get_image().ok())
+            .is_some();
+    }
+
     pub(super) fn maybe_poll_update_check(&mut self) {
         const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -681,6 +691,7 @@ impl App {
                     self.show_toast(message, ToastStyle::Success);
                 }
                 SessionOpResult::Error { message } => {
+                    tracing::error!("session op failed: {message}");
                     self.show_toast(message, ToastStyle::Error);
                     // Clear any pending relaunch — the operation failed
                     self.pending_relaunch = None;
@@ -804,17 +815,45 @@ impl App {
         });
     }
 
+    /// Periodically sync GitHub data in the background (5 minutes).
+    pub(super) fn maybe_poll_github_sync(&mut self) {
+        const GITHUB_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+        if self.last_github_sync.elapsed() < GITHUB_SYNC_INTERVAL {
+            return;
+        }
+        self.last_github_sync = std::time::Instant::now();
+
+        // Only auto-sync for git-linked projects
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        if !project.is_git_linked {
+            return;
+        }
+
+        self.spawn_github_sync();
+    }
+
     /// Drain results from a background GitHub sync.
     pub(super) fn poll_github_sync_results(&mut self) {
         while let Ok(result) = self.github_sync_rx.try_recv() {
+            let was_manual = self.github_sync_manual;
+            self.github_sync_manual = false;
             match result {
                 Ok(snapshot) => {
                     let selected_project_hint = self.config.github_app.default_project_id.clone();
                     self.apply_board_snapshot(snapshot, selected_project_hint.as_deref());
-                    self.show_toast("GitHub sync complete", ToastStyle::Success);
+                    if was_manual {
+                        self.show_toast("GitHub sync complete", ToastStyle::Success);
+                    }
                 }
                 Err(error) => {
-                    self.show_toast(format!("GitHub sync failed: {error}"), ToastStyle::Error);
+                    if was_manual {
+                        self.show_toast(format!("GitHub sync failed: {error}"), ToastStyle::Error);
+                    } else {
+                        tracing::warn!("Background GitHub sync failed: {error}");
+                    }
                 }
             }
         }

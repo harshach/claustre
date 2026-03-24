@@ -4,6 +4,8 @@
 //! `SessionTerminals` (tree-based pane layout), and the rendering widget.
 
 pub mod protocol;
+pub(crate) mod remote;
+pub(crate) mod terminal_trait;
 mod widget;
 pub use widget::TerminalWidget;
 
@@ -16,8 +18,10 @@ pub(crate) mod session_terminals;
 pub(crate) use embedded::Backend;
 pub use embedded::EmbeddedTerminal;
 pub use layout::{LayoutNode, SplitDirection};
+pub(crate) use remote::RemoteTerminal;
 pub use selection::Selection;
 pub use session_terminals::SessionTerminals;
+pub(crate) use terminal_trait::Terminal;
 
 /// Unique identifier for a pane within a session.
 pub type PaneId = u16;

@@ -4,11 +4,12 @@
 //! session management, autonomous task chains, or skill operations.
 
 use claustre::{
-    config, configure, session, session_host, session_update, skills, store, sync, tui, update,
+    config, configure, github, github_app, runtime, session, session_host, session_update, skills,
+    store, sync, threads, tui, update, workflows,
 };
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -153,6 +154,33 @@ enum Commands {
         #[command(subcommand)]
         action: SyncAction,
     },
+    /// GitHub cache/auth/status operations
+    #[command(name = "github")]
+    GitHub {
+        #[command(subcommand)]
+        action: GitHubAction,
+    },
+    /// Thread launch, focus, provider switching, and clipboard capture
+    Thread {
+        #[command(subcommand)]
+        action: ThreadAction,
+    },
+    /// Workflow loading and run control
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+    /// Runtime build/service control for a launched thread
+    Runtime {
+        #[command(subcommand)]
+        action: RuntimeAction,
+    },
+    /// Open a thread from a notification or shell integration target
+    Open {
+        /// Thread ID to open/focus
+        #[arg(long)]
+        thread: String,
+    },
     /// Print shell integration script (add `eval "$(claustre shell-init)"` to your .zshrc/.bashrc)
     ShellInit,
     /// Verify the binary is functional (used by auto-update smoke test)
@@ -205,6 +233,151 @@ enum SkillsAction {
     },
     /// Update all installed skills
     Update,
+}
+
+#[derive(Subcommand)]
+enum GitHubAction {
+    /// Show GitHub auth status and local cache counts
+    Status,
+    /// Run `gh auth login` as the current fallback auth flow
+    Login,
+    /// Sync one or all linked repos into the local GitHub cache
+    Sync {
+        /// Optional project name to sync. Defaults to all git-linked projects.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Run `gh auth logout`
+    Disconnect,
+}
+
+#[derive(Subcommand)]
+enum ThreadAction {
+    /// Create a thread workspace from an existing task
+    Launch {
+        /// Task ID to launch a thread for
+        #[arg(long)]
+        task_id: String,
+        /// Provider to use for the thread (`claude`, `codex`, `gemini`, `local`)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider profile name
+        #[arg(long)]
+        profile: Option<String>,
+        /// Runtime profile from sandbox.yaml
+        #[arg(long)]
+        runtime_profile: Option<String>,
+        /// Optional workflow to attach immediately
+        #[arg(long)]
+        workflow: Option<String>,
+    },
+    /// Show the stored metadata for a thread
+    Focus {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+    },
+    /// Change the active provider for a thread
+    SwitchProvider {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+        /// Provider kind
+        #[arg(long)]
+        provider: String,
+        /// Provider profile
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Capture text/image content from the system clipboard into a thread
+    PasteClipboard {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+        /// Optional draft key to associate with the pending attachment
+        #[arg(long)]
+        draft_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// List available workflow definitions
+    List {
+        /// Optional project name to include repo-local workflows
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Start a workflow run for a thread
+    Run {
+        /// Workflow name
+        #[arg(long)]
+        name: String,
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+    },
+    /// Advance a workflow run to the next stage
+    Resume {
+        /// Workflow run ID
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Approve a waiting stage and advance the workflow
+    Approve {
+        /// Workflow run ID
+        #[arg(long)]
+        run_id: String,
+        /// Stage name to approve
+        #[arg(long)]
+        stage: String,
+    },
+    /// Show workflow artifacts for a run
+    Artifact {
+        /// Workflow run ID
+        #[arg(long)]
+        run_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Build and start runtime services for a thread
+    Up {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+        /// Override runtime profile
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Stop runtime services for a thread
+    Down {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+    },
+    /// Restart runtime services for a thread
+    Restart {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+    },
+    /// Re-run runtime health checks
+    Health {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+    },
+    /// Print the log path for a runtime service
+    Logs {
+        /// Thread ID
+        #[arg(long)]
+        thread_id: String,
+        /// Service name
+        #[arg(long)]
+        service: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -443,6 +616,22 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::GitHub { action } => run_github_command(action),
+        Commands::Thread { action } => run_thread_command(action),
+        Commands::Workflow { action } => run_workflow_command(action),
+        Commands::Runtime { action } => run_runtime_command(action),
+        Commands::Open { thread } => {
+            let store = open_store()?;
+            let thread = threads::focus_thread(&store, &thread)?;
+            println!("{} {}", thread.id, thread.title);
+            if let Some(worktree_path) = thread.worktree_path.as_deref() {
+                println!("worktree: {worktree_path}");
+            }
+            if let Some(session_id) = thread.session_id.as_deref() {
+                println!("session: {session_id}");
+            }
+            Ok(())
+        }
         Commands::FeedNext {
             session_id,
             remote,
@@ -595,6 +784,448 @@ fn main() -> Result<()> {
             tui::run(store)
         }
     }
+}
+
+fn run_github_command(action: GitHubAction) -> Result<()> {
+    match action {
+        GitHubAction::Status => {
+            let store = open_store()?;
+            let cfg = config::load()?;
+            let status = github_app::local_status(&cfg.github_app)?;
+            println!(
+                "GitHub App available: {}",
+                if status.configured { "yes" } else { "no" }
+            );
+            println!(
+                "GitHub App source: {}",
+                if status.custom_app_configured {
+                    "custom config"
+                } else if status.configured {
+                    "bundled defaults"
+                } else {
+                    "not available"
+                }
+            );
+            println!(
+                "GitHub App client_id: {}",
+                status.client_id.as_deref().unwrap_or("not set")
+            );
+            println!(
+                "GitHub App user: {}",
+                status.user_login.as_deref().unwrap_or("not authenticated")
+            );
+            println!(
+                "GitHub App token expires: {}",
+                status.expires_at.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "GitHub App installation default: {}",
+                status
+                    .default_installation_id
+                    .as_deref()
+                    .unwrap_or("none configured")
+            );
+            println!(
+                "GitHub App project default: {}",
+                status
+                    .default_project_id
+                    .as_deref()
+                    .unwrap_or("none configured")
+            );
+            println!(
+                "GitHub CLI: {}",
+                status.gh_user_login.as_deref().map_or_else(
+                    || "not authenticated".to_string(),
+                    |login| format!("authenticated as {login}"),
+                )
+            );
+            if status.gh_authenticated {
+                println!(
+                    "GitHub CLI scopes: {}",
+                    if status.gh_scopes.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        status.gh_scopes.join(", ")
+                    }
+                );
+                println!(
+                    "Projects v2 access: {}",
+                    if status.gh_has_project_scope {
+                        "ready"
+                    } else {
+                        "missing read:project"
+                    }
+                );
+            }
+            if let Some(token) = github_app::ensure_access_token(&cfg.github_app)? {
+                if let Ok(installations) = github_app::list_installations(&token) {
+                    println!("GitHub App installations: {}", installations.len());
+                    for installation in installations.iter().take(5) {
+                        println!("  - {} ({})", installation.account.login, installation.id);
+                    }
+                }
+            } else if let Ok(status) = github::auth_status() {
+                println!("gh fallback: {status}");
+            }
+
+            let repos = store.list_github_repos()?;
+            let item_count = repos
+                .iter()
+                .map(|repo| {
+                    store
+                        .list_github_items_for_repo(&repo.id)
+                        .map(|items| items.len())
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .sum::<usize>();
+            println!("cached repos: {}", repos.len());
+            println!("cached items: {item_count}");
+            Ok(())
+        }
+        GitHubAction::Login => {
+            let cfg = config::load()?;
+            if github_app::app_auth_available(&cfg.github_app) {
+                println!("Starting GitHub App device flow...");
+                github_app::authenticate_device_flow(&cfg.github_app, |event| match event {
+                    github_app::GitHubAuthMessage::Prompt(prompt) => {
+                        println!(
+                            "Open: {}",
+                            prompt
+                                .verification_uri_complete
+                                .as_deref()
+                                .unwrap_or(&prompt.verification_uri)
+                        );
+                        println!("Code: {}", prompt.user_code);
+                        println!("Expires: {}", prompt.expires_at);
+                    }
+                    github_app::GitHubAuthMessage::Success(session) => {
+                        println!(
+                            "Authenticated as {}",
+                            session.user_login.as_deref().unwrap_or("unknown user")
+                        );
+                    }
+                    github_app::GitHubAuthMessage::CliSuccess(login) => {
+                        println!(
+                            "Connected to GitHub CLI as {}",
+                            login.as_deref().unwrap_or("unknown user")
+                        );
+                    }
+                    github_app::GitHubAuthMessage::Failed(error) => {
+                        eprintln!("GitHub App auth failed: {error}");
+                    }
+                    github_app::GitHubAuthMessage::Disconnected => {}
+                })?;
+            } else {
+                println!("Starting GitHub CLI browser login...");
+                let login = github_app::github_cli_connect()?;
+                println!(
+                    "Connected to GitHub CLI as {}",
+                    login.as_deref().unwrap_or("unknown user")
+                );
+            }
+            Ok(())
+        }
+        GitHubAction::Sync { project } => {
+            let store = open_store()?;
+            let projects = if let Some(project_name) = project {
+                vec![find_project_by_name(&store, &project_name)?]
+            } else {
+                store
+                    .list_projects()?
+                    .into_iter()
+                    .filter(|project| project.is_git_linked)
+                    .collect()
+            };
+            anyhow::ensure!(!projects.is_empty(), "no git-linked projects to sync");
+            for project in projects {
+                let summary = github::sync_project_repo(&store, &project)?;
+                println!(
+                    "{}: {} issues, {} PRs, {} comments, {} reviews, {} review comments",
+                    summary.repo_full_name,
+                    summary.issues_synced,
+                    summary.prs_synced,
+                    summary.comments_synced,
+                    summary.reviews_synced,
+                    summary.review_comments_synced
+                );
+            }
+            Ok(())
+        }
+        GitHubAction::Disconnect => {
+            let cfg = config::load()?;
+            if github_app::app_auth_available(&cfg.github_app)
+                && github_app::load_session()?.is_some()
+            {
+                github_app::clear_session()?;
+                println!("Cleared GitHub App session");
+            } else {
+                github_app::github_cli_disconnect()?;
+                println!("Cleared GitHub CLI session");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_thread_command(action: ThreadAction) -> Result<()> {
+    match action {
+        ThreadAction::Launch {
+            task_id,
+            provider,
+            profile,
+            runtime_profile,
+            workflow,
+        } => {
+            let store = open_store()?;
+            let cfg = config::load()?;
+            let provider_kind = provider.as_deref().map(parse_provider_kind).transpose()?;
+            let result = threads::launch_thread(
+                &store,
+                &cfg,
+                &threads::LaunchThreadArgs {
+                    task_id,
+                    provider_kind,
+                    provider_profile: profile,
+                    runtime_profile,
+                    workflow_name: workflow,
+                    thread_title: None,
+                    initial_prompt: None,
+                },
+            )?;
+            println!("thread: {} {}", result.thread.id, result.thread.title);
+            if let Some(worktree_path) = result.thread.worktree_path.as_deref() {
+                println!("worktree: {worktree_path}");
+            }
+            if let Some(bundle) = result.workflow {
+                println!("workflow: {} ({})", bundle.run.id, bundle.definition.name);
+            }
+            Ok(())
+        }
+        ThreadAction::Focus { thread_id } => {
+            let store = open_store()?;
+            let thread = threads::focus_thread(&store, &thread_id)?;
+            let messages = store.list_thread_messages(&thread.id)?;
+            let runs = store.list_thread_runs(&thread.id)?;
+            println!("thread: {} {}", thread.id, thread.title);
+            println!("status: {}", thread.status);
+            println!("provider: {}", thread.provider_kind);
+            if let Some(worktree_path) = thread.worktree_path.as_deref() {
+                println!("worktree: {worktree_path}");
+            }
+            println!("messages: {}", messages.len());
+            println!("runs: {}", runs.len());
+            Ok(())
+        }
+        ThreadAction::SwitchProvider {
+            thread_id,
+            provider,
+            profile,
+        } => {
+            let store = open_store()?;
+            threads::switch_thread_provider(
+                &store,
+                &thread_id,
+                parse_provider_kind(&provider)?,
+                profile.as_deref(),
+            )?;
+            println!("updated provider for thread {thread_id}");
+            Ok(())
+        }
+        ThreadAction::PasteClipboard {
+            thread_id,
+            draft_key,
+        } => {
+            let store = open_store()?;
+            match threads::smart_paste_clipboard(&store, &thread_id, draft_key.as_deref())? {
+                threads::SmartPasteResult::Text(text) => println!("{text}"),
+                threads::SmartPasteResult::Image(attachment) => {
+                    println!("{}", attachment.local_path);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_workflow_command(action: WorkflowAction) -> Result<()> {
+    match action {
+        WorkflowAction::List { project } => {
+            let store = open_store()?;
+            let repo_root = if let Some(project_name) = project {
+                let project = find_project_by_name(&store, &project_name)?;
+                Some(PathBuf::from(project.repo_path))
+            } else {
+                None
+            };
+            let defs = workflows::sync_workflow_definitions(&store, repo_root.as_deref())?;
+            for (definition, stored) in defs {
+                println!(
+                    "{} [{}] {}",
+                    definition.name,
+                    stored.scope,
+                    definition.description.unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        WorkflowAction::Run { name, thread_id } => {
+            let store = open_store()?;
+            let thread = store.get_thread(&thread_id)?;
+            let project = store.get_project(&thread.project_id)?;
+            let bundle = workflows::start_workflow_run(
+                &store,
+                &name,
+                Some(&thread.id),
+                thread.github_item_id.as_deref(),
+                Some(Path::new(&project.repo_path)),
+            )?;
+            store.attach_workflow_run_to_thread(&thread.id, Some(&bundle.run.id))?;
+            println!("workflow run: {}", bundle.run.id);
+            for stage in bundle.stages {
+                println!("  {} [{}]", stage.stage_name, stage.status);
+            }
+            Ok(())
+        }
+        WorkflowAction::Resume { run_id } => {
+            let store = open_store()?;
+            let bundle = workflows::resume_workflow_run(&store, &run_id)?;
+            println!("workflow run: {} [{}]", bundle.run.id, bundle.run.status);
+            for stage in bundle.stages {
+                println!("  {} [{}]", stage.stage_name, stage.status);
+            }
+            Ok(())
+        }
+        WorkflowAction::Approve { run_id, stage } => {
+            let store = open_store()?;
+            let bundle = workflows::approve_workflow_stage(&store, &run_id, &stage)?;
+            println!("workflow run: {} [{}]", bundle.run.id, bundle.run.status);
+            for stage in bundle.stages {
+                println!("  {} [{}]", stage.stage_name, stage.status);
+            }
+            Ok(())
+        }
+        WorkflowAction::Artifact { run_id } => {
+            let store = open_store()?;
+            for artifact in store.list_workflow_artifacts(&run_id)? {
+                if let Some(local_path) = artifact.local_path.as_deref() {
+                    println!(
+                        "{} ({}) {}",
+                        artifact.artifact_name, artifact.artifact_type, local_path
+                    );
+                } else {
+                    println!("{} ({})", artifact.artifact_name, artifact.artifact_type);
+                    if let Some(content_text) = artifact.content_text.as_deref() {
+                        println!("{content_text}");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_runtime_command(action: RuntimeAction) -> Result<()> {
+    match action {
+        RuntimeAction::Up { thread_id, profile } => {
+            let (store, cfg, thread, project, worktree_path) = thread_runtime_context(&thread_id)?;
+            if profile.is_some() {
+                store.update_thread_session_and_worktree(
+                    &thread.id,
+                    thread.session_id.as_deref(),
+                    thread.worktree_path.as_deref(),
+                    thread.branch_name.as_deref(),
+                    profile.as_deref(),
+                )?;
+            }
+            let states = runtime::up_profile(
+                &store,
+                &thread.id,
+                &worktree_path,
+                Path::new(&project.repo_path),
+                &cfg.runtime,
+                profile.as_deref(),
+            )?;
+            for state in states {
+                println!("{} [{}]", state.name, state.status);
+            }
+            Ok(())
+        }
+        RuntimeAction::Down { thread_id } => {
+            let (store, cfg, thread, project, worktree_path) = thread_runtime_context(&thread_id)?;
+            for state in runtime::down_profile(
+                &store,
+                &thread.id,
+                &worktree_path,
+                Path::new(&project.repo_path),
+                &cfg.runtime,
+            )? {
+                println!("{} [{}]", state.name, state.status);
+            }
+            Ok(())
+        }
+        RuntimeAction::Restart { thread_id } => {
+            let (store, cfg, thread, project, worktree_path) = thread_runtime_context(&thread_id)?;
+            for state in runtime::restart_profile(
+                &store,
+                &thread.id,
+                &worktree_path,
+                Path::new(&project.repo_path),
+                &cfg.runtime,
+            )? {
+                println!("{} [{}]", state.name, state.status);
+            }
+            Ok(())
+        }
+        RuntimeAction::Health { thread_id } => {
+            let (store, cfg, thread, project, worktree_path) = thread_runtime_context(&thread_id)?;
+            for state in runtime::health_check_profile(
+                &store,
+                &thread.id,
+                &worktree_path,
+                Path::new(&project.repo_path),
+                &cfg.runtime,
+            )? {
+                println!("{} [{}]", state.name, state.status);
+            }
+            Ok(())
+        }
+        RuntimeAction::Logs { thread_id, service } => {
+            let store = open_store()?;
+            if let Some(log_path) = runtime::service_log_path(&store, &thread_id, &service)? {
+                println!("{}", log_path.display());
+            } else {
+                anyhow::bail!("no log path tracked for service '{service}'");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_provider_kind(raw: &str) -> Result<store::ProviderKind> {
+    raw.parse::<store::ProviderKind>()
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn thread_runtime_context(
+    thread_id: &str,
+) -> Result<(
+    store::Store,
+    config::Config,
+    store::Thread,
+    store::Project,
+    PathBuf,
+)> {
+    let store = open_store()?;
+    let cfg = config::load()?;
+    let thread = store.get_thread(thread_id)?;
+    let project = store.get_project(&thread.project_id)?;
+    let worktree_path = thread
+        .worktree_path
+        .as_ref()
+        .map(PathBuf::from)
+        .context("thread has no worktree path")?;
+    Ok((store, cfg, thread, project, worktree_path))
 }
 
 const RATE_LIMIT_THRESHOLD: f64 = 80.0;

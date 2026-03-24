@@ -36,6 +36,46 @@ impl HostMessage {
             Self::Exited(code) => encode_frame(TYPE_EXITED, &code.to_le_bytes()),
         }
     }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < HEADER_LEN {
+            bail!(
+                "truncated header: need {HEADER_LEN} bytes, got {}",
+                buf.len()
+            );
+        }
+
+        let msg_type = buf[0];
+        let payload_len = u32::from_le_bytes(
+            buf[1..5]
+                .try_into()
+                .context("header payload length field corrupted")?,
+        ) as usize;
+
+        if buf.len() < HEADER_LEN + payload_len {
+            bail!(
+                "truncated payload: need {} bytes, got {}",
+                HEADER_LEN + payload_len,
+                buf.len()
+            );
+        }
+
+        let payload = &buf[HEADER_LEN..HEADER_LEN + payload_len];
+
+        match msg_type {
+            TYPE_SNAPSHOT => Ok(Self::Snapshot(payload.to_vec())),
+            TYPE_OUTPUT => Ok(Self::Output(payload.to_vec())),
+            TYPE_EXITED => {
+                if payload.len() != 4 {
+                    bail!("Exited payload must be 4 bytes, got {}", payload.len());
+                }
+                let code =
+                    i32::from_le_bytes(payload.try_into().context("exited code field corrupted")?);
+                Ok(Self::Exited(code))
+            }
+            _ => bail!("unknown host message type: {msg_type:#04x}"),
+        }
+    }
 }
 
 // -- Client -> Host messages ------------------------------------------------
@@ -52,6 +92,19 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Input(data) => encode_frame(TYPE_INPUT, data),
+            Self::Resize { cols, rows } => {
+                let mut payload = Vec::with_capacity(4);
+                payload.extend_from_slice(&cols.to_le_bytes());
+                payload.extend_from_slice(&rows.to_le_bytes());
+                encode_frame(TYPE_RESIZE, &payload)
+            }
+            Self::Shutdown => encode_frame(TYPE_SHUTDOWN, &[]),
+        }
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < HEADER_LEN {
             bail!(
@@ -217,5 +270,118 @@ mod tests {
         let frame = encode_frame(TYPE_INPUT, payload);
         let decoded = ClientMessage::decode(&frame).unwrap();
         assert_eq!(decoded, ClientMessage::Input(payload.to_vec()));
+    }
+
+    // -- ClientMessage::encode tests --
+
+    #[test]
+    fn client_message_encode_input() {
+        let msg = ClientMessage::Input(b"hello".to_vec());
+        let encoded = msg.encode();
+        assert_eq!(encoded[0], TYPE_INPUT);
+        let payload_len = u32::from_le_bytes(encoded[1..5].try_into().unwrap()) as usize;
+        assert_eq!(payload_len, 5);
+        assert_eq!(&encoded[HEADER_LEN..], b"hello");
+    }
+
+    #[test]
+    fn client_message_encode_resize() {
+        let msg = ClientMessage::Resize {
+            cols: 120,
+            rows: 40,
+        };
+        let encoded = msg.encode();
+        assert_eq!(encoded[0], TYPE_RESIZE);
+        let payload_len = u32::from_le_bytes(encoded[1..5].try_into().unwrap()) as usize;
+        assert_eq!(payload_len, 4);
+        let cols = u16::from_le_bytes(encoded[HEADER_LEN..HEADER_LEN + 2].try_into().unwrap());
+        let rows = u16::from_le_bytes(encoded[HEADER_LEN + 2..HEADER_LEN + 4].try_into().unwrap());
+        assert_eq!(cols, 120);
+        assert_eq!(rows, 40);
+    }
+
+    #[test]
+    fn client_message_encode_shutdown() {
+        let msg = ClientMessage::Shutdown;
+        let encoded = msg.encode();
+        assert_eq!(encoded[0], TYPE_SHUTDOWN);
+        let payload_len = u32::from_le_bytes(encoded[1..5].try_into().unwrap()) as usize;
+        assert_eq!(payload_len, 0);
+    }
+
+    #[test]
+    fn client_message_encode_decode_roundtrip() {
+        let messages = vec![
+            ClientMessage::Input(b"ls -la\n".to_vec()),
+            ClientMessage::Resize {
+                cols: 200,
+                rows: 50,
+            },
+            ClientMessage::Shutdown,
+        ];
+        for msg in messages {
+            let encoded = msg.encode();
+            let decoded = ClientMessage::decode(&encoded).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    // -- HostMessage::decode tests --
+
+    #[test]
+    fn host_message_decode_snapshot() {
+        let data = b"screen data";
+        let frame = encode_frame(TYPE_SNAPSHOT, data);
+        let decoded = HostMessage::decode(&frame).unwrap();
+        assert_eq!(decoded, HostMessage::Snapshot(data.to_vec()));
+    }
+
+    #[test]
+    fn host_message_decode_output() {
+        let data = b"output bytes";
+        let frame = encode_frame(TYPE_OUTPUT, data);
+        let decoded = HostMessage::decode(&frame).unwrap();
+        assert_eq!(decoded, HostMessage::Output(data.to_vec()));
+    }
+
+    #[test]
+    fn host_message_decode_exited() {
+        let frame = encode_frame(TYPE_EXITED, &42i32.to_le_bytes());
+        let decoded = HostMessage::decode(&frame).unwrap();
+        assert_eq!(decoded, HostMessage::Exited(42));
+    }
+
+    #[test]
+    fn host_message_encode_decode_roundtrip() {
+        let messages = vec![
+            HostMessage::Snapshot(b"snapshot".to_vec()),
+            HostMessage::Output(b"output".to_vec()),
+            HostMessage::Exited(127),
+        ];
+        for msg in messages {
+            let encoded = msg.encode();
+            let decoded = HostMessage::decode(&encoded).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn decode_invalid_host_type() {
+        let frame = encode_frame(0xFF, &[]);
+        let result = HostMessage::decode(&frame);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown host message type")
+        );
+    }
+
+    #[test]
+    fn decode_truncated_header_host() {
+        let result = HostMessage::decode(&[0x01]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated header"));
     }
 }

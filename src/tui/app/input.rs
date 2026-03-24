@@ -127,25 +127,44 @@ impl App {
             return self.handle_permission_dialog_key(code);
         }
 
-        if self.active_session_uses_thread_workspace() {
-            return self.handle_thread_session_tab_key(code, modifiers);
-        }
-
+        // Global session keys — work in ALL view modes (conversation, terminal, editor)
         // Ctrl+Q = close session permanently (with confirmation)
         if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('q')) {
             self.prompt_close_session();
             return Ok(());
         }
 
-        // Ctrl+O toggles back to Conversation view (if session has a thread)
-        if modifiers == KeyModifiers::CONTROL
-            && matches!(code, KeyCode::Char('o'))
-            && self.active_session_thread().is_some()
-        {
-            if self.toggle_active_session_view() {
-                self.show_toast("Switched to conversation view", ToastStyle::Info);
+        // Ctrl+O toggles between conversation and terminal
+        if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('o')) {
+            self.toggle_active_session_view();
+            return Ok(());
+        }
+
+        // Ctrl+E toggles editor mode (neovim full-screen)
+        if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('e')) {
+            let in_editor = matches!(
+                self.tabs.get(self.active_tab),
+                Some(Tab::Session {
+                    view_mode: SessionTabView::Editor,
+                    ..
+                })
+            );
+            if in_editor {
+                // Exit editor → conversation
+                if let Some(Tab::Session { view_mode, .. }) =
+                    self.tabs.get_mut(self.active_tab)
+                {
+                    *view_mode = SessionTabView::Conversation;
+                }
+            } else {
+                self.switch_to_editor()?;
             }
             return Ok(());
+        }
+
+        // Conversation view has its own key handler for compose, inspector, etc.
+        if self.active_session_uses_thread_workspace() {
+            return self.handle_thread_session_tab_key(code, modifiers);
         }
 
         if let Some(action) = self.keymap.lookup_session(code, modifiers) {
@@ -178,15 +197,70 @@ impl App {
     }
 
     fn toggle_active_session_view(&mut self) -> bool {
-        let Some(Tab::Session { view_mode, .. }) = self.tabs.get_mut(self.active_tab) else {
+        let Some(Tab::Session {
+            view_mode,
+            terminals,
+            ..
+        }) = self.tabs.get_mut(self.active_tab)
+        else {
             return false;
         };
 
         *view_mode = match *view_mode {
-            SessionTabView::Conversation => SessionTabView::Terminal,
-            SessionTabView::Terminal => SessionTabView::Conversation,
+            SessionTabView::Conversation => {
+                tracing::debug!("toggle_view: conversation → terminal (resetting scrollback)");
+                terminals.reset_all_scrollback();
+                // Focus the Claude pane by default — that's what the user
+                // wants to see. Fall back to any live pane if Claude exited.
+                if terminals
+                    .terminal(terminals.claude_pane_id)
+                    .is_some_and(|t| !t.exited())
+                {
+                    terminals.focused = terminals.claude_pane_id;
+                } else {
+                    let live = terminals.pane_ids_in_order().into_iter().find(|&id| {
+                        terminals.terminal(id).is_some_and(|t| !t.exited())
+                    });
+                    if let Some(id) = live {
+                        tracing::debug!(
+                            pane_id = id,
+                            "toggle_view: focusing live pane (claude exited)"
+                        );
+                        terminals.focused = id;
+                    }
+                }
+                SessionTabView::Terminal
+            }
+            SessionTabView::Terminal | SessionTabView::Editor => {
+                tracing::debug!("toggle_view: terminal/editor → conversation");
+                SessionTabView::Conversation
+            }
         };
         true
+    }
+
+    /// Switch to full-screen neovim editor mode. Spawns nvim on first call.
+    fn switch_to_editor(&mut self) -> Result<()> {
+        let Some(Tab::Session {
+            view_mode,
+            terminals,
+            ..
+        }) = self.tabs.get_mut(self.active_tab)
+        else {
+            return Ok(());
+        };
+
+        // Seed the editor config if needed
+        if let Err(e) = crate::config::seed_editor_config() {
+            tracing::warn!("failed to seed editor config: {e:#}");
+        }
+
+        let area = self.last_terminal_area;
+        let editor_id = terminals.ensure_editor(area.height, area.width)?;
+        terminals.focused = editor_id;
+        *view_mode = SessionTabView::Editor;
+        tracing::debug!("switch_to_editor: entering editor mode");
+        Ok(())
     }
 
     /// Execute a session-mode action (dashboard return, pane focus, splits, close).
@@ -208,10 +282,8 @@ impl App {
                 }
             }
             Action::ScrollToBottom => {
-                if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab)
-                    && let Some(term) = terminals.focused_terminal()
-                {
-                    term.reset_scrollback();
+                if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab) {
+                    terminals.reset_all_scrollback();
                 }
             }
             Action::ScrollPageUp => {
@@ -329,19 +401,30 @@ impl App {
                 };
             }
             Action::ScrollPageUp => {
-                self.inspector_scroll = self.inspector_scroll.saturating_sub(8);
+                if self.focus == Focus::Inspector {
+                    self.inspector_scroll = self.inspector_scroll.saturating_sub(8);
+                } else {
+                    self.session_chat_auto_scroll = false;
+                    self.session_chat_scroll = self.session_chat_scroll.saturating_add(10);
+                }
             }
             Action::ScrollPageDown => {
-                self.inspector_scroll = self.inspector_scroll.saturating_add(8);
+                if self.focus == Focus::Inspector {
+                    self.inspector_scroll = self.inspector_scroll.saturating_add(8);
+                } else if self.session_chat_scroll > 0 {
+                    self.session_chat_scroll = self.session_chat_scroll.saturating_sub(10);
+                    if self.session_chat_scroll == 0 {
+                        self.session_chat_auto_scroll = true;
+                    }
+                }
             }
             Action::ScrollToBottom => {
                 self.inspector_scroll = u16::MAX;
+                self.session_chat_scroll = 0;
+                self.session_chat_auto_scroll = true;
             }
             Action::SplitRight | Action::SplitDown | Action::ClosePane => {
-                self.show_toast(
-                    "Open the raw terminal view (Ctrl+O) to manage PTY panes",
-                    ToastStyle::Info,
-                );
+                // These work in terminal-focused mode via Ctrl+O
             }
             _ => {}
         }
@@ -361,9 +444,7 @@ impl App {
         }
 
         if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('o')) {
-            if self.toggle_active_session_view() {
-                self.show_toast("Switched to terminal view", ToastStyle::Info);
-            }
+            self.toggle_active_session_view();
             return Ok(());
         }
 
@@ -382,7 +463,9 @@ impl App {
         // Ctrl+C in conversation view: interrupt Claude and force-send queued message
         if code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL {
             if self.interrupt_active_session_claude() {
-                if let Some((thread_id, content)) = self.queued_compose_message.take() {
+                if let Some((thread_id, content, image_paths)) =
+                    self.queued_compose_message.take()
+                {
                     // User wants to steer the agent — interrupt and send the queued message
                     self.show_toast(
                         "Interrupted Claude — sending your message",
@@ -392,8 +475,9 @@ impl App {
                     // The message goes into the PTY buffer; Claude reads it
                     // after the interrupt is processed.
                     if let Ok(thread) = self.store.get_thread(&thread_id) {
-                        let _ = self.send_to_active_session_claude(&content)
-                            || self.send_prompt_to_live_thread_session(&thread, &content);
+                        let prompt = augment_prompt_with_images(&content, &image_paths);
+                        let _ = self.send_to_active_session_claude(&prompt)
+                            || self.send_prompt_to_live_thread_session(&thread, &prompt);
                         if let Some(ref mut cache) = self.conversation_cache {
                             cache.entries.push(
                                 crate::conversation::ConversationEntry::UserMessage {
@@ -404,6 +488,7 @@ impl App {
                                 },
                             );
                         }
+                        self.cached_chat_lines = None;
                     }
                 } else {
                     self.show_toast("Sent interrupt (Ctrl+C) to Claude", ToastStyle::Info);
@@ -432,6 +517,21 @@ impl App {
                 }
                 KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Inspector => {
                     self.inspector_scroll = self.inspector_scroll.saturating_sub(1);
+                    return Ok(());
+                }
+                // Chat panel scroll (when chat is focused, not inspector)
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.session_chat_scroll > 0 {
+                        self.session_chat_scroll = self.session_chat_scroll.saturating_sub(1);
+                        if self.session_chat_scroll == 0 {
+                            self.session_chat_auto_scroll = true;
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.session_chat_auto_scroll = false;
+                    self.session_chat_scroll = self.session_chat_scroll.saturating_add(1);
                     return Ok(());
                 }
                 KeyCode::Char('i') => {
@@ -530,11 +630,21 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('q') => {
-                    self.close_active_thread_session()?;
+                    // Show confirmation dialog (same as Ctrl+Q)
+                    self.prompt_close_session();
                     return Ok(());
                 }
                 KeyCode::Char('R') => {
                     self.restart_claude_in_session()?;
+                    return Ok(());
+                }
+                KeyCode::Char('l') => {
+                    // Relaunch the thread (new session) when Claude has exited
+                    self.restart_claude_in_session()?;
+                    return Ok(());
+                }
+                KeyCode::Char('e') => {
+                    self.open_editor_pane()?;
                     return Ok(());
                 }
                 _ => {}
@@ -554,6 +664,13 @@ impl App {
 
     /// Forward pasted text to the focused PTY on a session tab.
     pub(super) fn handle_session_tab_paste(&mut self, text: &str) -> Result<()> {
+        // When in compose mode or conversation view, paste into the compose buffer
+        if self.input_mode == InputMode::ThreadCompose
+            || self.active_session_uses_thread_workspace()
+        {
+            return self.handle_dashboard_paste(text);
+        }
+
         if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab) {
             terminals.selection = None;
             if let Some(term) = terminals.focused_terminal() {
@@ -846,7 +963,16 @@ impl App {
             // exited — preventing scroll events from being silently consumed
             // by a dead process while the parser retains stale mouse mode.
             let coords = self.screen_to_terminal_coords(col, row);
-            let mouse_forwarded = if let Some((pane_id, vt_row, vt_col)) = coords
+            // Never forward scroll events to the PTY — claustre manages
+            // scrollback independently.  Forwarding them causes the scroll
+            // offset to get stuck when the PTY application enables mouse
+            // tracking (alternate screen mode).
+            let is_scroll = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            let mouse_forwarded = if !is_scroll
+                && let Some((pane_id, vt_row, vt_col)) = coords
                 && let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab)
                 && let Some(term) = terminals.terminal(pane_id)
                 && term.should_forward_mouse()
@@ -1680,8 +1806,7 @@ impl App {
                         self.input_buffer = def.name.clone();
                         self.input_cursor = self.input_buffer.len();
                         self.input_mode = InputMode::SettingsEdit;
-                        self.settings_edit_target =
-                            Some(SettingsEditTarget::WorkflowName);
+                        self.settings_edit_target = Some(SettingsEditTarget::WorkflowName);
                     }
                 }
                 Ok(true)
@@ -2711,13 +2836,19 @@ impl App {
                     Ok(result) => SessionOpResult::ThreadLaunched {
                         result: Box::new(result),
                     },
-                    Err(error) => SessionOpResult::Error {
-                        message: format!("Thread relaunch failed: {error}"),
-                    },
+                    Err(error) => {
+                        tracing::error!(thread_id, "thread relaunch failed: {error:#}");
+                        SessionOpResult::Error {
+                            message: format!("Thread relaunch failed: {error}"),
+                        }
+                    }
                 },
-                Err(error) => SessionOpResult::Error {
-                    message: format!("Thread relaunch failed (DB): {error}"),
-                },
+                Err(error) => {
+                    tracing::error!("thread relaunch DB open failed: {error:#}");
+                    SessionOpResult::Error {
+                        message: format!("Thread relaunch failed (DB): {error}"),
+                    }
+                }
             };
             let _ = tx.send(result);
         });
@@ -2762,6 +2893,45 @@ impl App {
         }
 
         self.spawn_thread_relaunch(thread.id);
+        Ok(())
+    }
+
+    /// Open neovim in a split pane in the session's worktree.
+    /// Uses `NVIM_APPNAME=claustre` so it picks up the claustre editor config
+    /// from `~/.config/claustre/init.lua` without interfering with the user's
+    /// personal nvim config.
+    fn open_editor_pane(&mut self) -> Result<()> {
+        let Some(Tab::Session {
+            terminals,
+            view_mode,
+            ..
+        }) = self.tabs.get_mut(self.active_tab)
+        else {
+            self.show_toast("No active session", ToastStyle::Info);
+            return Ok(());
+        };
+
+        // Seed the editor config if it doesn't exist
+        let _ = crate::config::seed_editor_config();
+
+        let worktree = terminals.worktree_path.clone();
+        let mut cmd = portable_pty::CommandBuilder::new("nvim");
+        cmd.cwd(&worktree);
+        // Use claustre-specific nvim config via NVIM_APPNAME
+        cmd.env("NVIM_APPNAME", "claustre");
+
+        let area = self.last_terminal_area;
+        terminals.split_with_command(
+            crate::pty::SplitDirection::Horizontal,
+            area.height,
+            area.width,
+            cmd,
+            "Editor",
+        )?;
+
+        // Switch to terminal view so the user sees the editor
+        *view_mode = super::SessionTabView::Terminal;
+        self.show_toast("Opened editor (nvim)", ToastStyle::Success);
         Ok(())
     }
 
@@ -2884,11 +3054,10 @@ impl App {
         self.input_mode = InputMode::ConfirmDelete;
     }
 
-
     /// Drain a queued compose message when Claude becomes idle.
     /// Called on every tick after `detect_paused_sessions`.
     pub(super) fn drain_queued_compose_message(&mut self) {
-        let Some((ref thread_id, _)) = self.queued_compose_message else {
+        let Some((ref thread_id, _, _)) = self.queued_compose_message else {
             return;
         };
         // Find the session for this thread
@@ -2909,25 +3078,26 @@ impl App {
         if !is_idle {
             return;
         }
-        let (thread_id, content) = self.queued_compose_message.take().expect("checked above");
+        let (thread_id, content, image_paths) =
+            self.queued_compose_message.take().expect("checked above");
         if let Ok(thread) = self.store.get_thread(&thread_id) {
-            let sent = self.send_to_active_session_claude(&content)
-                || self.send_prompt_to_live_thread_session(&thread, &content);
+            let prompt = augment_prompt_with_images(&content, &image_paths);
+            let sent = self.send_to_active_session_claude(&prompt)
+                || self.send_prompt_to_live_thread_session(&thread, &prompt);
             if sent {
                 self.show_toast("Queued message sent to agent", ToastStyle::Success);
                 if let Some(ref mut cache) = self.conversation_cache {
                     cache
                         .entries
                         .push(crate::conversation::ConversationEntry::UserMessage {
-                            timestamp: chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S")
-                                .to_string(),
+                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
                             text: content,
                         });
                 }
+                self.cached_chat_lines = None;
             } else {
-                // Claude dead — try restart
-                let _ = self.restart_claude_with_message(&thread, &content);
+                // Claude dead — try restart with image support
+                let _ = self.restart_claude_with_message(&thread, &content, &image_paths);
                 self.show_toast("Restarting Claude with queued message...", ToastStyle::Info);
             }
         }
@@ -2940,31 +3110,43 @@ impl App {
         let Tab::Session { terminals, .. } = self.tabs.get(self.active_tab)? else {
             return None;
         };
-        terminals.with_claude_live_screen(|screen| {
-            super::screen_shows_idle_prompt(screen)
-        })
+        terminals.with_claude_live_screen(|screen| super::screen_shows_idle_prompt(screen))
     }
-
-    /// Check if Claude has exited in the active session.
-    /// Uses `pty_idle_sessions` as a signal — if the session has been idle
-    /// (no Claude indicator for 15+ seconds), Claude likely exited.
 
     /// Send a prompt directly to the active session tab's Claude pane.
     /// This is the most direct path — no thread/session lookup needed.
     fn send_to_active_session_claude(&mut self, prompt: &str) -> bool {
         let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab) else {
+            tracing::debug!(
+                "send_to_active: no session tab at active_tab={}",
+                self.active_tab
+            );
             return false;
         };
         let pane_id = terminals.claude_pane_id;
         let Some(term) = terminals.terminal_mut(pane_id) else {
+            tracing::debug!("send_to_active: no terminal for claude pane {pane_id}");
             return false;
         };
         if term.exited() {
+            tracing::debug!("send_to_active: claude pane exited");
             return false;
         }
         term.reset_scrollback();
-        let payload = format!("\x1b[200~{prompt}\x1b[201~\n");
-        term.send_bytes(payload.as_bytes()).is_ok()
+        let clean = prompt.replace('\n', " ");
+        let text_ok = term.send_bytes(clean.as_bytes()).is_ok();
+        let enter_ok = if text_ok {
+            term.send_bytes(b"\r").is_ok()
+        } else {
+            false
+        };
+        tracing::debug!(
+            text_ok,
+            enter_ok,
+            prompt_len = clean.len(),
+            "send_to_active: sent"
+        );
+        text_ok && enter_ok
     }
 
     /// Send Ctrl+C (SIGINT) to the Claude pane to interrupt a stuck operation.
@@ -3008,20 +3190,23 @@ impl App {
         if term.exited() {
             return false;
         }
-        let payload = format!("\x1b[200~{prompt}\x1b[201~\n");
-        match term.send_bytes(payload.as_bytes()) {
-            Ok(()) => true,
-            Err(_) => false,
+        let clean = prompt.replace('\n', " ");
+        if term.send_bytes(clean.as_bytes()).is_err() {
+            return false;
         }
+        term.send_bytes(b"\r").is_ok()
     }
 
     /// Restart Claude Code in the existing shell PTY when Claude has exited.
     /// Sends `claude --resume <session_id> -p "message"` to the shell, which
     /// resumes the previous conversation with the user's message as prompt.
-    fn restart_claude_with_message(
+    /// When `image_paths` is non-empty, adds `--image <path>` flags so Claude
+    /// receives the images natively in its context window.
+    pub(super) fn restart_claude_with_message(
         &mut self,
         thread: &crate::store::Thread,
         message: &str,
+        image_paths: &[String],
     ) -> bool {
         let Some(session_id) = thread.session_id.as_deref() else {
             return false;
@@ -3031,15 +3216,19 @@ impl App {
             Err(_) => return false,
         };
 
+        tracing::debug!(session_id, image_count = image_paths.len(), "restart_claude: building resume command");
         // Build resume command: claude --resume <csid> -p "message"
+        // Images are included as path references in the prompt text
+        // (Claude Code CLI doesn't support --image flags).
         let mut cmd = crate::threads::build_resume_agent_command(
             &self.config,
             thread.provider_kind,
             thread.provider_profile.as_deref(),
             &session,
         );
+        let prompt_text = augment_prompt_with_images(message, image_paths);
         cmd.push("-p".to_string());
-        cmd.push(message.to_string());
+        cmd.push(prompt_text);
 
         // Shell-escape each arg and join into a single command line
         let shell_cmd: String = cmd
@@ -3048,26 +3237,53 @@ impl App {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Send to the claude pane's PTY as a raw shell command (not bracketed paste)
+        tracing::debug!(cmd = %shell_cmd, "restart_claude: sending to PTY");
+        // Send to the shell pane (not the dead Claude pane). The shell is
+        // still alive and can launch a new Claude process.
         let Some(Tab::Session { terminals, .. }) = self
             .tabs
             .iter_mut()
             .find(|tab| matches!(tab, Tab::Session { session_id: sid, .. } if sid == session_id))
         else {
+            tracing::debug!("restart_claude: no session tab found");
             return false;
         };
-        let pane_id = terminals.claude_pane_id;
+        // Find a live pane to send the command — prefer shell (pane 0), fall back to any alive pane
+        let live_pane = terminals
+            .pane_ids_in_order()
+            .into_iter()
+            .find(|&id| {
+                id != terminals.claude_pane_id
+                    && terminals.terminal(id).is_some_and(|t| !t.exited())
+            })
+            .or_else(|| {
+                // If all non-claude panes are dead too, try claude pane as last resort
+                terminals
+                    .terminal(terminals.claude_pane_id)
+                    .and_then(|t| (!t.exited()).then_some(terminals.claude_pane_id))
+            });
+        let Some(pane_id) = live_pane else {
+            tracing::debug!("restart_claude: all panes exited, cannot send");
+            return false;
+        };
         let Some(term) = terminals.terminal_mut(pane_id) else {
+            tracing::debug!("restart_claude: no terminal for pane {pane_id}");
             return false;
         };
-        if term.exited() {
-            return false;
-        }
+        tracing::debug!(pane_id, "restart_claude: using pane");
 
         let payload = format!("{shell_cmd}\r");
         if term.send_bytes(payload.as_bytes()).is_err() {
             return false;
         }
+
+        // Record the restart timestamp so the dead-detection logic
+        // gives Claude time to start before declaring it dead again.
+        // This prevents double-restart: without it, the next message would
+        // see the original claude pane as exited, try to restart again,
+        // and send garbled text into the already-running Claude process.
+        self.last_restart_at
+            .insert(session_id.to_string(), std::time::Instant::now());
 
         // Update session status to Working
         let _ = self.store.update_session_status(
@@ -3090,28 +3306,118 @@ impl App {
             cache.file_offset = 0;
             cache.entries.clear();
         }
-        // Clear the timer-based exit detection since we just restarted Claude
+        // Clear all exit/idle detection state since we just restarted Claude.
+        // Without this, the header continues showing "claude exited" even though
+        // Claude is running in the restarted pane, because pty_idle_sessions
+        // still contains the session and thread_session_state checks it.
         self.working_no_indicator_since.remove(session_id);
+        self.pty_idle_sessions.remove(session_id);
         true
     }
 
-    /// Restart Claude in the current session. Closes the dead session and
-    /// relaunches the thread — preserving worktree, branch, and conversation.
+    /// Restart the provider in the current session without tearing down the
+    /// worktree or session. Replaces the command in the provider pane.
+    /// Falls back to full relaunch if the session is truly dead.
     fn restart_claude_in_session(&mut self) -> Result<()> {
         let Some(thread) = self.active_session_thread() else {
             self.show_toast("No active thread", ToastStyle::Info);
             return Ok(());
         };
-        self.show_toast("Restarting Claude session...", ToastStyle::Info);
 
-        // Close the dead session's tab
-        if let Some(session_id) = thread.session_id.clone() {
-            self.store.close_session(&session_id)?;
-            self.remove_session_tab(&session_id);
+        let session_id = thread.session_id.clone();
+        let thread_id = thread.id.clone();
+        let provider_kind = thread.provider_kind;
+        let provider_profile = thread.provider_profile.clone();
+
+        // Try in-place restart: replace the provider command in the existing pane
+        if let Some(ref sid) = session_id {
+            let session_result = self.store.get_session(sid);
+            let Ok(session) = session_result else {
+                tracing::warn!("in-place restart: session not found in DB");
+                // Fall through to full relaunch
+                self.show_toast("Session not found, relaunching...", ToastStyle::Info);
+                return self.full_relaunch_session(session_id, thread_id);
+            };
+
+            // Build the resume command for the provider
+            let cmd_parts = crate::threads::build_resume_agent_command(
+                &self.config,
+                provider_kind,
+                provider_profile.as_deref(),
+                &session,
+            );
+
+            let mut cmd = portable_pty::CommandBuilder::new(&cmd_parts[0]);
+            for arg in &cmd_parts[1..] {
+                cmd.arg(arg);
+            }
+            cmd.cwd(&session.worktree_path);
+
+            let tab_found = self
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab, super::Tab::Session { session_id: s, .. } if s == sid));
+
+            if !tab_found {
+                tracing::warn!("in-place restart: no tab found for session {sid}");
+                self.show_toast("Session tab missing, relaunching...", ToastStyle::Info);
+                return self.full_relaunch_session(session_id, thread_id);
+            }
+
+            // Find the tab mutably and replace the command
+            let tab = self
+                .tabs
+                .iter_mut()
+                .find(|tab| matches!(tab, super::Tab::Session { session_id: s, .. } if s == sid))
+                .expect("tab existence verified above");
+
+            if let super::Tab::Session { terminals, .. } = tab {
+                let label = format!("{} [{}]", session.tab_label, provider_kind);
+                match terminals.replace_claude_command(cmd, &label) {
+                    Ok(()) => {
+                        self.show_toast("Provider restarted", ToastStyle::Success);
+                        let _ = self.store.update_session_status(
+                            sid,
+                            crate::store::ClaudeStatus::Working,
+                            "Provider restarted",
+                        );
+                        self.working_no_indicator_since.remove(sid.as_str());
+                        self.pty_idle_sessions.remove(sid.as_str());
+                        if let Some(ref mut cache) = self.conversation_cache {
+                            cache.file_offset = 0;
+                            cache.entries.clear();
+                        }
+                        self.cached_chat_lines = None;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.show_toast(
+                            format!("In-place restart failed: {e}"),
+                            ToastStyle::Error,
+                        );
+                        tracing::warn!("in-place restart failed: {e:#}");
+                        return self.full_relaunch_session(session_id, thread_id);
+                    }
+                }
+            }
+            // Shouldn't reach here if tab was found
+            return self.full_relaunch_session(session_id, thread_id);
         }
 
-        // Relaunch the thread (creates new worktree + session + PTY)
-        let thread_id = thread.id.clone();
+        // No session_id on thread
+        self.show_toast("No session attached, launching new...", ToastStyle::Info);
+        self.full_relaunch_session(session_id, thread_id)
+    }
+
+    fn full_relaunch_session(
+        &mut self,
+        session_id: Option<String>,
+        thread_id: String,
+    ) -> Result<()> {
+        if let Some(sid) = session_id {
+            let _ = self.store.close_session(&sid);
+            self.remove_session_tab(&sid);
+        }
         let tx = self.session_op_tx.clone();
         let cfg = self.config.clone();
         self.session_op_in_progress = true;
@@ -3121,13 +3427,19 @@ impl App {
                     Ok(result) => super::SessionOpResult::ThreadLaunched {
                         result: Box::new(result),
                     },
-                    Err(error) => super::SessionOpResult::Error {
-                        message: format!("Restart failed: {error}"),
-                    },
+                    Err(error) => {
+                        tracing::error!(thread_id, "session restart failed: {error:#}");
+                        super::SessionOpResult::Error {
+                            message: format!("Restart failed: {error}"),
+                        }
+                    }
                 },
-                Err(error) => super::SessionOpResult::Error {
-                    message: format!("Restart failed (DB): {error}"),
-                },
+                Err(error) => {
+                    tracing::error!("session restart DB open failed: {error:#}");
+                    super::SessionOpResult::Error {
+                        message: format!("Restart failed (DB): {error}"),
+                    }
+                }
             };
             let _ = tx.send(result);
         });
@@ -3155,6 +3467,24 @@ impl App {
         match crate::workflows::approve_workflow_stage(&self.store, run_id, stage_name) {
             Ok(_bundle) => {
                 self.show_toast(format!("Stage approved: {stage_name}"), ToastStyle::Success);
+                // Clear stale quick-reply choices from the previous stage
+                self.quick_reply_choices.clear();
+                // Add visual feedback in the conversation timeline
+                if let Some(ref mut cache) = self.conversation_cache {
+                    cache
+                        .entries
+                        .push(crate::conversation::ConversationEntry::UserMessage {
+                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                            text: format!("[Approved] Stage: {stage_name} — advancing workflow"),
+                        });
+                }
+                self.cached_chat_lines = None;
+                // Reset conversation cache offset so next refresh picks up new JSONL entries
+                // from the restarted Claude process
+                if let Some(ref mut cache) = self.conversation_cache {
+                    cache.file_offset = 0;
+                    cache.file_mtime = None;
+                }
                 // Next tick picks up the newly Running stage for prompt injection
             }
             Err(err) => {
@@ -3175,9 +3505,13 @@ impl App {
         };
 
         let content = self.thread_compose_buffer.trim().to_string();
-        eprintln!("[compose] submit called, content={:?}, thread_id={thread_id}", content.chars().take(40).collect::<String>());
+        tracing::debug!(
+            thread_id = %thread_id,
+            content_len = content.len(),
+            content_preview = %content.chars().take(60).collect::<String>(),
+            "compose: submit"
+        );
         if content.is_empty() {
-            eprintln!("[compose] empty content, aborting");
             self.show_toast("Compose a message first", ToastStyle::Info);
             return Ok(());
         }
@@ -3186,6 +3520,10 @@ impl App {
         self.compose_history.push(content.clone());
         self.compose_history_index = None;
 
+        // Snap chat scroll to bottom when sending a message
+        self.session_chat_scroll = 0;
+        self.session_chat_auto_scroll = true;
+
         let thread = self.store.get_thread(&thread_id)?;
         let latest_run_id = self
             .store
@@ -3193,13 +3531,34 @@ impl App {
             .into_iter()
             .last()
             .map(|run| run.id);
-        self.store.create_thread_message(
+        let message = self.store.create_thread_message(
             &thread.id,
             latest_run_id.as_deref(),
             "user",
             &content,
             &[],
         )?;
+
+        // Link any draft image attachments to this message and collect their
+        // local paths so we can forward images to Claude.
+        let image_paths: Vec<String> = self
+            .store
+            .list_draft_attachments(&thread.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.mime_type.starts_with("image/"))
+            .map(|a| a.local_path)
+            .collect();
+        if !image_paths.is_empty() {
+            let _ = self
+                .store
+                .link_attachments_to_message(&thread.id, &message.id);
+            tracing::debug!(
+                count = image_paths.len(),
+                "compose: linked image attachments"
+            );
+        }
+
         self.store
             .update_thread_status(&thread.id, crate::store::ThreadStatus::Running)?;
 
@@ -3207,14 +3566,40 @@ impl App {
         self.quick_reply_choices.clear();
 
         // Determine Claude's state to pick the right send strategy:
-        // 1. Dead (pty_idle + no ❯ prompt) → restart with --resume
+        // 1. Dead (PTY exited, or pty_idle + no ❯ prompt) → restart with --resume
         // 2. Working (DB says Working, not idle-detected) → queue for later
         // 3. Idle or unknown → send directly
+        //
+        // When images are attached, the direct-send path augments the prompt
+        // text with image path instructions (Claude can Read image files).
+        // The restart path uses native --image flags for cleaner delivery.
         let session_id = thread.session_id.as_deref();
-        let claude_dead = session_id.is_some_and(|sid| {
-            self.pty_idle_sessions.contains(sid)
-                && self.is_claude_idle_in_active_session() != Some(true)
+        let claude_pane_exited = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| {
+                if let Tab::Session { terminals, .. } = tab {
+                    terminals
+                        .terminal(terminals.claude_pane_id)
+                        .map(|t| t.exited())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        // If we recently restarted Claude in the shell pane (within 60s),
+        // don't declare it dead — give it time to start and process.
+        let restart_cooldown = session_id.is_some_and(|sid| {
+            self.last_restart_at
+                .get(sid)
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
         });
+        let claude_dead = !restart_cooldown
+            && (claude_pane_exited
+                || session_id.is_some_and(|sid| {
+                    self.pty_idle_sessions.contains(sid)
+                        && self.is_claude_idle_in_active_session() != Some(true)
+                }));
         let claude_working = session_id.is_some_and(|sid| {
             self.sessions
                 .iter()
@@ -3223,31 +3608,42 @@ impl App {
                 && self.is_claude_idle_in_active_session() != Some(true)
         });
 
-        eprintln!(
-            "[compose] state: session_id={:?}, claude_dead={claude_dead}, claude_working={claude_working}, idle={:?}",
-            session_id,
-            self.is_claude_idle_in_active_session()
+        tracing::debug!(
+            ?session_id,
+            claude_pane_exited,
+            claude_dead,
+            claude_working,
+            image_count = image_paths.len(),
+            idle = ?self.is_claude_idle_in_active_session(),
+            "compose: send strategy"
         );
 
-        if claude_dead {
+        if restart_cooldown {
+            // A restart was sent recently — Claude is starting up in the
+            // shell pane. Queue the message so it's sent when Claude
+            // becomes idle. Don't try direct send (the original claude
+            // pane is dead) or restart (would double-restart).
+            tracing::debug!("compose: restart cooldown active → queuing message");
+            self.queued_compose_message =
+                Some((thread.id.clone(), content.clone(), image_paths));
+            self.show_toast(
+                "Message queued — Claude is restarting",
+                ToastStyle::Info,
+            );
+        } else if claude_dead {
             // Claude is dead — try restart, then direct send, then tell user
-            let restarted = self.restart_claude_with_message(&thread, &content);
+            tracing::info!("compose: claude dead → attempting restart");
+            let restarted = self.restart_claude_with_message(&thread, &content, &image_paths);
+            tracing::debug!(restarted, "compose: restart result");
             if restarted {
                 self.show_toast("Restarting Claude with your message...", ToastStyle::Info);
-                if let Some(ref mut cache) = self.conversation_cache {
-                    cache
-                        .entries
-                        .push(crate::conversation::ConversationEntry::UserMessage {
-                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            text: content,
-                        });
-                }
             } else {
                 // Restart failed — try direct send as fallback
-                let sent = self.send_to_active_session_claude(&content)
-                    || self.send_prompt_to_live_thread_session(&thread, &content);
+                let prompt = augment_prompt_with_images(&content, &image_paths);
+                let sent = self.send_to_active_session_claude(&prompt)
+                    || self.send_prompt_to_live_thread_session(&thread, &prompt);
+                tracing::debug!(sent, "compose: dead fallback direct send");
                 if !sent {
-                    // Nothing works — preserve message and tell user to press R
                     self.show_toast(
                         "Claude exited — press Esc then R to restart session",
                         ToastStyle::Error,
@@ -3255,30 +3651,34 @@ impl App {
                 }
             }
         } else if claude_working {
-            eprintln!("[compose] path: claude_working → queue");
-            self.queued_compose_message = Some((thread.id.clone(), content));
+            tracing::debug!("compose: claude working → queuing message");
+            self.queued_compose_message =
+                Some((thread.id.clone(), content.clone(), image_paths));
             self.show_toast(
                 "Message queued — will send when Claude finishes",
                 ToastStyle::Info,
             );
         } else {
-            eprintln!("[compose] path: idle/unknown → send directly");
-            let sent_active = self.send_to_active_session_claude(&content);
-            let sent = sent_active || self.send_prompt_to_live_thread_session(&thread, &content);
-            eprintln!("[compose] send result: sent_active={sent_active}, sent={sent}");
+            tracing::debug!("compose: idle/unknown → send directly");
+            let prompt = augment_prompt_with_images(&content, &image_paths);
+            let sent_active = self.send_to_active_session_claude(&prompt);
+            let sent = sent_active || self.send_prompt_to_live_thread_session(&thread, &prompt);
+            tracing::debug!(sent_active, sent, "compose: direct send result");
             if sent {
-                self.show_toast("Sent to agent", ToastStyle::Success);
-                if let Some(ref mut cache) = self.conversation_cache {
-                    cache
-                        .entries
-                        .push(crate::conversation::ConversationEntry::UserMessage {
-                            timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            text: content,
-                        });
+                if image_paths.is_empty() {
+                    self.show_toast("Sent to agent", ToastStyle::Success);
+                } else {
+                    self.show_toast(
+                        format!("Sent to agent with {} image(s)", image_paths.len()),
+                        ToastStyle::Success,
+                    );
                 }
             } else {
                 // PTY send failed — try restart as last resort
-                let restarted = self.restart_claude_with_message(&thread, &content);
+                tracing::info!("compose: direct send failed → attempting restart");
+                let restarted =
+                    self.restart_claude_with_message(&thread, &content, &image_paths);
+                tracing::debug!(restarted, "compose: fallback restart result");
                 if restarted {
                     self.show_toast("Resuming Claude session...", ToastStyle::Info);
                 } else {
@@ -3289,6 +3689,20 @@ impl App {
                 }
             }
         }
+
+        // Append the user message to the conversation cache AFTER the send
+        // strategy block. This must come after restart_claude_with_message
+        // which clears the cache — adding the message before would lose it.
+        if let Some(ref mut cache) = self.conversation_cache {
+            cache
+                .entries
+                .push(crate::conversation::ConversationEntry::UserMessage {
+                    timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    text: content.clone(),
+                });
+        }
+        // Invalidate rendered line cache so the timeline rebuilds with the new message
+        self.cached_chat_lines = None;
 
         self.thread_compose_buffer.clear();
         self.thread_compose_cursor = 0;
@@ -3457,12 +3871,16 @@ impl App {
                         Ok(result) => SessionOpResult::ThreadLaunched {
                             result: Box::new(result),
                         },
-                        Err(error) => SessionOpResult::Error {
-                            message: format!("Thread launch failed: {error}"),
-                        },
+                        Err(error) => {
+                            tracing::error!("thread launch failed: {error:#}");
+                            SessionOpResult::Error {
+                                message: format!("Thread launch failed: {error}"),
+                            }
+                        }
                     }
                 }
                 Err(error) => {
+                    tracing::error!("thread launch DB open failed: {error:#}");
                     SessionOpResult::Error {
                         message: format!("Thread launch failed (DB): {error}"),
                     }
@@ -3812,10 +4230,8 @@ impl App {
                                 definition.name = new_name.clone();
                                 let _ = crate::workflows::save_workflow_definition(&definition);
                                 let _ = crate::workflows::delete_workflow_definition(&old_name);
-                                let _ = crate::workflows::sync_workflow_definitions(
-                                    &self.store,
-                                    None,
-                                );
+                                let _ =
+                                    crate::workflows::sync_workflow_definitions(&self.store, None);
                                 self.refresh_available_workflow_names();
                                 self.show_toast(
                                     format!("Renamed: {old_name} → {new_name}"),
@@ -3840,9 +4256,8 @@ impl App {
                     } else {
                         crate::config::save_settings_config(&self.config)?;
                     }
-                    self.github_status =
-                        crate::github_app::local_status(&self.config.github_app)
-                            .unwrap_or_default();
+                    self.github_status = crate::github_app::local_status(&self.config.github_app)
+                        .unwrap_or_default();
                     self.settings_edit_target = None;
                     self.input_mode = InputMode::Normal;
                     self.show_toast(format!("Saved {}", target.label()), ToastStyle::Success);
@@ -4247,7 +4662,8 @@ impl App {
                     } else if self.workbench_view == WorkbenchView::SprintBoard {
                         if self.selected_board_issue().is_some() {
                             self.task_details_scroll = 0;
-                            self.input_mode = InputMode::TaskDetails;
+                            self.refresh_board_selected_comments();
+                            self.input_mode = InputMode::BoardIssueDrawer;
                         }
                     } else if let Some(task) = self.selected_task() {
                         if let Some(session_id) = &task.session_id {
@@ -4313,6 +4729,9 @@ impl App {
                     {
                         self.refresh_my_task_selected_comments();
                         self.input_mode = InputMode::MyTaskDrawer;
+                    } else if self.workbench_view == WorkbenchView::SprintBoard {
+                        self.refresh_board_selected_comments();
+                        self.input_mode = InputMode::BoardIssueDrawer;
                     } else {
                         self.input_mode = InputMode::TaskDetails;
                     }
@@ -5902,6 +6321,7 @@ impl App {
             self.board_error = Some("Project not linked to git".to_string());
             return;
         }
+        self.github_sync_manual = true;
         self.spawn_github_sync();
         self.show_toast("Syncing GitHub data...", ToastStyle::Info);
     }
@@ -7295,6 +7715,51 @@ impl App {
             self.show_toast("Creating issue...".to_string(), ToastStyle::Info);
         }
     }
+}
+
+/// Strip `[image: filename]` markers from compose text.
+/// Used when images are sent via `--image` flags (restart path) so the
+/// prompt text doesn't contain redundant references.
+pub(super) fn strip_image_markers(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("[image: ") {
+        result.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find(']') {
+            rest = &rest[start + end + 1..];
+        } else {
+            // Unclosed bracket — keep the rest as-is
+            rest = &rest[start..];
+            break;
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_string()
+}
+
+/// Augment a prompt with image path instructions for the direct-send path.
+/// When Claude is alive and we send text directly to its PTY, there is no
+/// way to inject images natively. Instead, we tell Claude where to find
+/// the image files so it can use its Read tool to view them.
+///
+/// Returns the original content unchanged if there are no images.
+pub(super) fn augment_prompt_with_images(content: &str, image_paths: &[String]) -> String {
+    if image_paths.is_empty() {
+        return content.to_string();
+    }
+    // Replace [image: filename] markers with the full path instruction
+    let mut prompt = strip_image_markers(content);
+    let image_refs: Vec<String> = image_paths
+        .iter()
+        .map(|path| format!("[Attached image: {path} — use Read tool to view]"))
+        .collect();
+    let image_block = image_refs.join(" ");
+    if prompt.is_empty() {
+        prompt = format!("Please look at the attached image(s). {image_block}");
+    } else {
+        prompt = format!("{prompt} {image_block}");
+    }
+    prompt
 }
 
 fn combine_prompt(base: &str, extra_context: &str) -> String {

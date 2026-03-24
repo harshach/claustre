@@ -361,7 +361,8 @@ impl App {
                 .ok()
                 .flatten()
                 .is_some();
-        let view_mode = SessionTabView::Terminal;
+        let view_mode = SessionTabView::Conversation;
+        tracing::debug!(session_id = %session_id, label = %label, "add_session_tab: conversation mode");
         self.tabs.push(Tab::Session {
             session_id,
             terminals,
@@ -404,6 +405,9 @@ impl App {
             .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == session_id))
         {
             self.active_tab = idx;
+            // Reset chat scroll when switching sessions
+            self.session_chat_scroll = 0;
+            self.session_chat_auto_scroll = true;
             if self.ensure_session_thread_workspace(session_id)
                 && let Some(Tab::Session { view_mode, .. }) = self.tabs.get_mut(idx)
             {

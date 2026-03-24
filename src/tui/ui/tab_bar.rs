@@ -68,7 +68,7 @@ pub fn compute_tab_layout(tabs: &[Tab], active_tab: usize, available_width: u16)
     let full_labels: Vec<String> = tabs
         .iter()
         .map(|tab| match tab {
-            Tab::Dashboard => " Dashboard ".to_string(),
+            Tab::Dashboard => " Workbench ".to_string(),
             Tab::Session { label, .. } => format!(" {label} "),
         })
         .collect();
@@ -237,7 +237,7 @@ mod tests {
     /// Build a mock tab list. We use `Tab::Dashboard` as placeholders for session
     /// tabs because `Tab::Session` requires a real `SessionTerminals` with PTYs.
     /// `compute_tab_layout` only reads the `Tab` variant for its label, and
-    /// `Tab::Dashboard` produces " Dashboard " — so to test label behavior we
+    /// `Tab::Dashboard` produces " Workbench " — so to test label behavior we
     /// override the label extraction via a local wrapper that produces the right
     /// labels.  However, `compute_tab_layout` calls `.map(|tab| match tab { … })`
     /// directly, so we instead construct real `Tab::Session` variants using a
@@ -263,7 +263,7 @@ mod tests {
         let tabs = dashboard_only();
         let layout = compute_tab_layout(&tabs, 0, 100);
         assert_eq!(layout.entries.len(), 1);
-        assert_eq!(layout.entries[0].display_label, " Dashboard ");
+        assert_eq!(layout.entries[0].display_label, " Workbench ");
         assert!(!layout.has_left_overflow);
         assert!(!layout.has_right_overflow);
     }
@@ -273,7 +273,7 @@ mod tests {
         let tabs = tabs_n(3);
         let layout = compute_tab_layout(&tabs, 0, 100);
         assert_eq!(layout.entries.len(), 3);
-        assert_eq!(layout.entries[0].display_label, " Dashboard ");
+        assert_eq!(layout.entries[0].display_label, " Workbench ");
         assert!(!layout.has_left_overflow);
         assert!(!layout.has_right_overflow);
     }

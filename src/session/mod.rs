@@ -265,6 +265,10 @@ pub fn teardown_session(store: &Store, session_id: &str) -> Result<()> {
     let project = store.get_project(&session.project_id)?;
     let repo_path = Path::new(&project.repo_path);
 
+    // Kill the session-host process (and its children) before removing the worktree.
+    // This prevents orphaned processes (Claude, jest workers, etc.) from lingering.
+    kill_session_host(session_id);
+
     // Capture final git stats
     if let Ok(stats) = get_git_stats(Path::new(&session.worktree_path), &project.default_branch) {
         store.update_session_git_stats(
@@ -290,6 +294,37 @@ pub fn teardown_session(store: &Store, session_id: &str) -> Result<()> {
     store.close_session(session_id)?;
 
     Ok(())
+}
+
+/// Kill the session-host process for a session using its PID file.
+/// Also cleans up the PID and socket files.
+fn kill_session_host(session_id: &str) {
+    let pid_path = match config::session_pid_path(session_id) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            // Send SIGTERM to the process group so children (Claude, jest, etc.) also die
+            unsafe {
+                // Kill the process group (negative PID)
+                let pgid_result = libc::getpgid(pid);
+                if pgid_result > 0 {
+                    libc::kill(-pgid_result, libc::SIGTERM);
+                } else {
+                    // Fallback: kill just the process
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    // Clean up PID and socket files
+    let _ = fs::remove_file(&pid_path);
+    if let Ok(sock) = config::session_socket_path(session_id) {
+        let _ = fs::remove_file(sock);
+    }
 }
 
 // ── Internal helpers ──
@@ -378,7 +413,7 @@ fn create_worktree(
     Ok(worktree_path)
 }
 
-fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     let repo_str = repo_path
         .to_str()
         .context("repo path contains invalid UTF-8")?;
@@ -742,7 +777,7 @@ exit 0
 
 /// POSIX shell-quote a string so it's safe to embed in `/bin/sh -c`.
 /// Wraps in single quotes and escapes any embedded single quotes.
-fn shell_quote(s: &str) -> String {
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

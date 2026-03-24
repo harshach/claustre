@@ -25,11 +25,13 @@ impl Store {
         tab_label: &str,
     ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO sessions (id, project_id, branch_name, worktree_path, tab_label)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, project_id, branch_name, worktree_path, tab_label],
+                "INSERT INTO sessions (
+                    id, project_id, branch_name, worktree_path, tab_label, last_activity_at, claude_progress
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, project_id, branch_name, worktree_path, tab_label, now, ""],
             )
             .with_context(|| format!("failed to create session for branch '{branch_name}'"))?;
         self.get_session(&id)
@@ -73,9 +75,20 @@ impl Store {
     }
 
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
-        let status_str: String = row.get(5)?;
-        let progress_str: String = row.get(13)?;
         let id: String = row.get(0)?;
+        let project_id: String = row.get(1)?;
+        let branch_name: String = row.get(2)?;
+        let worktree_path: String = row.get(3)?;
+        let created_at: String = row.get(11)?;
+        let status_str = row
+            .get::<_, Option<String>>(5)?
+            .unwrap_or_else(|| "idle".to_string());
+        let status_message = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+        let last_activity_at = row
+            .get::<_, Option<String>>(7)?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| created_at.clone());
+        let progress_str = row.get::<_, Option<String>>(13)?.unwrap_or_default();
         let claude_progress = if progress_str.is_empty() {
             vec![]
         } else {
@@ -90,16 +103,19 @@ impl Store {
                 ClaudeStatus::Idle
             }),
             id,
-            project_id: row.get(1)?,
-            branch_name: row.get(2)?,
-            worktree_path: row.get(3)?,
-            tab_label: row.get(4)?,
-            status_message: row.get(6)?,
-            last_activity_at: row.get(7)?,
-            files_changed: row.get(8)?,
-            lines_added: row.get(9)?,
-            lines_removed: row.get(10)?,
-            created_at: row.get(11)?,
+            project_id,
+            branch_name: branch_name.clone(),
+            worktree_path,
+            tab_label: row
+                .get::<_, Option<String>>(4)?
+                .filter(|value| !value.is_empty())
+                .unwrap_or(branch_name),
+            status_message,
+            last_activity_at,
+            files_changed: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+            lines_added: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+            lines_removed: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+            created_at,
             closed_at: row.get(12)?,
             claude_progress,
             claude_session_id: row.get(14)?,
@@ -325,6 +341,53 @@ mod tests {
 
         // Default progress is empty string in DB
         let session = store.get_session(&sid).unwrap();
+        assert!(session.claude_progress.is_empty());
+    }
+
+    #[test]
+    fn row_to_session_tolerates_legacy_null_fields() {
+        let store = Store::open_unmigrated().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL,
+                    tab_label TEXT,
+                    claude_status TEXT,
+                    status_message TEXT,
+                    last_activity_at TEXT,
+                    files_changed INTEGER,
+                    lines_added INTEGER,
+                    lines_removed INTEGER,
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    claude_progress TEXT,
+                    claude_session_id TEXT
+                );
+                INSERT INTO sessions (
+                    id, project_id, branch_name, worktree_path, tab_label, claude_status,
+                    status_message, last_activity_at, files_changed, lines_added, lines_removed,
+                    created_at, closed_at, claude_progress, claude_session_id
+                ) VALUES (
+                    'session-1', 'project-1', 'feature/x', '/tmp/wt', NULL, 'idle',
+                    NULL, NULL, NULL, NULL, NULL,
+                    '2026-03-17T00:00:00Z', NULL, NULL, NULL
+                );
+                ",
+            )
+            .unwrap();
+
+        let session = store.get_session("session-1").unwrap();
+        assert_eq!(session.tab_label, "feature/x");
+        assert_eq!(session.status_message, "");
+        assert_eq!(session.last_activity_at, "2026-03-17T00:00:00Z");
+        assert_eq!(session.files_changed, 0);
+        assert_eq!(session.lines_added, 0);
+        assert_eq!(session.lines_removed, 0);
         assert!(session.claude_progress.is_empty());
     }
 }

@@ -27,7 +27,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.8"
+ureq = { version = "2.12", features = ["json"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
@@ -39,9 +41,11 @@ regex = "1"
 portable-pty = "0.9"
 vt100 = "0.15"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arboard = "3"
 libc = "0.2"
+png = "0.17"
+tui-markdown = "0.3.7"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

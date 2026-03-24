@@ -138,9 +138,12 @@ impl App {
                         self.maybe_poll_git_stats();
                         self.maybe_scan_external_sessions();
                         self.maybe_poll_update_check();
+                        self.maybe_poll_github_sync();
                         self.maybe_teardown_push_mode_sessions();
+                        self.check_clipboard_for_image();
                         self.refresh_data()?;
                         self.refresh_conversation_cache();
+                        self.refresh_session_thread_context();
                         self.maybe_advance_workflow_stages();
                     }
                 }

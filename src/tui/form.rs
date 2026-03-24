@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -198,6 +198,7 @@ pub fn render_modal(
     border_color: Style,
     width: u16,
     height: u16,
+    surface_style: Style,
 ) -> Rect {
     let area = frame.area();
     let w = width.min(area.width.saturating_sub(4));
@@ -209,9 +210,13 @@ pub fn render_modal(
     frame.render_widget(Clear, panel);
 
     let block = Block::default()
-        .title(title)
+        .title(Line::from(vec![Span::styled(
+            format!(" {title} "),
+            border_color.add_modifier(Modifier::BOLD),
+        )]))
         .borders(Borders::ALL)
-        .border_style(border_color);
+        .border_style(border_color)
+        .style(surface_style);
     let inner = block.inner(panel);
     frame.render_widget(block, panel);
 
