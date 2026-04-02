@@ -6,13 +6,15 @@
 
 use anyhow::Result;
 
+use super::screen_view::{MouseEncoding, MouseMode, ScreenViewRef};
+
 /// Unified interface for terminal backends (local PTY or remote session-host).
 ///
 /// Captures the public surface of `EmbeddedTerminal` so that `SessionTerminals`
 /// and TUI rendering code can operate on any backend without knowing the
 /// concrete type.
 pub(crate) trait Terminal {
-    /// Drain pending output from the backend and feed it to the vt100 parser.
+    /// Drain pending output from the backend and feed it to the parser.
     ///
     /// Processing is capped at a byte budget per call so the UI thread is never
     /// blocked for too long on a burst of output.
@@ -31,8 +33,10 @@ pub(crate) trait Terminal {
     /// Clear the screen buffer (erase display + home cursor).
     fn clear_screen(&mut self);
 
-    /// Get the current terminal screen state for rendering.
-    fn screen(&self) -> &vt100::Screen;
+    /// Get a parser-agnostic view of the current terminal screen.
+    ///
+    /// Returns a parser-agnostic borrowed screen view.
+    fn screen_view(&self) -> ScreenViewRef<'_>;
 
     /// Get the user's current scroll offset (0 = live screen, >0 = lines into history).
     fn scrollback(&self) -> usize;
@@ -41,10 +45,10 @@ pub(crate) trait Terminal {
     fn should_forward_mouse(&self) -> bool;
 
     /// The mouse protocol mode requested by the PTY application.
-    fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode;
+    fn mouse_protocol_mode(&self) -> MouseMode;
 
     /// The mouse protocol encoding requested by the PTY application.
-    fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding;
+    fn mouse_protocol_encoding(&self) -> MouseEncoding;
 
     /// Scroll up into history by `lines` rows.
     fn scroll_up(&mut self, lines: usize);

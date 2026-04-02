@@ -531,7 +531,7 @@ pub(super) fn draw_launch_thread_overlay(frame: &mut Frame, app: &App) {
     let modal_height = 30u16.min(frame.area().height.saturating_sub(4));
     let inner = render_modal(
         frame,
-        " Launch Thread ",
+        draft.modal_title(),
         Style::default().fg(app.theme.accent_primary),
         modal_width,
         modal_height,
@@ -567,6 +567,26 @@ pub(super) fn draw_launch_thread_overlay(frame: &mut Frame, app: &App) {
 
     let summary_lines = vec![
         Line::from(vec![
+            Span::styled(
+                format!(" {} ", draft.source_kind_label()),
+                app.theme.chip_style(app.theme.accent_secondary),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", draft.provider_kind),
+                app.theme.chip_style(app.theme.accent_primary),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                if draft.workflow_name.trim().is_empty() {
+                    " no workflow ".to_string()
+                } else {
+                    format!(" {} ", draft.workflow_name)
+                },
+                app.theme.chip_style(app.theme.tab_inactive),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled(" Source: ", selected_style),
             Span::styled(draft.source_label(), summary_style),
         ]),
@@ -580,19 +600,9 @@ pub(super) fn draw_launch_thread_overlay(frame: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled(" Result: ", selected_style),
-            Span::styled(
-                if draft.is_ad_hoc() {
-                    "new ad hoc thread, worktree, and live provider session".to_string()
-                } else {
-                    "linked thread, worktree, and live provider session".to_string()
-                },
-                summary_style,
-            ),
+            Span::styled(draft.launch_result_label(), summary_style),
         ]),
-        Line::from(Span::styled(
-            " Review the launch context here before the session starts. The live terminal tab stays available after launch.",
-            dim_style,
-        )),
+        Line::from(Span::styled(draft.launch_summary(), dim_style)),
     ];
     frame.render_widget(
         Paragraph::new(summary_lines).wrap(Wrap { trim: false }),

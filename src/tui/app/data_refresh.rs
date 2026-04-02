@@ -14,6 +14,154 @@ use super::{
 };
 
 impl App {
+    pub(crate) fn preferred_inspector_tab_for_thread(
+        &self,
+        thread: &crate::store::Thread,
+    ) -> super::InspectorTab {
+        if let Some(github_item_id) = thread.github_item_id.as_deref()
+            && let Ok(item) = self.store.get_github_item(github_item_id)
+            && item.kind == GitHubItemKind::PullRequest
+        {
+            return super::InspectorTab::Diff;
+        }
+
+        super::InspectorTab::Issue
+    }
+
+    pub(crate) fn initialize_thread_workspace(&mut self, thread: &crate::store::Thread) {
+        use std::collections::hash_map::Entry;
+        let preferred_tab = self.preferred_inspector_tab_for_thread(thread);
+
+        match self.thread_workspaces.entry(thread.id.clone()) {
+            Entry::Occupied(mut entry) => {
+                let workspace = entry.get_mut();
+                if !workspace.inspector_tab_touched
+                    && workspace.inspector_tab == super::InspectorTab::Issue
+                    && preferred_tab != super::InspectorTab::Issue
+                {
+                    workspace.inspector_tab = preferred_tab;
+                }
+            }
+            Entry::Vacant(entry) => {
+                let mut workspace = super::ThreadWorkspaceState::default();
+                workspace.inspector_tab = preferred_tab;
+                entry.insert(workspace);
+            }
+        }
+    }
+
+    pub(crate) fn thread_workspace(&self, thread_id: &str) -> Option<&super::ThreadWorkspaceState> {
+        self.thread_workspaces.get(thread_id)
+    }
+
+    pub(crate) fn ensure_thread_workspace(
+        &mut self,
+        thread_id: &str,
+    ) -> &mut super::ThreadWorkspaceState {
+        self.thread_workspaces
+            .entry(thread_id.to_string())
+            .or_default()
+    }
+
+    pub(crate) fn sync_thread_draft_from_input(&mut self, thread_id: &str) {
+        let compose_buffer = self.input_buffer.clone();
+        let compose_cursor = self.input_cursor.min(compose_buffer.len());
+        let workspace = self.ensure_thread_workspace(thread_id);
+        workspace.compose_buffer = compose_buffer.clone();
+        workspace.compose_cursor = compose_cursor;
+        self.thread_compose_buffer = compose_buffer;
+        self.thread_compose_cursor = compose_cursor;
+    }
+
+    pub(crate) fn sync_thread_compose_shadow_from_input(&mut self) {
+        self.thread_compose_buffer = self.input_buffer.clone();
+        self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+    }
+
+    pub(crate) fn load_thread_draft_into_input(&mut self, thread_id: &str) {
+        let (compose_buffer, compose_cursor) = {
+            let workspace = self.ensure_thread_workspace(thread_id);
+            (
+                workspace.compose_buffer.clone(),
+                workspace.compose_cursor.min(workspace.compose_buffer.len()),
+            )
+        };
+        self.thread_compose_buffer = compose_buffer.clone();
+        self.thread_compose_cursor = compose_cursor;
+        self.input_buffer = compose_buffer;
+        self.input_cursor = compose_cursor;
+    }
+
+    pub(crate) fn clear_thread_draft(&mut self, thread_id: &str) {
+        let workspace = self.ensure_thread_workspace(thread_id);
+        workspace.compose_buffer.clear();
+        workspace.compose_cursor = 0;
+        self.thread_compose_buffer.clear();
+        self.thread_compose_cursor = 0;
+    }
+
+    pub(crate) fn reset_thread_chat_scroll(&mut self, thread_id: &str) {
+        let workspace = self.ensure_thread_workspace(thread_id);
+        workspace.chat_scroll = 0;
+        workspace.chat_auto_scroll = true;
+        self.session_chat_scroll = 0;
+        self.session_chat_auto_scroll = true;
+    }
+
+    pub(crate) fn invalidate_thread_chat_cache(&mut self, thread_id: &str) {
+        let workspace = self.ensure_thread_workspace(thread_id);
+        workspace.cached_chat_lines = None;
+        workspace.cached_thread_timeline_lines = None;
+        workspace.cached_compose_rect = None;
+        self.cached_chat_lines = None;
+        self.cached_compose_rect = None;
+        self.cached_compose_thread_id = None;
+    }
+
+    pub(crate) fn thread_inspector_tab(&self, thread_id: Option<&str>) -> super::InspectorTab {
+        thread_id
+            .and_then(|id| {
+                let workspace = self.thread_workspace(id)?;
+                if !workspace.inspector_tab_touched
+                    && workspace.inspector_tab == super::InspectorTab::Issue
+                {
+                    let preferred_tab = self
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == id)
+                        .map_or(super::InspectorTab::Issue, |thread| {
+                            self.preferred_inspector_tab_for_thread(thread)
+                        });
+                    if preferred_tab != super::InspectorTab::Issue {
+                        return Some(preferred_tab);
+                    }
+                }
+                Some(workspace.inspector_tab)
+            })
+            .unwrap_or(self.inspector_tab)
+    }
+
+    pub(crate) fn thread_inspector_scroll(&self, thread_id: Option<&str>) -> u16 {
+        thread_id
+            .and_then(|id| {
+                self.thread_workspace(id)
+                    .map(|workspace| workspace.inspector_scroll)
+            })
+            .unwrap_or(self.inspector_scroll)
+    }
+
+    pub(crate) fn set_thread_inspector_tab(&mut self, thread_id: &str, tab: super::InspectorTab) {
+        let workspace = self.ensure_thread_workspace(thread_id);
+        workspace.inspector_tab = tab;
+        workspace.inspector_tab_touched = true;
+        self.inspector_tab = tab;
+    }
+
+    pub(crate) fn set_thread_inspector_scroll(&mut self, thread_id: &str, scroll: u16) {
+        self.ensure_thread_workspace(thread_id).inspector_scroll = scroll;
+        self.inspector_scroll = scroll;
+    }
+
     pub(crate) fn sidebar_nav_count() -> usize {
         WorkbenchView::ALL.len()
     }
@@ -565,6 +713,18 @@ impl App {
     }
 
     pub(crate) fn active_session_thread(&self) -> Option<Thread> {
+        if let Some(super::Tab::Session {
+            thread_id: Some(thread_id),
+            ..
+        }) = self.tabs.get(self.active_tab)
+        {
+            return self
+                .threads
+                .iter()
+                .find(|thread| thread.id == *thread_id)
+                .cloned()
+                .or_else(|| self.store.get_thread(thread_id).ok());
+        }
         let session_id = self.active_session_id()?;
         self.threads
             .iter()
@@ -781,19 +941,52 @@ impl App {
         self.build_thread_context(thread)
     }
 
+    fn sync_active_session_tab_thread_id(&mut self, thread_id: Option<&str>) {
+        if let Some(super::Tab::Session {
+            thread_id: tab_thread_id,
+            ..
+        }) = self.tabs.get_mut(self.active_tab)
+        {
+            *tab_thread_id = thread_id.map(ToOwned::to_owned);
+        }
+    }
+
+    fn load_session_thread_context_with_cache(
+        &mut self,
+        allow_cached: bool,
+    ) -> Option<SelectedThreadContext> {
+        let session_id = self.active_session_id().map(str::to_string);
+        if session_id != self.cached_session_thread_ctx_session_id {
+            self.cached_session_thread_ctx = None;
+            self.cached_session_thread_ctx_session_id = session_id.clone();
+        }
+
+        let Some(_) = session_id else {
+            return None;
+        };
+
+        if allow_cached && let Some(thread_ctx) = self.cached_session_thread_ctx.clone() {
+            self.sync_active_session_tab_thread_id(Some(thread_ctx.thread.id.as_str()));
+            return Some(thread_ctx);
+        }
+
+        let thread_ctx = self.active_session_thread_context();
+        self.cached_session_thread_ctx = thread_ctx.clone();
+        if let Some(ref ctx) = thread_ctx {
+            self.sync_active_session_tab_thread_id(Some(ctx.thread.id.as_str()));
+        }
+        thread_ctx
+    }
+
+    pub(crate) fn current_session_thread_context(&mut self) -> Option<SelectedThreadContext> {
+        self.load_session_thread_context_with_cache(true)
+    }
+
     /// Refresh the cached thread context for the active session tab.
     /// Called from slow tick (1s) so the chat panel has fresh data without
     /// running ~15 DB queries on every 60fps frame.
     pub(crate) fn refresh_session_thread_context(&mut self) {
-        let session_id = self.active_session_id().map(str::to_string);
-        if session_id != self.cached_session_thread_ctx_session_id {
-            // Session changed — clear cache and rebuild
-            self.cached_session_thread_ctx = None;
-            self.cached_session_thread_ctx_session_id = session_id.clone();
-        }
-        if session_id.is_some() {
-            self.cached_session_thread_ctx = self.active_session_thread_context();
-        }
+        let _ = self.load_session_thread_context_with_cache(false);
     }
 
     pub fn selected_thread_context(&self) -> Option<SelectedThreadContext> {
@@ -1139,24 +1332,68 @@ impl App {
 
     /// Refresh the JSONL conversation cache for the active session tab.
     ///
-    /// If the active tab is not a session in Conversation view, or the JSONL
+    /// If no live session is selected in the current workspace, or the JSONL
     /// file hasn't changed since the last parse, this is a no-op.
     pub(crate) fn refresh_conversation_cache(&mut self) {
-        // Only refresh when viewing a session tab
-        let Some(session_id) = self.active_session_id().map(str::to_string) else {
-            return;
+        let target = if let Some(session_id) = self.active_session_id().map(str::to_string) {
+            let active_thread_id = self.active_session_thread().map(|thread| thread.id);
+            self.sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| {
+                    (
+                        session.id.clone(),
+                        session.worktree_path.clone(),
+                        session.claude_session_id.clone(),
+                        active_thread_id.clone(),
+                    )
+                })
+                .or_else(|| {
+                    self.store.get_session(&session_id).ok().map(|session| {
+                        (
+                            session.id,
+                            session.worktree_path,
+                            session.claude_session_id,
+                            active_thread_id,
+                        )
+                    })
+                })
+        } else {
+            self.selected_thread()
+                .and_then(|thread| {
+                    thread
+                        .session_id
+                        .as_deref()
+                        .map(|session_id| (thread.id.clone(), session_id.to_string()))
+                })
+                .and_then(|(thread_id, session_id)| {
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| {
+                            (
+                                session.id.clone(),
+                                session.worktree_path.clone(),
+                                session.claude_session_id.clone(),
+                                Some(thread_id.clone()),
+                            )
+                        })
+                        .or_else(|| {
+                            self.store.get_session(&session_id).ok().map(|session| {
+                                (
+                                    session.id,
+                                    session.worktree_path,
+                                    session.claude_session_id,
+                                    Some(thread_id),
+                                )
+                            })
+                        })
+                })
         };
 
-        // Look up the session to get worktree_path and claude_session_id
-        let (worktree_path, claude_session_id) =
-            if let Some(s) = self.sessions.iter().find(|s| s.id == session_id) {
-                (s.worktree_path.clone(), s.claude_session_id.clone())
-            } else if let Ok(s) = self.store.get_session(&session_id) {
-                // `s` is owned, so move fields directly instead of cloning.
-                (s.worktree_path, s.claude_session_id)
-            } else {
-                return;
-            };
+        let Some((session_id, worktree_path, claude_session_id, active_thread_id)) = target else {
+            return;
+        };
 
         // Check if cache already exists for the same session and file hasn't grown.
         // Use file size instead of mtime — mtime has 1-second resolution on macOS
@@ -1204,6 +1441,8 @@ impl App {
             return;
         };
 
+        let mut invalidate_cache = false;
+
         if let Some(ref mut cache) = self.conversation_cache
             && cache.session_id == session_id
             && cache.jsonl_path.as_deref() == Some(path.as_path())
@@ -1213,6 +1452,7 @@ impl App {
                 cache.entries.extend(new_entries);
                 // Invalidate rendered line cache — new data arrived
                 self.cached_chat_lines = None;
+                invalidate_cache = true;
             }
             cache.file_offset = new_offset;
             cache.file_mtime = current_mtime;
@@ -1226,11 +1466,20 @@ impl App {
                 jsonl_path: jsonl_path.clone(),
             });
             self.cached_chat_lines = None;
+            invalidate_cache = true;
+        }
+
+        if invalidate_cache && let Some(ref thread_id) = active_thread_id {
+            self.invalidate_thread_chat_cache(thread_id);
         }
 
         // Detect quick-reply choices from the latest assistant message
         if let Some(ref cache) = self.conversation_cache {
             self.quick_reply_choices = detect_quick_reply_choices(&cache.entries);
+            if let Some(ref thread_id) = active_thread_id {
+                self.ensure_thread_workspace(thread_id).quick_reply_choices =
+                    self.quick_reply_choices.clone();
+            }
         }
     }
 }

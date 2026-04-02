@@ -361,6 +361,41 @@ fn create_worktree(
         .to_str()
         .context("worktree path contains invalid UTF-8")?;
 
+    // If the worktree path already exists (from a previous or concurrent
+    // session), use a unique suffix so we don't destroy another session's
+    // working directory.  We also prune stale git worktree metadata so
+    // orphaned entries from crashed sessions don't block new ones.
+    let _ = Command::new("git")
+        .args(["-C", repo_str, "worktree", "prune"])
+        .output();
+
+    let (worktree_path, branch_name) = if worktree_path.exists() {
+        // Find a free slot: branch-2, branch-3, ...
+        let mut suffix = 2u32;
+        loop {
+            let candidate_name = format!("{branch_name}-{suffix}");
+            let candidate_path = worktree_base.join(project_name).join(&candidate_name);
+            if !candidate_path.exists() {
+                tracing::info!(
+                    original = wt_str,
+                    new = %candidate_path.display(),
+                    "worktree path occupied, using suffix -{suffix}"
+                );
+                break (candidate_path, candidate_name);
+            }
+            suffix += 1;
+            if suffix > 100 {
+                bail!("too many worktrees for branch {branch_name}");
+            }
+        }
+    } else {
+        (worktree_path, branch_name.to_string())
+    };
+
+    let wt_str = worktree_path
+        .to_str()
+        .context("worktree path contains invalid UTF-8")?;
+
     let WorktreeMode::NewBranch { default_branch } = &mode;
     let fetch_branch = *default_branch;
     let origin_ref = format!("origin/{default_branch}");
@@ -385,7 +420,7 @@ fn create_worktree(
         "worktree",
         "add",
         "-b",
-        branch_name,
+        &branch_name,
         wt_str,
         &origin_ref,
     ];
@@ -398,7 +433,7 @@ fn create_worktree(
     if !output.status.success() {
         // Branch might already exist — try checking it out directly
         let output = Command::new("git")
-            .args(["-C", repo_str, "worktree", "add", wt_str, branch_name])
+            .args(["-C", repo_str, "worktree", "add", wt_str, &branch_name])
             .output()
             .context("failed to run git worktree add")?;
 

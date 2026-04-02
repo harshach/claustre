@@ -13,9 +13,7 @@ mod ui;
 use std::io::stdout;
 
 use anyhow::Result;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use crossterm::execute;
 
 use crate::store::Store;
@@ -60,7 +58,7 @@ pub fn run(store: Store) -> Result<()> {
     init_logging();
 
     let mut terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let _ = execute!(stdout(), EnableBracketedPaste);
 
     let result = app::App::new(store).and_then(|mut app| app.run(&mut terminal));
 

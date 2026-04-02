@@ -185,7 +185,11 @@ fn parse_stage_section(name: &str, lines: &[&str]) -> WorkflowStageDefinition {
 
     WorkflowStageDefinition {
         name: name.to_string(),
-        prompt_template: if prompt.is_empty() { None } else { Some(prompt) },
+        prompt_template: if prompt.is_empty() {
+            None
+        } else {
+            Some(prompt)
+        },
         provider,
         provider_profile,
         runtime_profile,
@@ -428,9 +432,8 @@ pub fn seed_builtin_workflows() -> Result<()> {
         let yaml_path = dir.join(format!("{stem}.yaml"));
         // Don't overwrite if either format exists (user may have edited)
         if !md_path.exists() && !yaml_path.exists() {
-            fs::write(&md_path, content).with_context(|| {
-                format!("failed to seed workflow file {}", md_path.display())
-            })?;
+            fs::write(&md_path, content)
+                .with_context(|| format!("failed to seed workflow file {}", md_path.display()))?;
         }
     }
     Ok(())

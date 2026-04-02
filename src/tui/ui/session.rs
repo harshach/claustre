@@ -37,9 +37,20 @@ pub(super) fn draw_session_tab(frame: &mut Frame, app: &mut App) {
         _ => SessionTabView::Terminal,
     };
 
-    // Use cached thread context (refreshed on slow ticks) to avoid
-    // running ~15 DB queries on every 60fps frame.
-    let thread_ctx = app.cached_session_thread_ctx.take();
+    if matches!(view_mode, SessionTabView::Terminal | SessionTabView::Editor)
+        && let Some(Tab::Session { terminals, .. }) = app.tabs.get_mut(app.active_tab)
+    {
+        let sizes = super::super::app::compute_pane_sizes_for_resize(
+            &terminals.layout,
+            size.width,
+            size.height,
+        );
+        let _ = terminals.resize_panes_with_clear(&sizes);
+    }
+
+    // Prefer the cached thread context, but fall back to an on-demand load so
+    // freshly restored sessions still render the native chat workspace.
+    let thread_ctx = app.current_session_thread_context();
 
     match view_mode {
         SessionTabView::Conversation => {
@@ -80,19 +91,14 @@ pub(super) fn draw_session_tab(frame: &mut Frame, app: &mut App) {
                 && let Some(editor_id) = terminals.editor_pane_id
                 && let Some(term) = terminals.terminal(editor_id)
             {
-                frame.render_widget(
-                    TerminalWidget::new(term.screen(), true),
-                    outer[1],
-                );
+                let view = term.screen_view();
+                frame.render_widget(TerminalWidget::new(&view, true), outer[1]);
             }
         }
     }
 
-    // Restore cached context after rendering
-    app.cached_session_thread_ctx = thread_ctx;
-
     // Hint bar
-    if view_mode == SessionTabView::Conversation && app.cached_session_thread_ctx.is_some() {
+    if view_mode == SessionTabView::Conversation && thread_ctx.is_some() {
         let expand_hint = if app.inspector_expanded {
             ("  f", ": collapse  ")
         } else {
@@ -102,11 +108,12 @@ pub(super) fn draw_session_tab(frame: &mut Frame, app: &mut App) {
             ("  i", ": compose  "),
             ("  q", ": close/done  "),
             expand_hint,
-            ("  j/k", ": scroll  "),
+            ("  k/j", ": older/newer  "),
         ];
         hints.extend_from_slice(&[
             ("Ctrl+O", ": terminal  "),
             ("Ctrl+E", ": editor  "),
+            ("Ctrl+G", ": bottom  "),
             ("  1-6", ": inspector  "),
             ("Ctrl+D", ": dashboard"),
         ]);
@@ -384,8 +391,9 @@ fn render_single_pane(
 
     let sel = terminals.selection.as_ref().filter(|s| s.pane == id);
 
+    let view = term.screen_view();
     frame.render_widget(
-        TerminalWidget::new(term.screen(), is_focused)
+        TerminalWidget::new(&view, is_focused)
             .with_selection(sel)
             .with_scrollback_offset(term.scrollback()),
         inner,

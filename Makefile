@@ -21,17 +21,9 @@ release: ## Build in release mode
 .PHONY: install
 install: ## Install claustre binary via cargo install
 	cargo install --path .
-	codesign --force --sign - "$$(which claustre)"
 ifeq ($(shell uname -s),Darwin)
-	cargo build --release -p claustre-app
-	@cp target/release/claustre-app "$$(dirname $$(which claustre))/claustre-app"
-	codesign --force --sign - "$$(dirname $$(which claustre))/claustre-app"
+	codesign --force --sign - "$$(which claustre)"
 endif
-
-.PHONY: app
-app: ## Build and run the Tauri desktop app (debug mode)
-	cargo build -p claustre-app
-	cargo run -p claustre-app
 
 ## -------
 ## Test

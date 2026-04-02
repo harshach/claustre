@@ -14,7 +14,6 @@ name = "claustre"
 path = "src/main.rs"
 
 [workspace]
-members = ["app/src-tauri"]
 
 [dependencies]
 # TUI
@@ -44,8 +43,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arboard = "3"
 libc = "0.2"
+notify-rust = "4"
 png = "0.17"
 tui-markdown = "0.3.7"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

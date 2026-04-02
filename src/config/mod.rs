@@ -449,7 +449,7 @@ pub struct NotificationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Whether macOS system banner notifications are enabled. Default: true
+    /// Whether system banner notifications are enabled. Default: true
     #[serde(default = "default_true")]
     pub system: bool,
 
@@ -546,7 +546,11 @@ fn default_true() -> bool {
 }
 
 fn default_notification_command() -> String {
-    "say".to_string()
+    if cfg!(target_os = "macos") {
+        "say".to_string()
+    } else {
+        "spd-say".to_string()
+    }
 }
 
 fn default_notification_template() -> String {
@@ -558,9 +562,9 @@ const NOTIFICATION_ICON: &[u8] = include_bytes!("../../assets/claustre-icon.png"
 
 impl NotificationConfig {
     /// Fire a notification for a completed task.
-    /// Sends both the voice command and a macOS system banner (if enabled).
-    /// If `pr_url` is provided, clicking the system notification opens the PR in a browser.
-    /// Otherwise, clicking brings the terminal app to the foreground.
+    /// Sends both the voice command and a system banner notification (if enabled).
+    /// On macOS, if `pr_url` is provided, clicking the system notification opens the PR
+    /// in a browser; otherwise, clicking brings the terminal app to the foreground.
     pub fn notify(&self, task_title: &str, pr_url: Option<&str>) {
         let message = self.template.replace("{task}", task_title);
 
@@ -608,19 +612,38 @@ impl NotificationConfig {
         Some(path)
     }
 
-    /// Send a macOS system banner notification (static, no config needed).
+    /// Send a system banner notification (static, no config needed).
     /// Used by the TUI for paused/waiting session alerts.
     pub fn system_notify_static(title: &str, message: &str, url: Option<&str>) {
         Self::system_notify(title, message, url);
     }
 
-    /// Send a macOS system banner notification.
-    /// Tries `terminal-notifier` first (supports custom icons and click actions),
-    /// falls back to `osascript`.
+    /// Send a system banner notification.
+    /// On macOS, tries `terminal-notifier` first (supports custom icons and click
+    /// actions), falls back to `osascript`.
+    /// On Linux, uses `notify-rust` (libnotify / D-Bus).
     ///
     /// When `pr_url` is provided, clicking the notification opens the PR in a browser.
     /// Otherwise, clicking brings the terminal app to the foreground.
     fn system_notify(task_title: &str, message: &str, pr_url: Option<&str>) {
+        #[cfg(target_os = "macos")]
+        Self::system_notify_macos(task_title, message, pr_url);
+
+        #[cfg(target_os = "linux")]
+        Self::system_notify_linux(task_title, message);
+
+        // On other platforms, silently do nothing for system notifications.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (task_title, message, pr_url);
+        }
+    }
+
+    /// macOS system banner notification.
+    /// Tries `terminal-notifier` first (supports custom app icon + click actions),
+    /// falls back to `osascript`.
+    #[cfg(target_os = "macos")]
+    fn system_notify_macos(task_title: &str, message: &str, pr_url: Option<&str>) {
         let icon_path = Self::ensure_icon();
 
         // Try terminal-notifier first (supports custom app icon + click actions)
@@ -665,9 +688,35 @@ impl NotificationConfig {
         }
     }
 
+    /// Linux system banner notification via `notify-rust` (libnotify / D-Bus).
+    /// Fire-and-forget: spawns a thread so the caller is never blocked.
+    #[cfg(target_os = "linux")]
+    fn system_notify_linux(task_title: &str, message: &str) {
+        let summary = format!("claustre \u{2014} {task_title}");
+        let body = message.to_owned();
+        let icon_path = Self::ensure_icon();
+
+        std::thread::spawn(move || {
+            let mut notification = notify_rust::Notification::new();
+            notification
+                .appname("claustre")
+                .summary(&summary)
+                .body(&body);
+
+            if let Some(ref icon) = icon_path {
+                notification.icon(&icon.display().to_string());
+            }
+
+            if let Err(e) = notification.show() {
+                tracing::warn!("system notification failed: {e}");
+            }
+        });
+    }
+
     /// Detect the bundle identifier of the terminal application.
     /// Uses `TERM_PROGRAM` env var and maps to known bundle IDs.
     /// Falls back to `com.apple.Terminal` if the terminal is unrecognized or unset.
+    #[cfg(target_os = "macos")]
     fn detect_terminal_bundle_id() -> String {
         if let Ok(term) = std::env::var("TERM_PROGRAM") {
             let bundle = match term.as_str() {
@@ -1291,7 +1340,7 @@ mod tests {
         assert!(!config.auto_update);
         assert!(config.notifications.enabled);
         assert!(config.notifications.system);
-        assert_eq!(config.notifications.command, "say");
+        assert_eq!(config.notifications.command, default_notification_command());
         assert_eq!(config.notifications.template, "completed {task}");
         assert!(config.notifications.voice.is_none());
         assert!(config.notifications.rate.is_none());
@@ -1660,6 +1709,7 @@ ask = ["Bash(git push*)"]
     // ── Terminal bundle ID detection ──
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn detect_terminal_bundle_id_known_terminals() {
         // We can't set env vars in a test-safe way without affecting other tests,
         // but we can at least verify the function returns a non-empty string

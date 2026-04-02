@@ -42,6 +42,8 @@ const TOAST_DURATION: Duration = Duration::from_secs(4);
 const DASHBOARD_TICK: Duration = Duration::from_millis(200);
 /// Tick rate when viewing a session tab (fast refresh for smooth PTY rendering).
 const SESSION_TICK: Duration = Duration::from_millis(16);
+/// Briefly defer heavy background work right after local input so typing feels snappy.
+const INPUT_GRACE: Duration = Duration::from_millis(120);
 /// How often to run the slow-path tick work (DB refresh, PR polling, etc.).
 /// Applies on all tabs since the dashboard tick rate (200 ms) is now faster
 /// than the desired refresh interval.
@@ -52,6 +54,7 @@ pub(crate) enum Tab {
     Dashboard,
     Session {
         session_id: String,
+        thread_id: Option<String>,
         terminals: Box<SessionTerminals>,
         label: String,
         view_mode: SessionTabView,
@@ -523,8 +526,34 @@ pub(crate) struct LaunchThreadDraft {
 }
 
 impl LaunchThreadDraft {
-    pub(crate) fn is_ad_hoc(&self) -> bool {
-        self.task_id.is_none() && self.board_issue.is_none() && self.review_pr.is_none()
+    pub(crate) fn modal_title(&self) -> &'static str {
+        if let Some(pr) = &self.review_pr {
+            match pr.mode {
+                PendingReviewLaunchMode::ContinueWork => " Continue PR Thread ",
+                PendingReviewLaunchMode::Review => " Review PR Thread ",
+            }
+        } else if self.board_issue.is_some() {
+            " Launch Issue Thread "
+        } else if self.task_id.is_some() {
+            " Launch Task Thread "
+        } else {
+            " New Ad Hoc Thread "
+        }
+    }
+
+    pub(crate) fn source_kind_label(&self) -> &'static str {
+        if let Some(pr) = &self.review_pr {
+            match pr.mode {
+                PendingReviewLaunchMode::ContinueWork => "pr",
+                PendingReviewLaunchMode::Review => "review",
+            }
+        } else if self.board_issue.is_some() {
+            "issue"
+        } else if self.task_id.is_some() {
+            "task"
+        } else {
+            "ad hoc"
+        }
     }
 
     pub(crate) fn source_label(&self) -> String {
@@ -540,6 +569,37 @@ impl LaunchThreadDraft {
             format!("Local task {task_id}")
         } else {
             "Ad hoc thread".to_string()
+        }
+    }
+
+    pub(crate) fn launch_summary(&self) -> &'static str {
+        if let Some(pr) = &self.review_pr {
+            match pr.mode {
+                PendingReviewLaunchMode::ContinueWork => {
+                    "Continue the existing PR workspace with a live coding session."
+                }
+                PendingReviewLaunchMode::Review => {
+                    "Start a review-focused workspace with the PR branch checked out."
+                }
+            }
+        } else if self.board_issue.is_some() {
+            "Create or link an issue workspace and launch a coding session from it."
+        } else if self.task_id.is_some() {
+            "Launch the task in a linked thread workspace with a worktree and provider session."
+        } else {
+            "Open a fresh scratch workspace for ad hoc investigation, coding, or planning."
+        }
+    }
+
+    pub(crate) fn launch_result_label(&self) -> &'static str {
+        if self.review_pr.is_some() {
+            "thread workspace + review context + live dock"
+        } else if self.board_issue.is_some() {
+            "thread workspace + issue context + live dock"
+        } else if self.task_id.is_some() {
+            "thread workspace + task context + live dock"
+        } else {
+            "thread workspace + fresh scratch session + live dock"
         }
     }
 }
@@ -690,6 +750,7 @@ pub(crate) struct App {
     pub review_queue_tab: ReviewQueueTab,
     pub settings_section_index: usize,
     pub settings_workflow_index: usize,
+    pub settings_workflow_stage_index: usize,
     pub github_installation_index: usize,
     pub github_project_index: usize,
     pub project_picker_index: usize,
@@ -703,6 +764,7 @@ pub(crate) struct App {
     pub settings_picker_options: Vec<String>,
     pub settings_picker_index: usize,
     pub settings_picker_target: Option<SettingsEditTarget>,
+    pub show_shortcuts_bar: bool,
     pub launch_thread_draft: Option<LaunchThreadDraft>,
     pub launch_thread_field_index: usize,
     pub thread_provider_picker_index: usize,
@@ -710,6 +772,7 @@ pub(crate) struct App {
     pub thread_compose_thread_id: Option<String>,
     pub thread_compose_buffer: String,
     pub thread_compose_cursor: usize,
+    pub thread_workspaces: HashMap<String, ThreadWorkspaceState>,
 
     // Slash command autocomplete
     pub slash_suggestions: Vec<String>,
@@ -918,6 +981,7 @@ pub(crate) struct App {
 
     // Slow-tick tracking for session tabs (DB refresh, PR polling, etc.)
     last_slow_tick: Instant,
+    last_user_input_at: Instant,
 
     // Last known terminal area for mouse hit-testing
     pub last_terminal_area: Rect,
@@ -1034,6 +1098,15 @@ pub(crate) struct App {
     // Cached rendered conversation lines for the chat panel.
     // Rebuilt only when conversation_cache changes (file grows), not every frame.
     pub cached_chat_lines: Option<CachedChatLines>,
+
+    /// Cached Rect for the compose area from the last full render.
+    /// Used by the compose-only fast-path to skip rebuilding the entire chat panel.
+    pub cached_compose_rect: Option<Rect>,
+    /// Thread id associated with `cached_compose_rect`.
+    /// Prevents reusing a compose-only cache across different threads/sessions.
+    pub cached_compose_thread_id: Option<String>,
+    pub inspector_selection: Option<InspectorSelection>,
+    pub inspector_render_cache: Option<InspectorRenderCache>,
 }
 
 /// Pre-built ratatui Lines for the conversation panel.
@@ -1041,7 +1114,86 @@ pub(crate) struct App {
 pub(crate) struct CachedChatLines {
     pub session_id: String,
     pub entry_count: usize,
+    pub body_width: u16,
+    pub visual_line_count: Option<u16>,
     pub lines: Vec<ratatui::text::Line<'static>>,
+}
+
+pub(crate) struct CachedThreadTimelineLines {
+    pub cache_key: String,
+    pub body_width: u16,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InspectorSelection {
+    pub anchor_row: u16,
+    pub anchor_col: u16,
+    pub focus_row: u16,
+    pub focus_col: u16,
+}
+
+impl InspectorSelection {
+    pub(crate) fn normalized(self) -> ((u16, u16), (u16, u16)) {
+        let start = (self.anchor_row, self.anchor_col);
+        let end = (self.focus_row, self.focus_col);
+        if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InspectorLinkHit {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InspectorRenderCache {
+    pub area: Rect,
+    pub lines: Vec<String>,
+    pub links: Vec<InspectorLinkHit>,
+}
+
+pub(crate) struct ThreadWorkspaceState {
+    pub compose_buffer: String,
+    pub compose_cursor: usize,
+    pub quick_reply_choices: Vec<String>,
+    pub inspector_tab: InspectorTab,
+    pub inspector_tab_touched: bool,
+    pub inspector_scroll: u16,
+    pub chat_scroll: u16,
+    pub chat_auto_scroll: bool,
+    pub cached_chat_lines: Option<CachedChatLines>,
+    pub cached_thread_timeline_lines: Option<CachedThreadTimelineLines>,
+    pub cached_compose_rect: Option<Rect>,
+    pub inspector_selection: Option<InspectorSelection>,
+    pub inspector_render_cache: Option<InspectorRenderCache>,
+}
+
+impl Default for ThreadWorkspaceState {
+    fn default() -> Self {
+        Self {
+            compose_buffer: String::new(),
+            compose_cursor: 0,
+            quick_reply_choices: Vec::new(),
+            inspector_tab: InspectorTab::Issue,
+            inspector_tab_touched: false,
+            inspector_scroll: 0,
+            chat_scroll: 0,
+            chat_auto_scroll: true,
+            cached_chat_lines: None,
+            cached_thread_timeline_lines: None,
+            cached_compose_rect: None,
+            inspector_selection: None,
+            inspector_render_cache: None,
+        }
+    }
 }
 
 /// Cached JSONL conversation entries for a session's Claude Code log.
@@ -1088,6 +1240,18 @@ impl MyTaskItem {
 }
 
 impl App {
+    pub(super) fn should_capture_mouse(&self) -> bool {
+        self.tabs.get(self.active_tab).is_some()
+    }
+
+    pub(crate) fn mark_user_input_activity(&mut self) {
+        self.last_user_input_at = Instant::now();
+    }
+
+    pub(crate) fn should_defer_background_work(&self) -> bool {
+        self.last_user_input_at.elapsed() < INPUT_GRACE
+    }
+
     pub(crate) fn busy_indicator_label(&self) -> Option<&'static str> {
         if self.session_op_in_progress {
             Some("preparing session")
@@ -1372,7 +1536,7 @@ fn collect_pane_inner_areas(
 /// Uses the same `Layout` and `Block::inner()` logic as the rendering path
 /// (`draw_session_tab` + `render_layout_node` + `render_single_pane`) so PTY sizes
 /// always match the actual rendered areas — no off-by-one edge clipping.
-fn compute_pane_sizes_for_resize(
+pub(crate) fn compute_pane_sizes_for_resize(
     layout: &crate::pty::LayoutNode,
     total_cols: u16,
     total_rows: u16,
@@ -1395,7 +1559,7 @@ fn compute_pane_sizes_for_resize(
 ///
 /// Only checks the bottom 20 rows of the screen to avoid false positives
 /// from Claude's text output that might mention "Allow" in discussion.
-fn screen_shows_permission_prompt(screen: &vt100::Screen) -> bool {
+fn screen_shows_permission_prompt(screen: &dyn crate::pty::ScreenView) -> bool {
     let contents = screen.contents();
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len();
@@ -1444,7 +1608,7 @@ fn screen_shows_permission_prompt(screen: &vt100::Screen) -> bool {
 /// options. The selector always includes "Other" as a choice, and uses `❯` (U+276F) as
 /// the cursor on the currently focused option. We detect this pattern in the bottom 25
 /// lines of the screen.
-fn screen_shows_question_prompt(screen: &vt100::Screen) -> bool {
+fn screen_shows_question_prompt(screen: &dyn crate::pty::ScreenView) -> bool {
     let contents = screen.contents();
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len();
@@ -1480,7 +1644,7 @@ fn screen_shows_question_prompt(screen: &vt100::Screen) -> bool {
 /// prompt (which has "Allow" + "Yes/No").
 ///
 /// Used as a fallback when the Notification hook fails to fire.
-fn screen_shows_idle_prompt(screen: &vt100::Screen) -> bool {
+fn screen_shows_idle_prompt(screen: &dyn crate::pty::ScreenView) -> bool {
     let contents = screen.contents();
     let lines: Vec<&str> = contents.lines().collect();
     let total = lines.len();
@@ -1507,7 +1671,34 @@ fn screen_shows_idle_prompt(screen: &vt100::Screen) -> bool {
         if bottom_lines.iter().any(|l| l.contains("Allow ")) {
             return false;
         }
-        return true;
+        // Claude usually keeps mouse tracking enabled while its TUI is alive,
+        // but restored sessions can still land at a real Claude prompt without
+        // the mouse mode bits we previously relied on. Prefer the strict check
+        // first, then fall back to prompt + Claude-context heuristics.
+        if screen.mouse_protocol_mode() != crate::pty::MouseMode::None {
+            return true;
+        }
+
+        let context_start = total.saturating_sub(40);
+        let context_lines = &lines[context_start..];
+        let has_claude_context = context_lines.iter().any(|line| {
+            let trimmed = line.trim();
+            trimmed.contains("(ctrl+o to expand)")
+                || trimmed.contains("Entered plan mode")
+                || trimmed.contains("assistant response")
+                || trimmed.contains("tool uses")
+                || trimmed.contains("Read ")
+                || trimmed.starts_with("Claude Code")
+                || trimmed.starts_with("Bash(")
+                || trimmed.starts_with("Explore(")
+                || trimmed.starts_with("Tool")
+                || trimmed.starts_with("Result")
+                || trimmed.starts_with("Tokens")
+        });
+        if has_claude_context {
+            return true;
+        }
+        return false;
     }
 
     // ── Codex pattern ──
@@ -1532,6 +1723,66 @@ fn screen_shows_idle_prompt(screen: &vt100::Screen) -> bool {
     }
 
     false
+}
+
+/// Detect a shell prompt in the Claude pane after the Claude CLI exits.
+///
+/// Managed sessions intentionally fall back to the user's shell so the pane
+/// does not look frozen after Claude exits. That shell can render prompts that
+/// look superficially similar to Claude's idle prompt (for example a final `❯`),
+/// but shell prompts do not keep Claude's mouse tracking enabled.
+pub(super) fn screen_shows_shell_prompt(screen: &dyn crate::pty::ScreenView) -> bool {
+    if screen.alternate_screen() || screen.mouse_protocol_mode() != crate::pty::MouseMode::None {
+        return false;
+    }
+    if screen_shows_permission_prompt(screen)
+        || screen_shows_question_prompt(screen)
+        || screen_shows_idle_prompt(screen)
+    {
+        return false;
+    }
+
+    let contents = screen.contents();
+    let lines: Vec<&str> = contents.lines().collect();
+    let total = lines.len();
+    let start = total.saturating_sub(6);
+    let bottom_lines = &lines[start..];
+    let last_non_empty = bottom_lines
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty());
+    let Some(last_line) = last_non_empty else {
+        return false;
+    };
+    let trimmed = last_line.trim();
+
+    trimmed.starts_with('\u{276f}')
+        || trimmed == "$"
+        || trimmed == "%"
+        || trimmed == "#"
+        || trimmed.ends_with(" $")
+        || trimmed.ends_with(" %")
+        || trimmed.ends_with(" #")
+        || trimmed.ends_with('\u{276f}')
+}
+
+pub(super) fn classify_restored_agent_screen(
+    screen: &dyn crate::pty::ScreenView,
+) -> (crate::store::ClaudeStatus, &'static str) {
+    if screen_shows_idle_prompt(screen) {
+        (crate::store::ClaudeStatus::Idle, "Ready")
+    } else if screen_shows_shell_prompt(screen) {
+        (
+            crate::store::ClaudeStatus::Interrupted,
+            "Claude unavailable",
+        )
+    } else if screen_shows_permission_prompt(screen) {
+        (crate::store::ClaudeStatus::Working, "Awaiting approval")
+    } else if screen_shows_question_prompt(screen) {
+        (crate::store::ClaudeStatus::Working, "Awaiting answer")
+    } else {
+        (crate::store::ClaudeStatus::Working, "Restored")
+    }
 }
 
 fn build_project_summaries(store: &Store, projects: &[Project]) -> HashMap<String, ProjectSummary> {
@@ -1792,6 +2043,9 @@ mod tests {
         WorkflowStageStatus,
     };
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_WORKTREE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     // ── Test Helpers ──
 
@@ -1862,16 +2116,17 @@ mod tests {
     }
 
     fn seed_thread_workspace(app: &mut App) {
+        let worktree_id = TEST_WORKTREE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let worktree_path = format!(
+            "/tmp/claustre-test-missing-worktree-{}-{worktree_id}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&worktree_path);
         let project = app.projects[0].clone();
         let task = app.tasks[0].clone();
         let session = app
             .store
-            .create_session(
-                &project.id,
-                "task-alpha",
-                "/tmp/test-repo-worktree",
-                "Task Alpha",
-            )
+            .create_session(&project.id, "task-alpha", &worktree_path, "Task Alpha")
             .unwrap();
         app.store
             .assign_task_to_session(&task.id, &session.id)
@@ -1997,7 +2252,7 @@ mod tests {
                 &task.title,
                 ProviderKind::Claude,
                 Some("default"),
-                Some("/tmp/test-repo-worktree"),
+                Some(&worktree_path),
                 Some("task-alpha"),
                 Some("default"),
                 None,
@@ -2325,6 +2580,36 @@ mod tests {
         }
     }
 
+    fn seed_test_workflow(app: &App, name: &str, stage_names: &[&str]) {
+        let definition = crate::workflows::WorkflowDefinition {
+            name: name.to_string(),
+            description: Some(format!("workflow {name}")),
+            stages: stage_names
+                .iter()
+                .map(|stage_name| crate::workflows::WorkflowStageDefinition {
+                    name: (*stage_name).to_string(),
+                    prompt_template: Some(format!("/{stage_name}")),
+                    provider: Some("claude".to_string()),
+                    provider_profile: Some("default".to_string()),
+                    runtime_profile: None,
+                    gate: None,
+                    outputs: vec![],
+                })
+                .collect(),
+        };
+        let yaml = serde_yaml::to_string(&definition).unwrap();
+        app.store
+            .upsert_workflow_def(
+                &definition.name,
+                "global",
+                Some(&format!("/tmp/{name}.md")),
+                definition.description.as_deref(),
+                &yaml,
+                false,
+            )
+            .unwrap();
+    }
+
     /// Render the app to a test buffer and return the content as a string.
     #[allow(deprecated)]
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -2429,6 +2714,77 @@ mod tests {
         assert_eq!(app.settings_section_index, 2);
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.settings_section_index, 1);
+    }
+
+    #[test]
+    fn settings_workflows_use_jk_for_workflow_navigation() {
+        let mut app = test_app();
+        seed_test_workflow(&app, "alpha_flow", &["plan"]);
+        seed_test_workflow(&app, "beta_flow", &["plan", "verify"]);
+        app.workbench_view = WorkbenchView::Settings;
+        app.focus = Focus::Tasks;
+        app.settings_section_index = SettingsSection::ALL
+            .iter()
+            .position(|section| *section == SettingsSection::Workflows)
+            .unwrap();
+
+        assert_eq!(app.settings_workflow_index, 0);
+        let original_section = app.settings_section_index;
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.settings_workflow_index, 1);
+        assert_eq!(app.settings_section_index, original_section);
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.settings_workflow_index, 0);
+        assert_eq!(app.settings_section_index, original_section);
+    }
+
+    #[test]
+    fn settings_workflows_use_shift_jk_for_stage_navigation() {
+        let mut app = test_app();
+        seed_test_workflow(&app, "beta_flow", &["plan", "implement", "verify"]);
+        app.workbench_view = WorkbenchView::Settings;
+        app.focus = Focus::Tasks;
+        app.settings_section_index = SettingsSection::ALL
+            .iter()
+            .position(|section| *section == SettingsSection::Workflows)
+            .unwrap();
+
+        assert_eq!(app.settings_workflow_stage_index, 0);
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.settings_workflow_stage_index, 1);
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.settings_workflow_stage_index, 2);
+        press(&mut app, KeyCode::Char('K'));
+        assert_eq!(app.settings_workflow_stage_index, 1);
+    }
+
+    #[test]
+    fn settings_builtin_workflow_allows_edit_mode() {
+        let mut app = test_app();
+        let _ = crate::workflows::sync_workflow_definitions(&app.store, None);
+        app.workbench_view = WorkbenchView::Settings;
+        app.focus = Focus::Tasks;
+        app.settings_section_index = SettingsSection::ALL
+            .iter()
+            .position(|section| *section == SettingsSection::Workflows)
+            .unwrap();
+
+        let defs = app.store.list_workflow_defs().unwrap();
+        let builtin_index = defs
+            .iter()
+            .position(|def| crate::workflows::is_builtin_workflow(&def.name))
+            .unwrap();
+        app.settings_workflow_index = builtin_index;
+
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.input_mode, InputMode::SettingsEdit);
+        assert_eq!(
+            app.settings_edit_target,
+            Some(SettingsEditTarget::WorkflowName)
+        );
+        assert!(!app.input_buffer.is_empty());
     }
 
     #[test]
@@ -2881,7 +3237,9 @@ mod tests {
 
         assert_eq!(app.input_mode, InputMode::LaunchThread);
         let draft = app.launch_thread_draft.as_ref().unwrap();
-        assert!(draft.is_ad_hoc());
+        assert!(
+            draft.task_id.is_none() && draft.board_issue.is_none() && draft.review_pr.is_none()
+        );
         assert_eq!(draft.provider_kind, ProviderKind::Claude);
         // Ad hoc starts with empty title for user to fill in
         assert!(draft.title.is_empty());
@@ -2909,6 +3267,39 @@ mod tests {
             app.launch_thread_draft.as_ref().unwrap().extra_context,
             " add context"
         );
+    }
+
+    #[test]
+    fn launch_review_modal_renders_source_specific_summary() {
+        let mut app = test_app_with_tasks();
+        seed_review_queue_items(&mut app);
+        app.workbench_view = WorkbenchView::Reviews;
+        app.focus = Focus::Tasks;
+        app.review_queue_tab = ReviewQueueTab::NeedsReview;
+        app.review_index = 0;
+
+        press(&mut app, KeyCode::Char('l'));
+
+        let output = render_to_string(&mut app, 160, 42);
+        assert!(output.contains("Review PR Thread"));
+        assert!(output.contains("review"));
+        assert!(output.contains("Start a review-focused workspace"));
+        assert!(output.contains("thread workspace + review context + live dock"));
+    }
+
+    #[test]
+    fn launch_ad_hoc_modal_renders_scratchpad_summary() {
+        let mut app = test_app_with_project();
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        press(&mut app, KeyCode::Char('n'));
+
+        let output = render_to_string(&mut app, 160, 42);
+        assert!(output.contains("New Ad Hoc Thread"));
+        assert!(output.contains("ad hoc"));
+        assert!(output.contains("fresh scratch workspace"));
+        assert!(output.contains("thread workspace + fresh scratch session + live dock"));
     }
 
     #[test]
@@ -3392,16 +3783,25 @@ mod tests {
     fn help_overlay_open_close_question_mark() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char('?'));
-        assert_eq!(app.input_mode, InputMode::HelpOverlay);
+        assert!(app.show_shortcuts_bar);
+        assert_eq!(app.input_mode, InputMode::Normal);
 
         press(&mut app, KeyCode::Char('?'));
+        assert!(!app.show_shortcuts_bar);
         assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn help_overlay_opens_with_f1() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.input_mode, InputMode::HelpOverlay);
     }
 
     #[test]
     fn help_overlay_close_with_esc() {
         let mut app = test_app();
-        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::F(1));
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.input_mode, InputMode::Normal);
     }
@@ -3409,7 +3809,7 @@ mod tests {
     #[test]
     fn help_overlay_close_with_q() {
         let mut app = test_app();
-        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::F(1));
         press(&mut app, KeyCode::Char('q'));
         assert_eq!(app.input_mode, InputMode::Normal);
     }
@@ -3624,7 +4024,8 @@ mod tests {
         assert!(output.contains("Threads ("));
         assert!(output.contains("Task Alpha"));
         assert!(output.contains("Plan the work first"));
-        assert!(output.contains("live"));
+        assert!(output.contains("Workspace"));
+        assert!(output.contains("Transcript"));
         // Compose area is at the bottom — may scroll off in small terminals
         // but the working indicator and timeline should be visible
         assert!(
@@ -3653,6 +4054,525 @@ mod tests {
     }
 
     #[test]
+    fn thread_workspace_header_renders_source_and_runtime_summary() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains("Workspace"));
+        assert!(output.contains("source pr #42"));
+        assert!(output.contains("1 message(s), 1 run(s), 1 attachment(s)"));
+        assert!(output.contains("runtime default [built] 1/1 healthy, 0 failed"));
+    }
+
+    #[test]
+    fn thread_workspace_header_shows_ready_for_live_idle_agent() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let session_id = app.threads[0].session_id.clone().unwrap();
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+        app.pty_idle_sessions.insert(session_id);
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains(" ready "));
+        assert!(!output.contains("claude exited"));
+        assert!(output.contains("Claude is ready"));
+    }
+
+    #[test]
+    fn thread_workspace_renders_relaunch_hint_when_hidden_session_is_dead() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Working, "Working")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("exit 0");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let tab_idx = app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+        if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+            terminals.process_output_full();
+        }
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains("No live Claude session attached"));
+        assert!(output.contains("l relaunch thread"));
+        assert!(!output.contains("Claude is actively working"));
+    }
+
+    #[test]
+    fn mouse_capture_is_enabled_for_dashboard_and_conversation_views() {
+        let mut app = test_app_with_tasks();
+        assert!(app.should_capture_mouse());
+
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let tab_idx = app.add_session_tab(session_id, Box::new(terminals), "Session".to_string());
+        app.active_tab = tab_idx;
+        assert!(app.should_capture_mouse());
+    }
+
+    #[test]
+    fn mouse_capture_is_enabled_for_terminal_and_editor_session_views() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let tab_idx = app.add_session_tab(session_id, Box::new(terminals), "Session".to_string());
+        app.active_tab = tab_idx;
+
+        if let Tab::Session { view_mode, .. } = &mut app.tabs[tab_idx] {
+            *view_mode = SessionTabView::Terminal;
+        }
+        assert!(app.should_capture_mouse());
+
+        if let Tab::Session { view_mode, .. } = &mut app.tabs[tab_idx] {
+            *view_mode = SessionTabView::Editor;
+        }
+        assert!(app.should_capture_mouse());
+    }
+
+    #[test]
+    fn inspector_drag_creates_bounded_selection_state() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+        app.last_terminal_area = Rect::new(0, 0, 180, 60);
+        let thread_id = app.threads[0].id.clone();
+
+        let _ = render_to_string(&mut app, 180, 60);
+        let cache = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.inspector_render_cache.clone())
+            .expect("inspector render cache");
+
+        let start_col = cache.area.x.saturating_add(2);
+        let start_row = cache.area.y.saturating_add(2);
+        let end_col = start_col.saturating_add(8);
+        let end_row = start_row.saturating_add(1);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: start_col,
+            row: start_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert!(
+            app.thread_workspace(&thread_id)
+                .and_then(|workspace| workspace.inspector_selection)
+                .is_some(),
+            "selection should start on mouse down"
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: end_col,
+            row: end_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        let selection = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.inspector_selection)
+            .expect("inspector selection");
+        assert_eq!(selection.anchor_row, start_row - cache.area.y);
+        assert_eq!(selection.anchor_col, start_col - cache.area.x);
+        assert_eq!(selection.focus_row, end_row - cache.area.y);
+        assert_eq!(selection.focus_col, end_col - cache.area.x);
+        assert_eq!(app.focus, Focus::Inspector);
+    }
+
+    #[test]
+    fn update_poll_respects_auto_update_config() {
+        let mut app = test_app_with_tasks();
+        app.config.auto_update = false;
+        app.last_update_check = std::time::Instant::now() - std::time::Duration::from_secs(60 * 60);
+
+        let before = app.last_update_check;
+        app.maybe_poll_update_check();
+
+        assert_eq!(app.last_update_check, before);
+        assert!(
+            !app.update_check_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(app.updated_version.is_none());
+        assert!(app.available_version.is_none());
+    }
+
+    #[test]
+    fn pr_threads_default_inspector_to_diff() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread_id = app.threads[0].id.clone();
+        let output = render_to_string(&mut app, 180, 60);
+
+        assert!(output.contains("Diff"));
+        assert_eq!(
+            app.thread_inspector_tab(Some(&thread_id)),
+            InspectorTab::Diff
+        );
+    }
+
+    #[test]
+    fn untouched_pr_workspace_upgrades_to_diff() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread_id = app.threads[0].id.clone();
+        app.thread_workspaces.insert(
+            thread_id.clone(),
+            ThreadWorkspaceState {
+                inspector_tab: InspectorTab::Issue,
+                ..ThreadWorkspaceState::default()
+            },
+        );
+
+        let _output = render_to_string(&mut app, 180, 60);
+        assert_eq!(
+            app.thread_inspector_tab(Some(&thread_id)),
+            InspectorTab::Diff
+        );
+    }
+
+    #[test]
+    fn untouched_pr_workspace_prefers_diff_even_before_render_upgrade() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread_id = app.threads[0].id.clone();
+        app.thread_workspaces.insert(
+            thread_id.clone(),
+            ThreadWorkspaceState {
+                inspector_tab: InspectorTab::Issue,
+                ..ThreadWorkspaceState::default()
+            },
+        );
+
+        assert_eq!(
+            app.thread_inspector_tab(Some(&thread_id)),
+            InspectorTab::Diff
+        );
+    }
+
+    #[test]
+    fn manual_pr_issue_tab_choice_is_preserved() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread_id = app.threads[0].id.clone();
+        let _output = render_to_string(&mut app, 180, 60);
+        app.set_thread_inspector_tab(&thread_id, InspectorTab::Issue);
+
+        let _rerender = render_to_string(&mut app, 180, 60);
+        assert_eq!(
+            app.thread_inspector_tab(Some(&thread_id)),
+            InspectorTab::Issue
+        );
+    }
+
+    #[test]
+    fn thread_workspace_compose_renders_session_restore_hints() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains("No live Claude session attached"));
+        assert!(output.contains("l relaunch thread"));
+    }
+
+    #[test]
+    fn thread_workspace_transcript_renders_dense_jsonl_blocks() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let session_id = app.threads[0].session_id.clone().unwrap();
+        app.conversation_cache = Some(ConversationCache {
+            session_id,
+            entries: vec![
+                crate::conversation::ConversationEntry::UserMessage {
+                    timestamp: "2026-03-16T10:00:00Z".to_string(),
+                    text: "Please verify the PR diff and comment status.".to_string(),
+                },
+                crate::conversation::ConversationEntry::AssistantText {
+                    timestamp: "2026-03-16T10:01:00Z".to_string(),
+                    text: "I checked the review state.\n```rust\nlet ready = true;\n```"
+                        .to_string(),
+                },
+                crate::conversation::ConversationEntry::ToolUse {
+                    timestamp: "2026-03-16T10:01:10Z".to_string(),
+                    tool_name: "Bash".to_string(),
+                    description: "Show the git diff against main".to_string(),
+                    tool_use_id: "tool-1".to_string(),
+                },
+                crate::conversation::ConversationEntry::ToolResult {
+                    timestamp: "2026-03-16T10:01:12Z".to_string(),
+                    tool_use_id: "tool-1".to_string(),
+                    output_preview: "diff --git a/src/foo.rs b/src/foo.rs".to_string(),
+                    is_error: false,
+                },
+                crate::conversation::ConversationEntry::TurnEnd {
+                    timestamp: "2026-03-16T10:01:20Z".to_string(),
+                    input_tokens: Some(1200),
+                    output_tokens: Some(340),
+                },
+            ],
+            file_offset: 0,
+            file_mtime: None,
+            jsonl_path: None,
+        });
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains("You"));
+        assert!(output.contains("Claude"));
+        assert!(output.contains("Tool"));
+        assert!(output.contains("Result"));
+        assert!(!output.contains("Tokens"));
+        assert!(output.contains("current"));
+        assert!(output.contains("status"));
+        assert!(output.contains("preview 1/1 lines"));
+    }
+
+    #[test]
+    fn cached_chat_lines_track_transcript_width() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let session_id = app.threads[0].session_id.clone().unwrap();
+        let thread_id = app.threads[0].id.clone();
+        app.conversation_cache = Some(ConversationCache {
+            session_id,
+            entries: vec![crate::conversation::ConversationEntry::AssistantText {
+                timestamp: "2026-03-16T10:01:00Z".to_string(),
+                text: "A long transcript body that should be rebuilt whenever the transcript width changes to keep wrapping and scroll math stable.".to_string(),
+            }],
+            file_offset: 0,
+            file_mtime: None,
+            jsonl_path: None,
+        });
+
+        let _wide = render_to_string(&mut app, 180, 50);
+        let wide_width = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.cached_chat_lines.as_ref())
+            .map(|cached| cached.body_width)
+            .unwrap();
+        assert!(wide_width > 0);
+
+        let _narrow = render_to_string(&mut app, 120, 50);
+        let narrow_width = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.cached_chat_lines.as_ref())
+            .map(|cached| cached.body_width)
+            .unwrap();
+        assert!(narrow_width < wide_width);
+    }
+
+    #[test]
+    fn dashboard_refresh_conversation_cache_for_selected_thread_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.active_tab = 0;
+
+        let thread = app.selected_thread().unwrap().clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let session = app.store.get_session(&session_id).unwrap();
+        std::fs::create_dir_all(&session.worktree_path).unwrap();
+        app.store
+            .set_claude_session_id(&session_id, "dashboard-refresh-test")
+            .unwrap();
+
+        let hash: String = session
+            .worktree_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project_dir = dirs::home_dir()
+            .unwrap()
+            .join(".claude/projects")
+            .join(hash);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let jsonl_path = project_dir.join("dashboard-refresh-test.jsonl");
+        std::fs::write(
+            &jsonl_path,
+            concat!(
+                "{\"type\":\"user\",\"timestamp\":\"2026-03-29T20:00:00Z\",",
+                "\"message\":{\"content\":\"please rerun tests\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-03-29T20:00:02Z\",",
+                "\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Rerunning tests now.\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        app.refresh_conversation_cache();
+
+        let cache = app.conversation_cache.as_ref().unwrap();
+        assert_eq!(cache.session_id, session_id);
+        assert!(cache.entries.iter().any(|entry| matches!(
+            entry,
+            crate::conversation::ConversationEntry::AssistantText { text, .. }
+                if text.contains("Rerunning tests now.")
+        )));
+
+        let _ = std::fs::remove_file(jsonl_path);
+        let _ = std::fs::remove_dir(project_dir);
+    }
+
+    #[test]
+    fn cached_thread_timeline_lines_track_transcript_width() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread_id = app.threads[0].id.clone();
+
+        let _wide = render_to_string(&mut app, 180, 50);
+        let wide_width = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.cached_thread_timeline_lines.as_ref())
+            .map(|cached| cached.body_width)
+            .unwrap();
+        assert!(wide_width > 0);
+
+        let _narrow = render_to_string(&mut app, 120, 50);
+        let narrow_width = app
+            .thread_workspace(&thread_id)
+            .and_then(|workspace| workspace.cached_thread_timeline_lines.as_ref())
+            .map(|cached| cached.body_width)
+            .unwrap();
+        assert!(narrow_width < wide_width);
+    }
+
+    #[test]
+    fn wide_thread_workspace_uses_aligned_surface_cards() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        std::fs::create_dir_all(&thread.worktree_path.clone().unwrap()).unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'preview from dock'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|tab| {
+                matches!(
+                    tab,
+                    Tab::Session {
+                        session_id: sid,
+                        ..
+                    } if sid == &session_id
+                )
+            })
+            .unwrap();
+        if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+            terminals.process_output_full();
+        }
+
+        let output = render_to_string(&mut app, 180, 60);
+        assert!(output.contains("Workspace"));
+        assert!(output.contains("Transcript"));
+        assert!(!output.contains("Live Terminal"));
+    }
+
+    #[test]
     fn typing_in_threads_starts_native_chat_editor() {
         let mut app = test_app_with_tasks();
         seed_thread_workspace(&mut app);
@@ -3671,6 +4591,43 @@ mod tests {
         let output = render_to_string(&mut app, 140, 40);
         assert!(output.contains("Reply"));
         assert!(output.contains("Enter:send"));
+    }
+
+    #[test]
+    fn stale_compose_cache_does_not_hide_thread_timeline() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+        app.input_mode = InputMode::ThreadCompose;
+        let thread = app.selected_thread().unwrap().clone();
+        app.thread_compose_thread_id = Some(thread.id.clone());
+        app.input_buffer = "H".to_string();
+        app.input_cursor = 1;
+        app.cached_compose_rect = Some(Rect::new(0, 0, 20, 3));
+        app.cached_compose_thread_id = Some("some-other-thread".to_string());
+
+        let output = render_to_string(&mut app, 140, 40);
+        assert!(output.contains("Plan the work first"));
+        assert!(output.contains("Reply"));
+    }
+
+    #[test]
+    fn matching_compose_cache_still_renders_thread_timeline() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+        app.input_mode = InputMode::ThreadCompose;
+        let thread = app.selected_thread().unwrap().clone();
+        app.thread_compose_thread_id = Some(thread.id.clone());
+        app.input_buffer = "Follow up on the review".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.cached_compose_rect = Some(Rect::new(0, 0, 20, 3));
+        app.cached_compose_thread_id = Some(thread.id.clone());
+
+        let output = render_to_string(&mut app, 140, 40);
+        assert!(output.contains("Plan the work first"));
     }
 
     #[test]
@@ -3716,6 +4673,327 @@ mod tests {
     }
 
     #[test]
+    fn session_thread_compose_plain_o_stays_in_compose() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        assert!(app.goto_session_tab(&session_id));
+        let thread = app.active_session_thread().unwrap();
+        app.input_mode = InputMode::ThreadCompose;
+        app.thread_compose_thread_id = Some(thread.id.clone());
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+
+        app.handle_session_tab_key(KeyCode::Char('o'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::ThreadCompose);
+        assert_eq!(app.input_buffer, "o");
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_thread_compose_shift_o_stays_in_compose() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        assert!(app.goto_session_tab(&session_id));
+        let thread = app.active_session_thread().unwrap();
+        app.input_mode = InputMode::ThreadCompose;
+        app.thread_compose_thread_id = Some(thread.id.clone());
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+
+        app.handle_session_tab_key(KeyCode::Char('O'), KeyModifiers::SHIFT)
+            .unwrap();
+
+        assert_eq!(app.input_mode, InputMode::ThreadCompose);
+        assert_eq!(app.input_buffer, "O");
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn active_thread_compose_typing_stays_local_until_exit() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+        let thread = app.selected_thread().unwrap().clone();
+
+        app.start_thread_compose().unwrap();
+        app.handle_thread_compose_key(KeyCode::Char('h'), KeyModifiers::NONE)
+            .unwrap();
+        app.handle_thread_compose_key(KeyCode::Char('i'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.input_buffer, "hi");
+        assert_eq!(app.thread_compose_buffer, "hi");
+        assert_eq!(
+            app.thread_workspace(&thread.id)
+                .map(|workspace| workspace.compose_buffer.as_str()),
+            Some("")
+        );
+
+        app.handle_thread_compose_key(KeyCode::Esc, KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(
+            app.thread_workspace(&thread.id)
+                .map(|workspace| workspace.compose_buffer.as_str()),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn thread_compose_submit_uses_live_input_buffer() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "Use the fresh buffer".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.thread_compose_buffer = "stale buffer".to_string();
+        app.thread_compose_cursor = app.thread_compose_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let thread = app.selected_thread().unwrap().clone();
+        let messages = app.store.list_thread_messages(&thread.id).unwrap();
+        let latest = messages.last().unwrap();
+        assert_eq!(latest.role, "user");
+        assert_eq!(latest.content, "Use the fresh buffer");
+    }
+
+    #[test]
+    fn empty_thread_compose_jk_scrolls_transcript() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread_id = app.threads[0].id.clone();
+        app.start_thread_compose().unwrap();
+        app.input_buffer.clear();
+        app.input_cursor = 0;
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.thread_workspace(&thread_id)
+                .map(|workspace| workspace.chat_scroll),
+            Some(1)
+        );
+        assert_eq!(
+            app.thread_workspace(&thread_id)
+                .map(|workspace| workspace.chat_auto_scroll),
+            Some(false)
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.thread_workspace(&thread_id)
+                .map(|workspace| workspace.chat_scroll),
+            Some(0)
+        );
+        assert_eq!(
+            app.thread_workspace(&thread_id)
+                .map(|workspace| workspace.chat_auto_scroll),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn native_thread_compose_marks_live_session_working() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Idle, "waiting")
+            .unwrap();
+        app.refresh_data().unwrap();
+        app.pty_idle_sessions.insert(session_id.clone());
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "where are we with this".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.submit_thread_compose_message().unwrap();
+
+        let session = app.store.get_session(&session_id).unwrap();
+        assert_eq!(session.claude_status, crate::store::ClaudeStatus::Working);
+        assert!(!app.pty_idle_sessions.contains(&session_id));
+    }
+
+    #[test]
+    fn start_thread_compose_stays_in_native_threads_workspace() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        std::fs::create_dir_all(&thread.worktree_path.clone().unwrap()).unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(session_id, Box::new(terminals), "Session".to_string());
+        app.active_tab = 0;
+
+        app.start_thread_compose().unwrap();
+
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.workbench_view, WorkbenchView::Threads);
+        assert_eq!(app.input_mode, InputMode::ThreadCompose);
+        assert_eq!(
+            app.thread_compose_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+    }
+
+    #[test]
+    fn inspector_state_is_scoped_per_thread_workspace() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let project_id = app.projects[0].id.clone();
+        let second_thread = app
+            .store
+            .create_thread(
+                &project_id,
+                None,
+                None,
+                None,
+                "Second Thread",
+                crate::store::ProviderKind::Claude,
+                Some("default"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        app.refresh_data().unwrap();
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Inspector;
+
+        let first_thread_id = app.threads[0].id.clone();
+        let first_index = app
+            .threads
+            .iter()
+            .position(|thread| thread.id == first_thread_id)
+            .unwrap();
+        let second_index = app
+            .threads
+            .iter()
+            .position(|thread| thread.id == second_thread.id)
+            .unwrap();
+
+        app.thread_index = first_index;
+        press(&mut app, KeyCode::Char('2'));
+        app.set_thread_inspector_scroll(&first_thread_id, 7);
+
+        app.thread_index = second_index;
+        press(&mut app, KeyCode::Char('4'));
+        app.set_thread_inspector_scroll(&second_thread.id, 3);
+
+        assert_eq!(
+            app.thread_inspector_tab(Some(&first_thread_id)),
+            InspectorTab::Diff
+        );
+        assert_eq!(app.thread_inspector_scroll(Some(&first_thread_id)), 7);
+        assert_eq!(
+            app.thread_inspector_tab(Some(&second_thread.id)),
+            InspectorTab::Tests
+        );
+        assert_eq!(app.thread_inspector_scroll(Some(&second_thread.id)), 3);
+    }
+
+    #[test]
     fn compose_queues_when_session_is_working() {
         let mut app = test_app_with_tasks();
         seed_thread_workspace(&mut app);
@@ -3744,7 +5022,7 @@ mod tests {
 
         app.submit_thread_compose_message().unwrap();
 
-        let toast = app.toast_message.as_deref().unwrap_or_default();
+        let _toast = app.toast_message.as_deref().unwrap_or_default();
         // In test there's no PTY, so it will either queue or fail to send.
         // The message should still be recorded in the DB.
         let messages = app.store.list_thread_messages(&thread.id).unwrap();
@@ -4011,7 +5289,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_from_authored_review_focuses_existing_thread() {
+    fn launch_from_authored_review_relaunches_stale_existing_thread() {
         let mut app = test_app_with_tasks();
         seed_review_queue_items(&mut app);
         app.workbench_view = WorkbenchView::Reviews;
@@ -4021,9 +5299,86 @@ mod tests {
 
         press(&mut app, KeyCode::Char('l'));
 
-        // In test there's no real session tab, so focus_thread_workspace
-        // stays on the current view instead of falling back to Threads.
-        assert_eq!(app.workbench_view, WorkbenchView::Reviews);
+        assert!(app.session_op_in_progress);
+        assert_eq!(app.toast_message.as_deref(), Some("Continuing thread..."));
+    }
+
+    #[test]
+    fn force_relaunch_from_authored_review_starts_fresh_session() {
+        let mut app = test_app_with_tasks();
+        seed_review_queue_items(&mut app);
+        app.workbench_view = WorkbenchView::Reviews;
+        app.focus = Focus::Tasks;
+        app.review_queue_tab = ReviewQueueTab::Authored;
+        app.review_index = 0;
+
+        press(&mut app, KeyCode::Char('R'));
+
+        assert!(app.session_op_in_progress);
+        assert_eq!(
+            app.toast_message.as_deref(),
+            Some("Force relaunching thread in a fresh session...")
+        );
+    }
+
+    #[test]
+    fn launched_thread_lands_in_threads_workspace_with_terminal_dock() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Reviews;
+        app.focus = Focus::Inspector;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let session = app.store.get_session(&session_id).unwrap();
+
+        app.session_op_tx
+            .send(SessionOpResult::ThreadLaunched {
+                result: Box::new(crate::threads::LaunchThreadResult {
+                    thread: thread.clone(),
+                    workflow: None,
+                    session_setup: Some(crate::session::SessionSetup {
+                        session,
+                        tab_label: "Session".to_string(),
+                        claude_cmd: Some(vec![
+                            "/bin/sh".to_string(),
+                            "-lc".to_string(),
+                            "printf 'agent'".to_string(),
+                        ]),
+                        worktree_path,
+                    }),
+                }),
+            })
+            .unwrap();
+
+        app.poll_session_ops();
+
+        assert_eq!(app.workbench_view, WorkbenchView::Threads);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.threads
+                .get(app.thread_index)
+                .map(|thread| thread.id.as_str()),
+            Some(thread.id.as_str())
+        );
+        assert!(app.tabs.len() > 1);
+        assert_eq!(
+            app.toast_message.as_deref(),
+            Some("Opened thread workspace via claude")
+        );
+    }
+
+    #[test]
+    fn stale_thread_session_is_not_treated_as_live() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+
+        let thread = app.selected_thread().unwrap().clone();
+        assert!(app.live_session_for_thread(&thread).is_none());
     }
 
     #[test]
@@ -4935,7 +6290,9 @@ mod tests {
         parser.process(b"  Allow Bash\r\n");
         parser.process(b"  ls -la\r\n");
         parser.process(b"  Yes  No  Always\r\n");
-        assert!(screen_shows_permission_prompt(parser.screen()));
+        assert!(screen_shows_permission_prompt(
+            &crate::pty::Vt100ScreenView(parser.screen())
+        ));
     }
 
     #[test]
@@ -4944,7 +6301,9 @@ mod tests {
         parser.process(b"Working on your task...\r\n");
         parser.process(b"  Running command: ls -la\r\n");
         parser.process(b"  Yes  No  Always\r\n");
-        assert!(!screen_shows_permission_prompt(parser.screen()));
+        assert!(!screen_shows_permission_prompt(
+            &crate::pty::Vt100ScreenView(parser.screen())
+        ));
     }
 
     #[test]
@@ -4952,7 +6311,9 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"  Allow Bash\r\n");
         parser.process(b"  ls -la\r\n");
-        assert!(!screen_shows_permission_prompt(parser.screen()));
+        assert!(!screen_shows_permission_prompt(
+            &crate::pty::Vt100ScreenView(parser.screen())
+        ));
     }
 
     #[test]
@@ -4961,7 +6322,9 @@ mod tests {
         parser.process(b"  Allow WebFetch\r\n");
         parser.process(b"  https://example.com\r\n");
         parser.process(b"  Yes  No\r\n");
-        assert!(screen_shows_permission_prompt(parser.screen()));
+        assert!(screen_shows_permission_prompt(
+            &crate::pty::Vt100ScreenView(parser.screen())
+        ));
     }
 
     #[test]
@@ -4971,7 +6334,9 @@ mod tests {
         parser.process(b"  Allow me to explain\r\n");
         parser.process(b"  Yes  No\r\n");
         // "me" starts lowercase — should not match
-        assert!(!screen_shows_permission_prompt(parser.screen()));
+        assert!(!screen_shows_permission_prompt(
+            &crate::pty::Vt100ScreenView(parser.screen())
+        ));
     }
 
     // ── Question prompt detection tests ──
@@ -4984,7 +6349,9 @@ mod tests {
         parser.process(b"  \xe2\x9d\xaf Option A (Recommended)\r\n");
         parser.process(b"    Option B\r\n");
         parser.process(b"    Other\r\n");
-        assert!(screen_shows_question_prompt(parser.screen()));
+        assert!(screen_shows_question_prompt(&crate::pty::Vt100ScreenView(
+            parser.screen()
+        )));
     }
 
     #[test]
@@ -4993,7 +6360,9 @@ mod tests {
         parser.process(b"Working on your task...\r\n");
         parser.process(b"  Option A\r\n");
         parser.process(b"  Other\r\n");
-        assert!(!screen_shows_question_prompt(parser.screen()));
+        assert!(!screen_shows_question_prompt(&crate::pty::Vt100ScreenView(
+            parser.screen()
+        )));
     }
 
     #[test]
@@ -5002,7 +6371,9 @@ mod tests {
         parser.process(b"Working on your task...\r\n");
         parser.process(b"  \xe2\x9d\xaf Option A\r\n");
         parser.process(b"  Option B\r\n");
-        assert!(!screen_shows_question_prompt(parser.screen()));
+        assert!(!screen_shows_question_prompt(&crate::pty::Vt100ScreenView(
+            parser.screen()
+        )));
     }
 
     #[test]
@@ -5010,7 +6381,9 @@ mod tests {
         // Regular text mentioning "Other" and containing a right-pointing character shouldn't match
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"There are Other options available.\r\n");
-        assert!(!screen_shows_question_prompt(parser.screen()));
+        assert!(!screen_shows_question_prompt(&crate::pty::Vt100ScreenView(
+            parser.screen()
+        )));
     }
 
     #[test]
@@ -5021,7 +6394,9 @@ mod tests {
         parser.process(b"    Feature B\r\n");
         parser.process(b"    Feature C\r\n");
         parser.process(b"    Other\r\n");
-        assert!(screen_shows_question_prompt(parser.screen()));
+        assert!(screen_shows_question_prompt(&crate::pty::Vt100ScreenView(
+            parser.screen()
+        )));
     }
 
     // ── Modified special key encoding tests ──
@@ -5078,6 +6453,71 @@ mod tests {
     }
 
     #[test]
+    fn shell_prompt_is_not_treated_as_claude_idle_prompt() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(format!("\x1b[24;1H{} ", '\u{276f}').as_bytes());
+
+        let screen = crate::pty::Vt100ScreenView(parser.screen());
+        assert!(screen_shows_shell_prompt(&screen));
+        assert!(!screen_shows_idle_prompt(&screen));
+    }
+
+    #[test]
+    fn claude_idle_prompt_requires_mouse_tracking() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        parser.process(format!("\x1b[24;1H{} ", '\u{276f}').as_bytes());
+
+        let screen = crate::pty::Vt100ScreenView(parser.screen());
+        assert!(screen_shows_idle_prompt(&screen));
+        assert!(!screen_shows_shell_prompt(&screen));
+    }
+
+    #[test]
+    fn restored_claude_prompt_without_mouse_tracking_is_still_idle_when_context_matches() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"Claude Code v2.1.87\r\n");
+        parser.process(b"Entered plan mode\r\n");
+        parser.process(format!("\x1b[24;1H{} ", '\u{276f}').as_bytes());
+
+        let screen = crate::pty::Vt100ScreenView(parser.screen());
+        assert!(screen_shows_idle_prompt(&screen));
+        assert!(!screen_shows_shell_prompt(&screen));
+        assert_eq!(
+            classify_restored_agent_screen(&screen),
+            (crate::store::ClaudeStatus::Idle, "Ready")
+        );
+    }
+
+    #[test]
+    fn restored_idle_prompt_is_classified_as_ready() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        parser.process(format!("\x1b[24;1H{} ", '\u{276f}').as_bytes());
+
+        let screen = crate::pty::Vt100ScreenView(parser.screen());
+        assert_eq!(
+            classify_restored_agent_screen(&screen),
+            (crate::store::ClaudeStatus::Idle, "Ready")
+        );
+    }
+
+    #[test]
+    fn restored_shell_prompt_is_classified_as_unavailable() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(format!("\x1b[24;1H{} ", '\u{276f}').as_bytes());
+
+        let screen = crate::pty::Vt100ScreenView(parser.screen());
+        assert_eq!(
+            classify_restored_agent_screen(&screen),
+            (
+                crate::store::ClaudeStatus::Interrupted,
+                "Claude unavailable"
+            )
+        );
+    }
+
+    #[test]
     fn ctrl_delete_encodes_tilde_modifier() {
         let kb = keycode_to_bytes(KeyCode::Delete, KeyModifiers::CONTROL);
         assert_eq!(kb.as_bytes(), b"\x1b[3;5~");
@@ -5121,7 +6561,7 @@ mod tests {
             &MouseEventKind::ScrollUp,
             10,
             5,
-            vt100::MouseProtocolEncoding::Sgr,
+            crate::pty::MouseEncoding::Sgr,
         );
         assert_eq!(bytes, Some(b"\x1b[<64;11;6M".to_vec()));
     }
@@ -5132,7 +6572,7 @@ mod tests {
             &MouseEventKind::ScrollDown,
             10,
             5,
-            vt100::MouseProtocolEncoding::Sgr,
+            crate::pty::MouseEncoding::Sgr,
         );
         assert_eq!(bytes, Some(b"\x1b[<65;11;6M".to_vec()));
     }
@@ -5143,7 +6583,7 @@ mod tests {
             &MouseEventKind::Down(MouseButton::Left),
             0,
             0,
-            vt100::MouseProtocolEncoding::Sgr,
+            crate::pty::MouseEncoding::Sgr,
         );
         assert_eq!(bytes, Some(b"\x1b[<0;1;1M".to_vec()));
     }
@@ -5154,7 +6594,7 @@ mod tests {
             &MouseEventKind::Up(MouseButton::Left),
             0,
             0,
-            vt100::MouseProtocolEncoding::Sgr,
+            crate::pty::MouseEncoding::Sgr,
         );
         // Release uses 'm' suffix instead of 'M'
         assert_eq!(bytes, Some(b"\x1b[<0;1;1m".to_vec()));
@@ -5166,7 +6606,7 @@ mod tests {
             &MouseEventKind::ScrollUp,
             10,
             5,
-            vt100::MouseProtocolEncoding::Default,
+            crate::pty::MouseEncoding::Default,
         );
         // button=64+32=96, x=11+32=43, y=6+32=38
         assert_eq!(bytes, Some(vec![0x1b, b'[', b'M', 96, 43, 38]));
@@ -5178,7 +6618,7 @@ mod tests {
             &MouseEventKind::Up(MouseButton::Left),
             0,
             0,
-            vt100::MouseProtocolEncoding::Default,
+            crate::pty::MouseEncoding::Default,
         );
         // Release: button=3+32=35, x=1+32=33, y=1+32=33
         assert_eq!(bytes, Some(vec![0x1b, b'[', b'M', 35, 33, 33]));
@@ -5197,6 +6637,16 @@ mod tests {
         app.pending_titles.insert("task-1".to_string());
         app.session_op_in_progress = true;
         assert_eq!(app.busy_indicator_label(), Some("preparing session"));
+    }
+
+    #[test]
+    fn recent_user_input_defers_background_work_briefly() {
+        let mut app = test_app();
+        app.mark_user_input_activity();
+        assert!(app.should_defer_background_work());
+
+        app.last_user_input_at = Instant::now() - INPUT_GRACE - Duration::from_millis(1);
+        assert!(!app.should_defer_background_work());
     }
 
     // ── Session chat panel layout tests ──
@@ -5390,6 +6840,825 @@ mod tests {
     }
 
     #[test]
+    fn goto_session_tab_populates_thread_context_cache() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        assert!(app.goto_session_tab(&session_id));
+        assert!(app.cached_session_thread_ctx.is_some());
+        assert_eq!(app.focus, Focus::Tasks);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn plain_o_does_not_toggle_terminal_from_thread_session_view() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        assert!(app.goto_session_tab(&session_id));
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            })
+        ));
+
+        app.handle_session_tab_key(KeyCode::Char('o'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_conversation_mouse_wheel_scrolls_transcript() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.last_terminal_area = Rect::new(0, 0, 180, 60);
+        assert!(app.goto_session_tab(&session_id));
+        app.focus = Focus::Tasks;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.thread_workspace(&thread.id).map(|w| w.chat_scroll),
+            Some(1)
+        );
+        assert_eq!(
+            app.thread_workspace(&thread.id).map(|w| w.chat_auto_scroll),
+            Some(false)
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.thread_workspace(&thread.id).map(|w| w.chat_scroll),
+            Some(0)
+        );
+        assert_eq!(
+            app.thread_workspace(&thread.id).map(|w| w.chat_auto_scroll),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn dashboard_inspector_mouse_wheel_uses_single_step_scroll() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+        app.last_terminal_area = Rect::new(0, 0, 180, 60);
+        let workbench_area = app.last_terminal_area;
+
+        let layout = super::super::ui::compute_workbench_layout(
+            workbench_area,
+            app.workbench_sidebar_width,
+            app.workbench_inspector_width,
+            super::super::ui::workbench_uses_persistent_inspector(app.workbench_view),
+        );
+
+        let inspector_col = layout.inspector.x.saturating_add(2);
+        let inspector_row = layout.inspector.y.saturating_add(2);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: inspector_col,
+            row: inspector_row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+        let thread_id = app.threads[app.thread_index].id.clone();
+        assert_eq!(app.thread_inspector_scroll(Some(&thread_id)), 1);
+    }
+
+    #[test]
+    fn ctrl_o_from_threads_workspace_opens_live_terminal_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        std::fs::create_dir_all(&thread.worktree_path.clone().unwrap()).unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.active_tab = 0;
+        press_mod(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                session_id: sid,
+                view_mode: SessionTabView::Terminal,
+                ..
+            }) if sid == &session_id
+        ));
+    }
+
+    #[test]
+    fn ctrl_e_from_threads_workspace_opens_live_editor_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        std::fs::create_dir_all(&thread.worktree_path.clone().unwrap()).unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.active_tab = 0;
+        press_mod(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                session_id: sid,
+                view_mode: SessionTabView::Editor,
+                ..
+            }) if sid == &session_id
+        ));
+    }
+
+    #[test]
+    fn session_conversation_renders_thread_context_without_slow_tick_cache() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|tab| {
+                matches!(
+                    tab,
+                    Tab::Session {
+                        session_id: sid,
+                        ..
+                    } if sid == &session_id
+                )
+            })
+            .unwrap();
+        app.active_tab = tab_idx;
+        app.cached_session_thread_ctx = None;
+        app.cached_session_thread_ctx_session_id = Some(session_id);
+
+        let output = render_to_string(&mut app, 180, 60);
+
+        assert!(output.contains("Plan the work first"));
+        assert!(output.contains("Ctrl+O: terminal"));
+    }
+
+    #[test]
+    fn workbench_compose_sends_to_live_thread_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Idle, "Idle")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("cat");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "did we address the bot feedback?".to_string();
+        app.input_cursor = app.input_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == &session_id))
+            .unwrap();
+        let mut echoed = String::new();
+        for _ in 0..20 {
+            if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+                terminals.process_output_full();
+                if let Some(content) = terminals.with_claude_live_screen(|screen| {
+                    let rows = screen.size().0;
+                    let cols = screen.size().1;
+                    let mut lines = Vec::new();
+                    for row in 0..rows {
+                        lines.push(screen.contents_between(row, 0, row, cols));
+                    }
+                    lines.join("\n")
+                }) {
+                    echoed = content;
+                }
+            }
+            if echoed.contains("did we address the bot feedback?") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(echoed.contains("did we address the bot feedback?"));
+    }
+
+    #[test]
+    fn add_session_tab_canonicalizes_duplicate_session_ids() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        let session_id = app.threads[0].session_id.clone().unwrap();
+
+        let rows = 24;
+        let cols = 120;
+
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell one'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent one'");
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let first_idx =
+            app.add_session_tab(session_id.clone(), Box::new(terminals), "First".to_string());
+
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell two'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent two'");
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let second_idx = app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Second".to_string(),
+        );
+
+        let matching_tabs = app
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab, Tab::Session { session_id: sid, .. } if sid == &session_id))
+            .count();
+        assert_eq!(matching_tabs, 1);
+        assert_eq!(first_idx, second_idx);
+        match &app.tabs[second_idx] {
+            Tab::Session { label, .. } => assert_eq!(label, "Second"),
+            _ => panic!("expected canonical session tab"),
+        }
+    }
+
+    #[test]
+    fn workbench_compose_sends_to_hidden_idle_thread_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Idle, "Idle")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+        app.pty_idle_sessions.insert(session_id.clone());
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("cat");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+        app.active_tab = 0;
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "please review the latest changes".to_string();
+        app.input_cursor = app.input_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == &session_id))
+            .unwrap();
+        let mut echoed = String::new();
+        for _ in 0..20 {
+            if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+                terminals.process_output_full();
+                if let Some(content) = terminals.with_claude_live_screen(|screen| {
+                    let rows = screen.size().0;
+                    let cols = screen.size().1;
+                    let mut lines = Vec::new();
+                    for row in 0..rows {
+                        lines.push(screen.contents_between(row, 0, row, cols));
+                    }
+                    lines.join("\n")
+                }) {
+                    echoed = content;
+                }
+            }
+            if echoed.contains("please review the latest changes") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(echoed.contains("please review the latest changes"));
+    }
+
+    #[test]
+    fn workbench_compose_refreshes_hidden_session_before_queueing() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Working, "Working")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg(
+            "python3 - <<'PY'\n\
+import sys\n\
+sys.stdout.write('busy line\\n' * 20000)\n\
+sys.stdout.write('Claude Code v2.1.87\\n')\n\
+sys.stdout.write('\\x1b[24;1H❯ ')\n\
+sys.stdout.flush()\n\
+PY\n\
+exec cat",
+        );
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let tab_idx = app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+        if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+            terminals.process_output();
+        }
+        app.active_tab = 0;
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "did this actually reach claude?".to_string();
+        app.input_cursor = app.input_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let toast = app.toast_message.as_deref().unwrap_or_default();
+        assert!(
+            !toast.contains("queued"),
+            "unexpected queued toast after hidden-session refresh: {toast}"
+        );
+        assert!(app.queued_compose_message.is_none());
+
+        let mut echoed = String::new();
+        for _ in 0..40 {
+            if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+                terminals.process_output_full();
+                if let Some(content) = terminals.with_claude_live_screen(|screen| {
+                    let rows = screen.size().0;
+                    let cols = screen.size().1;
+                    let mut lines = Vec::new();
+                    for row in 0..rows {
+                        lines.push(screen.contents_between(row, 0, row, cols));
+                    }
+                    lines.join("\n")
+                }) {
+                    echoed = content;
+                }
+            }
+            if echoed.contains("did this actually reach claude?") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(echoed.contains("did this actually reach claude?"));
+    }
+
+    #[test]
+    fn workbench_compose_prefers_latest_usable_hidden_session_tab() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Idle, "Idle")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+        app.pty_idle_sessions.insert(session_id.clone());
+
+        let rows = 24;
+        let cols = 120;
+
+        let mut stale_shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        stale_shell_cmd.arg("-lc");
+        stale_shell_cmd.arg("printf 'shell'");
+        let mut stale_agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        stale_agent_cmd.arg("-lc");
+        stale_agent_cmd.arg("exit 0");
+
+        let stale_shell =
+            crate::pty::EmbeddedTerminal::spawn(stale_shell_cmd, rows, cols / 2).unwrap();
+        let stale_agent =
+            crate::pty::EmbeddedTerminal::spawn(stale_agent_cmd, rows, cols / 2).unwrap();
+        let stale_terminals = crate::pty::SessionTerminals::from_parts(
+            stale_shell,
+            Box::new(stale_agent),
+            "/tmp/test-repo",
+        );
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(stale_terminals),
+            "Stale Session".to_string(),
+        );
+
+        let stale_tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { label, .. } if label == "Stale Session"))
+            .unwrap();
+        if let Tab::Session { terminals, .. } = &mut app.tabs[stale_tab_idx] {
+            terminals.process_output_full();
+        }
+
+        let mut live_shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        live_shell_cmd.arg("-lc");
+        live_shell_cmd.arg("printf 'shell'");
+        let mut live_agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        live_agent_cmd.arg("-lc");
+        live_agent_cmd.arg("cat");
+
+        let live_shell =
+            crate::pty::EmbeddedTerminal::spawn(live_shell_cmd, rows, cols / 2).unwrap();
+        let live_agent =
+            crate::pty::EmbeddedTerminal::spawn(live_agent_cmd, rows, cols / 2).unwrap();
+        let live_terminals = crate::pty::SessionTerminals::from_parts(
+            live_shell,
+            Box::new(live_agent),
+            "/tmp/test-repo",
+        );
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(live_terminals),
+            "Live Session".to_string(),
+        );
+
+        app.active_tab = 0;
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "prefer the latest live tab".to_string();
+        app.input_cursor = app.input_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let live_tab_idx = app
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Session { label, .. } if label == "Live Session"))
+            .unwrap();
+        let mut echoed = String::new();
+        for _ in 0..20 {
+            if let Tab::Session { terminals, .. } = &mut app.tabs[live_tab_idx] {
+                terminals.process_output_full();
+                if let Some(content) = terminals.with_claude_live_screen(|screen| {
+                    let rows = screen.size().0;
+                    let cols = screen.size().1;
+                    let mut lines = Vec::new();
+                    for row in 0..rows {
+                        lines.push(screen.contents_between(row, 0, row, cols));
+                    }
+                    lines.join("\n")
+                }) {
+                    echoed = content;
+                }
+            }
+            if echoed.contains("prefer the latest live tab") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(echoed.contains("prefer the latest live tab"));
+    }
+
+    #[test]
+    fn workbench_compose_does_not_queue_against_dead_hidden_session() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        let worktree_path = thread.worktree_path.clone().unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        app.store
+            .update_session_status(&session_id, crate::store::ClaudeStatus::Working, "Working")
+            .unwrap();
+        app.sessions = app
+            .store
+            .list_sessions_for_project(&thread.project_id)
+            .unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("exit 0");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        let tab_idx = app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+        if let Tab::Session { terminals, .. } = &mut app.tabs[tab_idx] {
+            terminals.process_output_full();
+        }
+        app.active_tab = 0;
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "status?".to_string();
+        app.input_cursor = app.input_buffer.len();
+
+        app.submit_thread_compose_message().unwrap();
+
+        let toast = app.toast_message.as_deref().unwrap_or_default();
+        assert!(
+            !toast.contains("queued"),
+            "unexpected queued toast: {toast}"
+        );
+        assert!(app.queued_compose_message.is_none());
+    }
+
+    #[test]
+    fn ctrl_e_from_thread_compose_opens_editor_and_keeps_draft() {
+        let mut app = test_app_with_tasks();
+        seed_thread_workspace(&mut app);
+        app.workbench_view = WorkbenchView::Threads;
+        app.focus = Focus::Tasks;
+
+        let thread = app.threads[0].clone();
+        let session_id = thread.session_id.clone().unwrap();
+        std::fs::create_dir_all(&thread.worktree_path.clone().unwrap()).unwrap();
+
+        let rows = 24;
+        let cols = 120;
+        let mut shell_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        shell_cmd.arg("-lc");
+        shell_cmd.arg("printf 'shell'");
+        let mut agent_cmd = portable_pty::CommandBuilder::new("/bin/sh");
+        agent_cmd.arg("-lc");
+        agent_cmd.arg("printf 'agent'");
+
+        let shell = crate::pty::EmbeddedTerminal::spawn(shell_cmd, rows, cols / 2).unwrap();
+        let agent = crate::pty::EmbeddedTerminal::spawn(agent_cmd, rows, cols / 2).unwrap();
+        let terminals =
+            crate::pty::SessionTerminals::from_parts(shell, Box::new(agent), "/tmp/test-repo");
+        app.add_session_tab(
+            session_id.clone(),
+            Box::new(terminals),
+            "Session".to_string(),
+        );
+
+        app.start_thread_compose().unwrap();
+        app.input_buffer = "Need to update the docs before editing".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.thread_compose_buffer = app.input_buffer.clone();
+        app.thread_compose_cursor = app.input_cursor;
+
+        press_mod(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+
+        assert!(matches!(
+            app.tabs.get(app.active_tab),
+            Some(Tab::Session {
+                session_id: sid,
+                view_mode: SessionTabView::Editor,
+                ..
+            }) if sid == &session_id
+        ));
+        assert_eq!(
+            app.thread_workspace(&thread.id)
+                .map(|workspace| workspace.compose_buffer.as_str()),
+            Some("Need to update the docs before editing")
+        );
+    }
+
+    #[test]
     fn strip_image_markers_removes_references() {
         use super::input::strip_image_markers;
         assert_eq!(
@@ -5408,10 +7677,7 @@ mod tests {
     fn augment_prompt_with_images_adds_paths() {
         use super::input::augment_prompt_with_images;
         // No images — returns content unchanged
-        assert_eq!(
-            augment_prompt_with_images("hello", &[]),
-            "hello"
-        );
+        assert_eq!(augment_prompt_with_images("hello", &[]), "hello");
         // With images — strips markers and appends path instructions
         let result = augment_prompt_with_images(
             "[image: clip.png] Look at this table",
@@ -5422,10 +7688,7 @@ mod tests {
         assert!(!result.contains("[image: clip.png]"));
 
         // Image-only (no text) — provides default prompt
-        let result = augment_prompt_with_images(
-            "[image: img.png]",
-            &["/tmp/img.png".to_string()],
-        );
+        let result = augment_prompt_with_images("[image: img.png]", &["/tmp/img.png".to_string()]);
         assert!(result.contains("Please look at the attached image"));
         assert!(result.contains("/tmp/img.png"));
     }

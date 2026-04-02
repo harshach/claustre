@@ -68,55 +68,54 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        // Modern palette inspired by Charmbracelet Crush.
-        // Cool blues and purples dominate; warm tones are soft peach/coral
-        // instead of saturated yellow.
+        // Charcoal + cyan + amber palette inspired by terminal-native IDEs.
+        // Keeps the UI dark and crisp without leaning too hard on purple.
         Self {
-            border_focused: Color::Rgb(138, 108, 255), // soft violet
-            border_unfocused: Color::Rgb(55, 60, 82),  // slate
+            border_focused: Color::Rgb(90, 177, 255),
+            border_unfocused: Color::Rgb(56, 65, 78),
 
-            text_primary: Color::Rgb(230, 225, 245), // cool white-lavender
-            text_secondary: Color::Rgb(140, 148, 178), // muted slate
-            text_accent: Color::Rgb(120, 200, 255),  // sky blue
+            text_primary: Color::Rgb(232, 238, 244),
+            text_secondary: Color::Rgb(136, 149, 166),
+            text_accent: Color::Rgb(255, 196, 112),
 
-            status_draft: Color::Rgb(120, 200, 255), // sky blue
-            status_pending: Color::Rgb(110, 116, 148), // dim slate
-            status_working: Color::Rgb(80, 220, 200), // teal-mint
-            status_interrupted: Color::Rgb(240, 130, 210), // soft pink
-            status_in_review: Color::Rgb(255, 180, 128), // warm peach
-            status_conflict: Color::Rgb(255, 150, 90), // coral-orange
-            status_ci_failed: Color::Rgb(255, 110, 120), // soft red
-            status_ci_running: Color::Rgb(180, 160, 255), // lavender
-            status_ci_passed: Color::Rgb(80, 220, 200), // teal-mint
-            status_done: Color::Rgb(130, 170, 255),  // periwinkle
-            status_error: Color::Rgb(255, 100, 100), // red
-            status_paused: Color::Rgb(255, 180, 128), // warm peach
-            status_waiting: Color::Rgb(120, 200, 255), // sky blue
+            status_draft: Color::Rgb(102, 196, 255),
+            status_pending: Color::Rgb(117, 126, 142),
+            status_working: Color::Rgb(77, 213, 184),
+            status_interrupted: Color::Rgb(255, 144, 150),
+            status_in_review: Color::Rgb(255, 196, 112),
+            status_conflict: Color::Rgb(255, 134, 92),
+            status_ci_failed: Color::Rgb(255, 108, 108),
+            status_ci_running: Color::Rgb(112, 168, 255),
+            status_ci_passed: Color::Rgb(77, 213, 184),
+            status_done: Color::Rgb(122, 188, 255),
+            status_error: Color::Rgb(255, 108, 108),
+            status_paused: Color::Rgb(255, 196, 112),
+            status_waiting: Color::Rgb(102, 196, 255),
 
-            accent_primary: Color::Rgb(120, 200, 255), // sky blue
-            accent_secondary: Color::Rgb(180, 160, 255), // lavender
-            accent_tertiary: Color::Rgb(220, 120, 255), // orchid
+            accent_primary: Color::Rgb(102, 196, 255),
+            accent_secondary: Color::Rgb(255, 196, 112),
+            accent_tertiary: Color::Rgb(255, 124, 92),
 
-            toast_info: Color::Rgb(120, 200, 255),   // sky blue
-            toast_success: Color::Rgb(80, 220, 200), // teal-mint
-            toast_error: Color::Rgb(255, 100, 100),  // red
+            toast_info: Color::Rgb(102, 196, 255),
+            toast_success: Color::Rgb(77, 213, 184),
+            toast_error: Color::Rgb(255, 108, 108),
 
-            usage_low: Color::Rgb(80, 220, 200),     // teal-mint
-            usage_medium: Color::Rgb(255, 180, 128), // peach
-            usage_high: Color::Rgb(255, 100, 100),   // red
+            usage_low: Color::Rgb(77, 213, 184),
+            usage_medium: Color::Rgb(255, 196, 112),
+            usage_high: Color::Rgb(255, 108, 108),
 
-            form_border_task: Color::Rgb(180, 160, 255), // lavender
-            form_border_project: Color::Rgb(220, 120, 255), // orchid
-            form_highlight: Color::Rgb(120, 200, 255),   // sky blue
-            form_dim: Color::Rgb(80, 85, 110),           // dark slate
+            form_border_task: Color::Rgb(102, 196, 255),
+            form_border_project: Color::Rgb(255, 124, 92),
+            form_highlight: Color::Rgb(102, 196, 255),
+            form_dim: Color::Rgb(71, 79, 94),
 
-            tab_active: Color::Rgb(138, 108, 255), // soft violet
-            tab_inactive: Color::Rgb(105, 112, 140), // muted slate
+            tab_active: Color::Rgb(90, 177, 255),
+            tab_inactive: Color::Rgb(103, 112, 126),
 
-            selection_indicator: Color::Rgb(120, 200, 255), // sky blue
-            pr_link: Color::Rgb(220, 120, 255),             // orchid
-            spinner: Color::Rgb(180, 160, 255),             // lavender
-            rate_limit_warning: Color::Rgb(255, 100, 100),  // red
+            selection_indicator: Color::Rgb(102, 196, 255),
+            pr_link: Color::Rgb(255, 124, 92),
+            spinner: Color::Rgb(255, 196, 112),
+            rate_limit_warning: Color::Rgb(255, 108, 108),
         }
     }
 }
@@ -124,34 +123,34 @@ impl Default for Theme {
 impl Theme {
     /// Background style for the navigation/sidebar rail.
     pub fn sidebar_surface(&self) -> Style {
-        Style::default().bg(Color::Rgb(22, 24, 38))
+        Style::default().bg(Color::Rgb(18, 23, 31))
     }
 
     /// Background style for primary work surfaces.
     pub fn main_surface(&self) -> Style {
-        Style::default().bg(Color::Rgb(18, 20, 32))
+        Style::default().bg(Color::Rgb(14, 18, 25))
     }
 
     /// Background style for the detail inspector rail.
     pub fn inspector_surface(&self) -> Style {
-        Style::default().bg(Color::Rgb(16, 18, 28))
+        Style::default().bg(Color::Rgb(12, 16, 22))
     }
 
     /// Background style for elevated cards and overlays.
     pub fn overlay_surface(&self) -> Style {
-        Style::default().bg(Color::Rgb(26, 24, 42))
+        Style::default().bg(Color::Rgb(24, 30, 39))
     }
 
     /// Background style for nested cards inside panels.
     pub fn card_surface(&self) -> Style {
-        Style::default().bg(Color::Rgb(28, 32, 46))
+        Style::default().bg(Color::Rgb(24, 29, 38))
     }
 
     /// Filled style for selected rows and focus chips.
     pub fn selected_fill(&self) -> Style {
         Style::default()
             .fg(self.text_primary)
-            .bg(Color::Rgb(50, 55, 80))
+            .bg(Color::Rgb(27, 46, 62))
             .add_modifier(Modifier::BOLD)
     }
 
@@ -483,11 +482,11 @@ mod tests {
     #[test]
     fn default_theme_has_expected_colors() {
         let t = Theme::default();
-        assert_eq!(t.border_focused, Color::Rgb(138, 108, 255));
-        assert_eq!(t.status_conflict, Color::Rgb(255, 150, 90));
-        assert_eq!(t.text_primary, Color::Rgb(230, 225, 245));
-        assert_eq!(t.sidebar_surface().bg, Some(Color::Rgb(22, 24, 38)));
-        assert_eq!(t.overlay_surface().bg, Some(Color::Rgb(26, 24, 42)));
+        assert_eq!(t.border_focused, Color::Rgb(90, 177, 255));
+        assert_eq!(t.status_conflict, Color::Rgb(255, 134, 92));
+        assert_eq!(t.text_primary, Color::Rgb(232, 238, 244));
+        assert_eq!(t.sidebar_surface().bg, Some(Color::Rgb(18, 23, 31)));
+        assert_eq!(t.overlay_surface().bg, Some(Color::Rgb(24, 30, 39)));
     }
 
     #[test]
@@ -522,7 +521,7 @@ mod tests {
         assert_eq!(t.border_focused, Color::Red);
         assert_eq!(t.status_conflict, Color::Rgb(100, 200, 50));
         // Non-overridden field keeps default
-        assert_eq!(t.text_primary, Color::Rgb(230, 225, 245));
+        assert_eq!(t.text_primary, Color::Rgb(232, 238, 244));
     }
 
     #[test]

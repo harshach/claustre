@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -6,6 +7,8 @@ use std::time::{Duration, Instant};
 use std::fmt::Write as _;
 
 use regex::Regex;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 
 use ratatui::{
     Frame,
@@ -23,8 +26,9 @@ use crate::{
 };
 
 use super::super::app::{
-    App, Focus, InputMode, InspectorTab, MyTaskItem, ReviewQueueItem, ReviewQueueTab,
-    SelectedThreadContext, SettingsSection, SidebarItem, WorkbenchView,
+    App, Focus, InputMode, InspectorLinkHit, InspectorRenderCache, InspectorTab, MyTaskItem,
+    ReviewQueueItem, ReviewQueueTab, SelectedThreadContext, SettingsSection, SidebarItem,
+    WorkbenchView,
 };
 use super::super::form::format_with_cursor;
 use super::board::{draw_board, draw_project_overlay, draw_sprint_overlay};
@@ -36,6 +40,17 @@ const DIFF_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_MAIN_MIN_WIDTH: u16 = 24;
 const SIDEBAR_MIN_WIDTH: u16 = 18;
 const INSPECTOR_MIN_WIDTH: u16 = 26;
+static INSPECTOR_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s)>"]+"#).expect("valid inspector URL regex"));
+
+/// Lazily-loaded syntect resources for code block syntax highlighting.
+static SYNTAX_HIGHLIGHT: LazyLock<(SyntaxSet, syntect::highlighting::Theme)> =
+    LazyLock::new(|| {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = ts.themes["base16-ocean.dark"].clone();
+        (ss, theme)
+    });
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WorkbenchLayout {
@@ -270,7 +285,7 @@ pub(super) fn draw_thread_session_view(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Ctrl+O: terminal",
+            "Ctrl+O: terminal  Ctrl+E: editor",
             Style::default().fg(app.theme.text_secondary),
         ),
     ];
@@ -300,51 +315,7 @@ pub(super) fn draw_thread_session_view(
     }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), vertical[0]);
 
-    let selected_task = thread_ctx
-        .thread
-        .task_id
-        .as_deref()
-        .and_then(|task_id| app.tasks.iter().find(|task| task.id == task_id))
-        .cloned();
-
-    if app.inspector_expanded {
-        // Expanded: inspector takes full body width, no chat panel
-        draw_inspector(
-            frame,
-            app,
-            vertical[1],
-            selected_task.as_ref(),
-            None,
-            None,
-            Some(thread_ctx),
-        );
-    } else {
-        let inspector_width = app.workbench_inspector_width.clamp(
-            INSPECTOR_MIN_WIDTH,
-            vertical[1]
-                .width
-                .saturating_sub(DEFAULT_MAIN_MIN_WIDTH)
-                .max(INSPECTOR_MIN_WIDTH),
-        );
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(DEFAULT_MAIN_MIN_WIDTH),
-                Constraint::Length(inspector_width),
-            ])
-            .split(vertical[1]);
-
-        draw_thread_chat(frame, app, body[0], Some(thread_ctx));
-        draw_inspector(
-            frame,
-            app,
-            body[1],
-            selected_task.as_ref(),
-            None,
-            None,
-            Some(thread_ctx),
-        );
-    }
+    draw_thread_workspace_panels(frame, app, vertical[1], Some(thread_ctx), false, true, true);
 }
 
 fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -356,44 +327,48 @@ fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(
-        crate::update::VERSION,
+        format!(" {} ", crate::update::VERSION),
+        Style::default()
+            .fg(app
+                .theme
+                .main_surface()
+                .bg
+                .unwrap_or(app.theme.border_unfocused))
+            .bg(app.theme.accent_primary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("  {}  ", app.workbench_view.label()),
         Style::default()
             .fg(app.theme.accent_secondary)
             .add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(
-        "  •  ",
-        Style::default().fg(app.theme.border_unfocused),
-    ));
-    spans.push(Span::styled(
-        app.workbench_view.label(),
-        Style::default()
-            .fg(app.theme.accent_primary)
-            .add_modifier(Modifier::BOLD),
-    ));
     if let Some(project) = app.selected_project() {
         spans.push(Span::styled(
-            format!("  •  {}", project.name),
-            Style::default().fg(app.theme.text_primary),
-        ));
-    }
-    if let Some(activity) = app.busy_indicator_label() {
-        spans.push(Span::styled(
-            format!("  •  {} {}", spinner_char(), activity),
+            format!(" {} ", project.name),
             Style::default()
-                .fg(app.theme.spinner)
+                .fg(app.theme.text_primary)
+                .bg(app
+                    .theme
+                    .card_surface()
+                    .bg
+                    .unwrap_or(app.theme.border_unfocused))
                 .add_modifier(Modifier::BOLD),
         ));
     }
     if let Some(ref warning) = app.config_warning {
         spans.push(Span::styled(
-            format!("  •  warning: {warning}"),
+            format!("  warning: {warning} "),
             Style::default()
-                .fg(app.theme.accent_secondary)
+                .fg(app.theme.text_primary)
+                .bg(app.theme.status_conflict)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(app.theme.sidebar_surface()),
+        area,
+    );
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -533,6 +508,51 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             format!("   {} local thread(s)", app.threads.len()),
             Style::default().fg(app.theme.text_primary),
         )));
+    }
+
+    if let Some(summary) = app
+        .selected_project()
+        .and_then(|project| app.project_summaries.get(&project.id).cloned())
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            " Snapshot",
+            Style::default()
+                .fg(app.theme.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("   active ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                summary.active_sessions.len().to_string(),
+                Style::default()
+                    .fg(app.theme.accent_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  pending ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                summary.task_counts.pending.to_string(),
+                Style::default()
+                    .fg(app.theme.status_pending)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   working ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                summary.task_counts.working.to_string(),
+                Style::default()
+                    .fg(app.theme.status_working)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  review ", Style::default().fg(app.theme.text_secondary)),
+            Span::styled(
+                summary.task_counts.in_review.to_string(),
+                Style::default()
+                    .fg(app.theme.status_in_review)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     frame.render_widget(
@@ -944,12 +964,18 @@ fn draw_review_queue(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut lines = Vec::with_capacity(items.len());
+    let lines_per_item: u16 = 3;
+    let mut lines = Vec::with_capacity(items.len() * usize::from(lines_per_item));
     for (idx, item) in items.iter().enumerate() {
-        let selected = idx == app.review_index;
-        lines.push(draw_review_row(app, item, selected, sections[1].width));
+        lines.extend(draw_review_row(
+            app,
+            item,
+            idx == app.review_index,
+            sections[1].width,
+        ));
     }
-    let scroll_y = (app.review_index as u16 + 1).saturating_sub(sections[1].height);
+    let selected_top = (app.review_index as u16) * lines_per_item;
+    let scroll_y = (selected_top + lines_per_item).saturating_sub(sections[1].height);
     frame.render_widget(
         Paragraph::new(lines)
             .style(app.theme.main_surface())
@@ -985,41 +1011,77 @@ fn draw_review_tabs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_review_row(app: &App, item: &ReviewQueueItem, selected: bool, width: u16) -> Line<'static> {
-    let marker = if selected && app.focus == Focus::Tasks {
-        ">"
+fn draw_review_row(
+    app: &App,
+    item: &ReviewQueueItem,
+    selected: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let is_focused = selected && app.focus == Focus::Tasks;
+    let bar = if is_focused {
+        Span::styled(" ▎ ", Style::default().fg(app.theme.accent_primary))
+    } else if selected {
+        Span::styled(" ▎ ", Style::default().fg(app.theme.border_unfocused))
     } else {
-        " "
+        Span::raw("   ")
     };
     let mut title = item.title_line();
     let meta = review_row_meta(app, item);
-    let available_width = usize::from(width.saturating_sub(20));
+    let available_width = usize::from(width.saturating_sub(12));
     if title.chars().count() > available_width.max(12) {
         title = truncate(&title, available_width.max(12));
     }
-    let style = if selected {
-        app.theme.selected_fill()
+    let title_style = if selected {
+        Style::default()
+            .fg(app.theme.text_primary)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.text_primary)
     };
+    let decision = item
+        .pr_cache
+        .review_decision
+        .as_deref()
+        .unwrap_or(if item.pr_cache.is_draft {
+            "draft"
+        } else {
+            "open"
+        })
+        .to_ascii_lowercase()
+        .replace('_', " ");
+    let decision_color = match decision.as_str() {
+        "approved" => app.theme.status_done,
+        "changes requested" => app.theme.status_conflict,
+        "review required" => app.theme.status_in_review,
+        "draft" => app.theme.text_secondary,
+        _ => app.theme.accent_secondary,
+    };
 
-    Line::from(vec![
-        Span::styled(format!(" {marker} "), style),
-        Span::styled(
-            if item.pr_cache.is_draft { "◐" } else { "○" },
-            if item.pr_cache.is_draft {
-                Style::default().fg(app.theme.text_secondary)
-            } else {
-                Style::default().fg(app.theme.accent_primary)
-            },
-        ),
-        Span::raw(" "),
-        Span::styled(title, style),
-        Span::styled(
-            format!("  {meta}"),
-            Style::default().fg(app.theme.text_secondary),
-        ),
-    ])
+    vec![
+        Line::from(vec![
+            bar.clone(),
+            Span::styled(
+                format!("#{} ", item.github_item.number),
+                Style::default()
+                    .fg(app.theme.accent_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title, title_style),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", decision),
+                app.theme.chip_style(decision_color),
+            ),
+        ]),
+        Line::from(vec![
+            bar,
+            Span::styled(
+                truncate(&meta, width.saturating_sub(4) as usize),
+                Style::default().fg(app.theme.text_secondary),
+            ),
+        ]),
+        Line::from(""),
+    ]
 }
 
 fn review_row_meta(app: &App, item: &ReviewQueueItem) -> String {
@@ -1059,6 +1121,18 @@ fn draw_thread_workspace(
     area: Rect,
     thread_ctx: Option<&SelectedThreadContext>,
 ) {
+    draw_thread_workspace_panels(frame, app, area, thread_ctx, true, false, false);
+}
+
+fn draw_thread_workspace_panels(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    thread_ctx: Option<&SelectedThreadContext>,
+    show_thread_list: bool,
+    embed_inspector: bool,
+    compact_session_layout: bool,
+) {
     if app.threads.is_empty() {
         let block = Block::default()
             .title(Line::from(vec![Span::styled(
@@ -1087,18 +1161,67 @@ fn draw_thread_workspace(
         return;
     }
 
-    let list_width = if area.width < 56 {
-        (area.width / 2).max(18)
-    } else {
-        area.width.saturating_sub(24).clamp(26, 38)
-    };
-    let sections = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(list_width), Constraint::Min(24)])
-        .split(area);
+    let selected_task = thread_ctx
+        .and_then(|ctx| ctx.thread.task_id.as_deref())
+        .and_then(|task_id| app.tasks.iter().find(|task| task.id == task_id))
+        .cloned();
 
-    draw_thread_list(frame, app, sections[0]);
-    draw_thread_chat(frame, app, sections[1], thread_ctx);
+    let body_area = if show_thread_list {
+        let list_width = if area.width < 56 {
+            (area.width / 2).max(18)
+        } else {
+            area.width.saturating_sub(24).clamp(26, 38)
+        };
+        let sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(list_width), Constraint::Min(24)])
+            .split(area);
+        draw_thread_list(frame, app, sections[0]);
+        sections[1]
+    } else {
+        area
+    };
+
+    if embed_inspector {
+        if app.inspector_expanded {
+            draw_inspector(
+                frame,
+                app,
+                body_area,
+                selected_task.as_ref(),
+                None,
+                None,
+                thread_ctx,
+            );
+        } else {
+            let inspector_width = app.workbench_inspector_width.clamp(
+                INSPECTOR_MIN_WIDTH,
+                body_area
+                    .width
+                    .saturating_sub(DEFAULT_MAIN_MIN_WIDTH)
+                    .max(INSPECTOR_MIN_WIDTH),
+            );
+            let sections = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(DEFAULT_MAIN_MIN_WIDTH),
+                    Constraint::Length(inspector_width),
+                ])
+                .split(body_area);
+            draw_thread_chat(frame, app, sections[0], thread_ctx, compact_session_layout);
+            draw_inspector(
+                frame,
+                app,
+                sections[1],
+                selected_task.as_ref(),
+                None,
+                None,
+                thread_ctx,
+            );
+        }
+    } else {
+        draw_thread_chat(frame, app, body_area, thread_ctx, compact_session_layout);
+    }
 }
 
 fn draw_thread_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -1127,39 +1250,242 @@ fn draw_thread_list(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = Vec::with_capacity(app.threads.len());
+    let lines_per_item: u16 = 3;
+    let mut lines = Vec::with_capacity(app.threads.len() * usize::from(lines_per_item));
     for (index, thread) in app.threads.iter().enumerate() {
-        let selected = index == app.thread_index;
-        let cursor = if selected { ">" } else { " " };
-        let session = thread_session_state(app, thread);
-        let source = thread_source_label(thread);
-        let row_style = if selected {
-            app.theme.selected_fill()
-        } else {
-            Style::default().fg(app.theme.text_primary)
-        };
-        let status_style = app.theme.thread_status_style(thread.status);
-        let provider_style = Style::default().fg(app.theme.accent_primary);
-        let meta_style = Style::default().fg(app.theme.text_secondary);
-        let title = truncate(
-            thread.title.as_str(),
-            inner.width.saturating_sub(26) as usize,
-        );
-        lines.push(Line::from(vec![
-            Span::styled(format!("{cursor} "), row_style),
-            Span::styled(title, row_style),
-            Span::styled(format!(" [{}]", thread.status), status_style),
-            Span::styled(format!(" {}", thread.provider_kind), provider_style),
-            Span::styled(format!(" {session} {source}"), meta_style),
-        ]));
+        lines.extend(draw_thread_row(
+            app,
+            thread,
+            index == app.thread_index,
+            inner.width,
+        ));
     }
+
+    let selected_top = (app.thread_index as u16) * lines_per_item;
+    let scroll_y = (selected_top + lines_per_item).saturating_sub(inner.height);
 
     frame.render_widget(
         Paragraph::new(lines)
             .style(app.theme.main_surface())
+            .scroll((scroll_y, 0))
             .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn draw_thread_row(
+    app: &App,
+    thread: &crate::store::Thread,
+    selected: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let is_focused = selected && app.focus == Focus::Tasks;
+    let bar = if is_focused {
+        Span::styled(" ▎ ", Style::default().fg(app.theme.accent_primary))
+    } else if selected {
+        Span::styled(" ▎ ", Style::default().fg(app.theme.border_unfocused))
+    } else {
+        Span::raw("   ")
+    };
+    let title_style = if selected {
+        Style::default()
+            .fg(app.theme.text_primary)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.theme.text_primary)
+    };
+    let title = truncate(thread.title.as_str(), width.saturating_sub(16) as usize);
+    let meta = truncate(
+        &format!(
+            "{}  {}",
+            thread_session_state(app, thread),
+            thread_source_label(thread)
+        ),
+        width.saturating_sub(4) as usize,
+    );
+
+    vec![
+        Line::from(vec![
+            bar.clone(),
+            Span::styled(title, title_style),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", thread.status),
+                app.theme
+                    .chip_style(thread_status_chip_color(app, thread.status)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", thread.provider_kind),
+                Style::default()
+                    .fg(app
+                        .theme
+                        .main_surface()
+                        .bg
+                        .unwrap_or(app.theme.border_unfocused))
+                    .bg(app.theme.accent_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            bar,
+            Span::styled(meta, Style::default().fg(app.theme.text_secondary)),
+        ]),
+        Line::from(""),
+    ]
+}
+
+fn thread_status_chip_color(
+    app: &App,
+    status: crate::store::ThreadStatus,
+) -> ratatui::style::Color {
+    match status {
+        crate::store::ThreadStatus::Draft => app.theme.status_draft,
+        crate::store::ThreadStatus::RuntimePreparing => app.theme.status_pending,
+        crate::store::ThreadStatus::Ready | crate::store::ThreadStatus::Done => {
+            app.theme.status_done
+        }
+        crate::store::ThreadStatus::Running => app.theme.status_working,
+        crate::store::ThreadStatus::WaitingUser => app.theme.status_waiting,
+        crate::store::ThreadStatus::WaitingReview => app.theme.status_in_review,
+        crate::store::ThreadStatus::Blocked => app.theme.status_conflict,
+        crate::store::ThreadStatus::Error => app.theme.status_error,
+    }
+}
+
+fn thread_source_chip_label(thread_ctx: &SelectedThreadContext) -> &'static str {
+    if let Some(github_item) = thread_ctx.github_item.as_ref() {
+        match github_item.kind {
+            GitHubItemKind::PullRequest => "pr",
+            GitHubItemKind::Issue => "issue",
+            GitHubItemKind::ProjectItem => "board",
+        }
+    } else if thread_ctx.thread.task_id.is_some() {
+        "task"
+    } else {
+        "ad hoc"
+    }
+}
+
+fn thread_source_chip_color(
+    theme: &Theme,
+    thread_ctx: &SelectedThreadContext,
+) -> ratatui::style::Color {
+    match thread_source_chip_label(thread_ctx) {
+        "pr" => theme.accent_secondary,
+        "issue" => theme.accent_primary,
+        "board" => theme.status_waiting,
+        "task" => theme.accent_tertiary,
+        _ => theme.form_dim,
+    }
+}
+
+fn thread_session_chip_color(app: &App, thread: &crate::store::Thread) -> ratatui::style::Color {
+    match thread_session_state(app, thread) {
+        "working" => app.theme.status_working,
+        "ready" => app.theme.status_done,
+        "needs approval" => app.theme.status_paused,
+        "waiting for reply" => app.theme.status_waiting,
+        "interrupted" => app.theme.status_interrupted,
+        "error" => app.theme.status_error,
+        "done" => app.theme.status_done,
+        "offline" | "closed" => app.theme.status_pending,
+        _ => app.theme.status_pending,
+    }
+}
+
+fn thread_session_badge_label(app: &App, thread: &crate::store::Thread) -> String {
+    let provider = thread.provider_kind.as_str();
+    match thread_session_state(app, thread) {
+        "working" => format!(" {provider} working "),
+        "ready" => format!(" {provider} ready "),
+        "needs approval" => " approval needed ".to_string(),
+        "waiting for reply" => " waiting for reply ".to_string(),
+        "interrupted" => " relaunch needed ".to_string(),
+        "error" => format!(" {provider} error "),
+        "done" => format!(" {provider} done "),
+        "offline" | "closed" => {
+            if thread.session_id.is_some() {
+                " relaunch needed ".to_string()
+            } else {
+                " no agent ".to_string()
+            }
+        }
+        _ => format!(" {provider} attached "),
+    }
+}
+
+fn thread_workspace_source_summary(thread_ctx: &SelectedThreadContext) -> String {
+    if let Some(github_item) = thread_ctx.github_item.as_ref() {
+        let kind = match github_item.kind {
+            GitHubItemKind::PullRequest => "pr",
+            GitHubItemKind::Issue => "issue",
+            GitHubItemKind::ProjectItem => "board item",
+        };
+        let mut summary = format!("source {kind} #{}", github_item.number);
+        if let Some(task_id) = thread_ctx.thread.task_id.as_deref() {
+            summary.push_str(&format!("  task {task_id}"));
+        }
+        if let Some(review_decision) = thread_ctx
+            .pr_cache
+            .as_ref()
+            .and_then(|cache| cache.review_decision.as_deref())
+        {
+            summary.push_str(&format!("  {}", review_decision.replace('_', " ")));
+        }
+        summary
+    } else if let Some(task_id) = thread_ctx.thread.task_id.as_deref() {
+        format!("source local task {task_id}")
+    } else {
+        "source ad hoc scratchpad".to_string()
+    }
+}
+
+fn build_thread_workspace_header(
+    app: &App,
+    thread_ctx: &SelectedThreadContext,
+    max_width: u16,
+) -> Vec<Line<'static>> {
+    let agent_badge = thread_session_badge_label(app, &thread_ctx.thread);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {} ", thread_source_chip_label(thread_ctx)),
+            app.theme
+                .chip_style(thread_source_chip_color(&app.theme, thread_ctx)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            agent_badge,
+            app.theme
+                .chip_style(thread_session_chip_color(app, &thread_ctx.thread)),
+        ),
+    ])];
+
+    let context_line = format!(
+        "{}  via {}  {}",
+        thread_workspace_source_summary(thread_ctx),
+        thread_ctx.thread.provider_kind,
+        thread_ctx.activity_summary()
+    );
+    lines.push(Line::from(Span::styled(
+        truncate(&context_line, max_width.saturating_sub(2) as usize),
+        Style::default().fg(app.theme.text_secondary),
+    )));
+
+    let mut runtime_line = format!("runtime {}", thread_ctx.runtime_summary());
+    if let Some(run_summary) = thread_ctx.latest_run_summary() {
+        runtime_line.push_str(&format!("  run {run_summary}"));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate(&runtime_line, max_width.saturating_sub(2) as usize),
+        Style::default().fg(app.theme.text_secondary),
+    )));
+
+    if let Some(pipeline_line) = workflow_pipeline_line(thread_ctx, &app.theme, max_width) {
+        lines.push(pipeline_line);
+    }
+
+    lines
 }
 
 pub(super) fn draw_thread_chat(
@@ -1167,6 +1493,7 @@ pub(super) fn draw_thread_chat(
     app: &mut App,
     area: Rect,
     thread_ctx: Option<&SelectedThreadContext>,
+    compact_session_layout: bool,
 ) {
     let title = thread_ctx.map_or_else(
         || "Conversation".to_string(),
@@ -1198,6 +1525,8 @@ pub(super) fn draw_thread_chat(
         return;
     };
 
+    app.initialize_thread_workspace(&thread_ctx.thread);
+
     // Check if Claude is actively working (used for choices and compose height)
     let session_is_working = thread_ctx.thread.session_id.as_deref().is_some_and(|sid| {
         app.sessions
@@ -1206,34 +1535,38 @@ pub(super) fn draw_thread_chat(
             && !app.pty_idle_sessions.contains(sid)
     });
 
+    let thread_id = thread_ctx.thread.id.as_str();
+    let workspace = app.ensure_thread_workspace(thread_id);
+    let workspace_draft = workspace.compose_buffer.clone();
+    let quick_reply_choices = workspace.quick_reply_choices.clone();
+    let (chat_scroll, chat_auto_scroll) = (workspace.chat_scroll, workspace.chat_auto_scroll);
+
     // Dynamic compose height: grows with content up to 40% of the panel
-    let compose_active = app.input_mode == InputMode::ThreadCompose
+    let compose_is_focused = app.input_mode == InputMode::ThreadCompose
         && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str());
-    let choices_visible = !session_is_working && !app.quick_reply_choices.is_empty();
-    let compose_content_height = if compose_active {
+    let choices_visible = !session_is_working && !quick_reply_choices.is_empty();
+    let _ = compact_session_layout;
+    let workspace_header_width = inner.width.saturating_sub(2);
+    let compose_body_height = if compose_is_focused {
         let text = format!("> {}", app.input_buffer);
         let available_w = inner.width.saturating_sub(2);
-        super::super::form::measure_wrapped_height(&text, available_w).saturating_add(1) // +1 for "Reply" label
-    } else if !app.thread_compose_buffer.is_empty()
+        super::super::form::measure_wrapped_height(&text, available_w)
+    } else if !workspace_draft.is_empty()
         && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str())
     {
-        let text = format!("> {}", app.thread_compose_buffer);
+        let text = format!("> {}", workspace_draft);
         let available_w = inner.width.saturating_sub(2);
-        super::super::form::measure_wrapped_height(&text, available_w).saturating_add(1)
+        super::super::form::measure_wrapped_height(&text, available_w)
     } else if choices_visible {
-        // choices: 1 header + 1 per choice + 1 compose hint
-        (app.quick_reply_choices.len() as u16 + 2).max(3)
+        (quick_reply_choices.len() as u16 + 1).max(2)
     } else {
-        3 // default: label + placeholder
+        1
     };
-    let max_compose = (inner.height * 2 / 5).max(4);
-    let compose_height = compose_content_height.clamp(3, max_compose);
+    let max_compose = (inner.height * 2 / 5).max(5);
+    let compose_height = compose_body_height.saturating_add(3).clamp(5, max_compose);
 
-    // Compute header height: 1 base line (metadata) + optional pipeline strip.
-    // The thread title is already shown in the slim session header above,
-    // so we only show runtime/source metadata + workflow pipeline here.
-    let pipeline = workflow_pipeline_line(thread_ctx, &app.theme, inner.width);
-    let header_height: u16 = if pipeline.is_some() { 2 } else { 1 };
+    let header_lines = build_thread_workspace_header(app, thread_ctx, workspace_header_width);
+    let header_height = header_lines.len() as u16 + 2;
 
     // Compute approval banner height
     let approval_banner = workflow_approval_banner(thread_ctx, &app.theme, inner.width);
@@ -1243,52 +1576,44 @@ pub(super) fn draw_thread_chat(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
-            Constraint::Min(8),
+            Constraint::Min(6),
             Constraint::Length(banner_height),
             Constraint::Length(compose_height),
         ])
         .split(inner);
 
-    let session_state = thread_session_state(app, &thread_ctx.thread);
-    // Single metadata line: runtime + source
-    let mut header = vec![
-        Line::from(vec![
-            Span::styled(
-                thread_ctx.runtime_summary(),
-                Style::default().fg(app.theme.text_secondary),
-            ),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!(
-                    "source: {}",
-                    if let Some(github_item) = thread_ctx.github_item.as_ref() {
-                        format!(
-                            "{} #{} {}",
-                            github_item.kind, github_item.number, github_item.url
-                        )
-                    } else if let Some(task_id) = thread_ctx.thread.task_id.as_deref() {
-                        format!("task {task_id}")
-                    } else {
-                        "ad hoc".to_string()
-                    }
-                ),
-                Style::default().fg(app.theme.text_secondary),
-            ),
-        ]),
-    ];
-    if let Some(pipeline_line) = pipeline {
-        header.push(pipeline_line);
+    let timeline_area = vertical[1];
+
+    // Cache the compose rect so the fast-path can skip the full render.
+    app.cached_compose_rect = Some(vertical[3]);
+    app.cached_compose_thread_id = Some(thread_ctx.thread.id.clone());
+    {
+        let workspace = app.ensure_thread_workspace(thread_id);
+        workspace.cached_compose_rect = Some(vertical[3]);
     }
+
+    let workspace_block = Block::default()
+        .title(Line::from(Span::styled(
+            " Workspace ",
+            Style::default()
+                .fg(app.theme.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(app.theme.unfocused_border())
+        .style(app.theme.card_surface());
+    let workspace_inner = workspace_block.inner(vertical[0]);
+    frame.render_widget(workspace_block, vertical[0]);
     frame.render_widget(
-        Paragraph::new(header)
-            .style(app.theme.main_surface())
+        Paragraph::new(header_lines)
+            .style(app.theme.card_surface())
             .wrap(Wrap { trim: false }),
-        vertical[0],
+        workspace_inner,
     );
 
     // Prefer JSONL conversation cache when available for this session.
     // Use pre-built lines cache to avoid rebuilding on every 60fps frame.
-    let width = vertical[1].width;
+    let transcript_body_width = timeline_area.width.saturating_sub(2);
     let jsonl_lines: Option<Vec<Line<'static>>> =
         thread_ctx.thread.session_id.as_deref().and_then(|sid| {
             let conv = app
@@ -1297,28 +1622,69 @@ pub(super) fn draw_thread_chat(
                 .filter(|c| c.session_id == sid && !c.entries.is_empty())?;
 
             // Check if cached lines are still valid
-            if let Some(ref cached) = app.cached_chat_lines {
-                if cached.session_id == sid && cached.entry_count == conv.entries.len() {
+            if let Some(ref cached) = app
+                .thread_workspace(thread_id)
+                .and_then(|workspace| workspace.cached_chat_lines.as_ref())
+            {
+                if cached.session_id == sid
+                    && cached.entry_count == conv.entries.len()
+                    && cached.body_width == transcript_body_width
+                {
                     return Some(cached.lines.clone());
                 }
             }
 
             // Rebuild and cache
-            let lines = build_jsonl_conversation_lines(&conv.entries, &app.theme, width);
-            app.cached_chat_lines = Some(super::super::app::CachedChatLines {
+            let lines =
+                build_jsonl_conversation_lines(&conv.entries, &app.theme, transcript_body_width);
+            let cached = super::super::app::CachedChatLines {
                 session_id: sid.to_string(),
                 entry_count: conv.entries.len(),
+                body_width: transcript_body_width,
+                visual_line_count: None,
                 lines: lines.clone(),
+            };
+            app.cached_chat_lines = Some(super::super::app::CachedChatLines {
+                session_id: cached.session_id.clone(),
+                entry_count: cached.entry_count,
+                body_width: cached.body_width,
+                visual_line_count: cached.visual_line_count,
+                lines: cached.lines.clone(),
             });
+            app.ensure_thread_workspace(thread_id).cached_chat_lines = Some(cached);
             Some(lines)
         });
 
     let has_jsonl = jsonl_lines.is_some();
-    let mut timeline = jsonl_lines.unwrap_or_else(|| build_thread_timeline(app, thread_ctx));
+    let mut timeline = if let Some(lines) = jsonl_lines {
+        lines
+    } else {
+        let timeline_cache_key = thread_timeline_cache_key(thread_ctx);
+        if let Some(cached) = app
+            .thread_workspace(thread_id)
+            .and_then(|workspace| workspace.cached_thread_timeline_lines.as_ref())
+            .filter(|cached| {
+                cached.body_width == transcript_body_width && cached.cache_key == timeline_cache_key
+            })
+        {
+            cached.lines.clone()
+        } else {
+            let lines = build_thread_timeline_base(app, thread_ctx);
+            app.ensure_thread_workspace(thread_id)
+                .cached_thread_timeline_lines =
+                Some(super::super::app::CachedThreadTimelineLines {
+                    cache_key: timeline_cache_key,
+                    body_width: transcript_body_width,
+                    lines: lines.clone(),
+                });
+            lines
+        }
+    };
 
     // For sessions without JSONL (Codex, etc.), show live PTY content
     // in the chat view so the user can see what the provider is doing.
     if !has_jsonl {
+        append_thread_timeline_live_status(app, thread_ctx, &mut timeline);
         if let Some(ref sid) = thread_ctx.thread.session_id {
             let pty_content: Option<Vec<String>> = app.tabs.iter().find_map(|tab| {
                 let super::super::app::Tab::Session {
@@ -1372,16 +1738,11 @@ pub(super) fn draw_thread_chat(
         }
     }
 
-    // Append live "Working..." indicator when the agent is busy (JSONL sessions only).
+    // Append live activity only when the attached Claude session is truly working.
     if has_jsonl {
         if let Some(ref sid) = thread_ctx.thread.session_id {
             let pty_preview = app.pty_activity_preview.get(sid.as_str());
-            let db_working = app
-                .sessions
-                .iter()
-                .any(|s| s.id == *sid && s.claude_status == crate::store::ClaudeStatus::Working);
-            let not_idle = !app.pty_idle_sessions.contains(sid.as_str());
-            let is_working = db_working && not_idle;
+            let is_working = thread_session_state(app, &thread_ctx.thread) == "working";
             if is_working {
                 timeline.push(Line::from(""));
                 timeline.push(Line::from(Span::styled(
@@ -1391,7 +1752,7 @@ pub(super) fn draw_thread_chat(
                         .add_modifier(Modifier::DIM),
                 )));
                 timeline.push(Line::from(Span::styled(
-                    format!("  {} Agent working...", spinner_char()),
+                    format!("  {} Claude is working...", spinner_char()),
                     Style::default()
                         .fg(app.theme.status_working)
                         .add_modifier(Modifier::BOLD),
@@ -1410,20 +1771,87 @@ pub(super) fn draw_thread_chat(
         }
     }
 
+    let transcript_block = Block::default()
+        .title(Line::from(Span::styled(
+            " Transcript ",
+            Style::default()
+                .fg(app.theme.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(if app.focus == Focus::Tasks {
+            app.theme.focused_border()
+        } else {
+            app.theme.unfocused_border()
+        })
+        .style(app.theme.card_surface());
+    let transcript_inner = transcript_block.inner(timeline_area);
+    frame.render_widget(transcript_block, timeline_area);
+    let transcript_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(transcript_inner);
+    let transcript_hint = if has_jsonl {
+        "thread history  cached conversation"
+    } else if thread_ctx.thread.session_id.is_some() {
+        "thread history  live provider stream"
+    } else {
+        "thread history  stored relaunch context"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" history ", app.theme.chip_style(app.theme.accent_primary)),
+            Span::styled(
+                format!(" {transcript_hint} "),
+                Style::default()
+                    .fg(app.theme.text_secondary)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]))
+        .style(app.theme.card_surface()),
+        transcript_sections[0],
+    );
+
     let timeline_paragraph = Paragraph::new(timeline)
-        .style(app.theme.main_surface())
+        .style(app.theme.card_surface())
         .wrap(Wrap { trim: false });
-    // Use visual line count (after wrapping) for scroll calculation
-    let visual_lines = timeline_paragraph.line_count(vertical[1].width) as u16;
-    let max_scroll = visual_lines.saturating_sub(vertical[1].height);
-    let transcript_scroll = if app.session_chat_auto_scroll {
+    let cached_visual_lines = if has_jsonl {
+        app.thread_workspace(thread_id)
+            .and_then(|workspace| workspace.cached_chat_lines.as_ref())
+            .filter(|cached| cached.body_width == transcript_body_width)
+            .and_then(|cached| cached.visual_line_count)
+    } else {
+        None
+    };
+    // Use visual line count (after wrapping) for scroll calculation.
+    let visual_lines = cached_visual_lines
+        .unwrap_or_else(|| timeline_paragraph.line_count(transcript_sections[1].width) as u16);
+    if has_jsonl && cached_visual_lines.is_none() {
+        if let Some(cached) = app
+            .ensure_thread_workspace(thread_id)
+            .cached_chat_lines
+            .as_mut()
+            .filter(|cached| cached.body_width == transcript_body_width)
+        {
+            cached.visual_line_count = Some(visual_lines);
+        }
+        if let Some(cached) = app
+            .cached_chat_lines
+            .as_mut()
+            .filter(|cached| cached.body_width == transcript_body_width)
+        {
+            cached.visual_line_count = Some(visual_lines);
+        }
+    }
+    let max_scroll = visual_lines.saturating_sub(transcript_sections[1].height);
+    let transcript_scroll = if chat_auto_scroll {
         max_scroll
     } else {
-        max_scroll.saturating_sub(app.session_chat_scroll)
+        max_scroll.saturating_sub(chat_scroll)
     };
     frame.render_widget(
         timeline_paragraph.scroll((transcript_scroll, 0)),
-        vertical[1],
+        transcript_sections[1],
     );
 
     // Render approval banner between timeline and compose when waiting
@@ -1436,35 +1864,111 @@ pub(super) fn draw_thread_chat(
 
     let compose_focused = app.input_mode == InputMode::ThreadCompose
         && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str());
+    let has_live_provider = thread_has_live_provider(app, &thread_ctx.thread);
+    let has_linked_session = thread_ctx.thread.session_id.as_deref().is_some_and(|sid| {
+        app.sessions
+            .iter()
+            .any(|session| session.id == sid && session.closed_at.is_none())
+    });
+    let has_queued = app
+        .queued_compose_message
+        .as_ref()
+        .is_some_and(|(tid, _, _)| tid == &thread_ctx.thread.id);
+    let live_agent_state = thread_session_state(app, &thread_ctx.thread);
+    let composer_state = if has_queued {
+        (" queued ", app.theme.status_paused)
+    } else if has_live_provider {
+        (
+            match live_agent_state {
+                "working" => " agent working ",
+                "ready" => " agent ready ",
+                "needs approval" => " approval needed ",
+                "waiting for reply" => " waiting for reply ",
+                "interrupted" => " relaunch needed ",
+                "error" => " agent error ",
+                _ => " live ",
+            },
+            thread_session_chip_color(app, &thread_ctx.thread),
+        )
+    } else if has_linked_session {
+        (" relaunch needed ", app.theme.status_waiting)
+    } else {
+        (" no agent ", app.theme.status_pending)
+    };
     let compose_block = Block::default()
-        .borders(Borders::TOP)
+        .title(Line::from(vec![
+            Span::styled(
+                " Reply ",
+                Style::default()
+                    .fg(app.theme.accent_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(composer_state.0, app.theme.chip_style(composer_state.1)),
+        ]))
+        .borders(Borders::ALL)
         .border_style(if compose_focused {
             app.theme.focused_border()
         } else {
             app.theme.unfocused_border()
         })
-        .style(app.theme.main_surface());
-    let compose_inner = compose_block.inner(vertical[3]);
-    frame.render_widget(compose_block, vertical[3]);
+        .style(app.theme.card_surface());
+    let compose_area = vertical[3];
+    let compose_inner = compose_block.inner(compose_area);
+    frame.render_widget(compose_block, compose_area);
+    let compose_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(compose_inner);
 
     // Build compose lines — show quick-reply choices only when Claude is idle
     let has_choices = !compose_focused && choices_visible;
+    let compose_hint_text = if has_choices {
+        "Quick replies ready  1-9 pick  i compose"
+    } else if has_queued && !has_live_provider {
+        "Queued draft needs a live Claude session  l relaunch thread"
+    } else if has_queued {
+        "Reply queued while Claude finishes  Ctrl+C interrupt and send now"
+    } else if compose_focused {
+        "Enter send  Esc back  Ctrl+O terminal  Ctrl+E editor"
+    } else if has_live_provider {
+        match live_agent_state {
+            "working" => "Claude is actively working  i compose to queue a reply  Ctrl+O terminal",
+            "ready" => "Claude is ready  i compose  Ctrl+O terminal  Ctrl+E editor",
+            "needs approval" => "Claude needs approval  Ctrl+O terminal  i compose to answer",
+            "waiting for reply" => "Claude is waiting for your reply  i compose to answer",
+            "interrupted" => "Claude session interrupted  l relaunch thread  Ctrl+O terminal",
+            "error" => "Claude hit an error  l relaunch thread  Ctrl+O terminal",
+            _ => "Claude session attached  i compose  Ctrl+O terminal  Ctrl+E editor",
+        }
+    } else if has_linked_session {
+        "No live Claude session attached  l relaunch thread  Ctrl+O inspect terminal"
+    } else {
+        "No live agent attached  i draft  l relaunch thread"
+    };
+    let mut compose_hint_spans = vec![Span::styled(
+        compose_hint_text,
+        Style::default()
+            .fg(app.theme.text_secondary)
+            .add_modifier(Modifier::DIM),
+    )];
+    if app.clipboard_has_image {
+        compose_hint_spans.push(Span::styled(
+            "  Ctrl+V attach image",
+            Style::default()
+                .fg(app.theme.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(compose_hint_spans)).style(app.theme.card_surface()),
+        compose_sections[0],
+    );
 
     let compose_lines: Vec<Line<'_>> = if has_choices {
         // Show selectable choices instead of plain compose prompt
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                "Reply ",
-                Style::default()
-                    .fg(app.theme.accent_secondary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "pick an option or press i to compose",
-                Style::default().fg(app.theme.text_secondary),
-            ),
-        ])];
-        for (i, choice) in app.quick_reply_choices.iter().enumerate() {
+        let mut lines = Vec::with_capacity(quick_reply_choices.len());
+        for (i, choice) in quick_reply_choices.iter().enumerate() {
             let num = i + 1;
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1481,10 +1985,6 @@ pub(super) fn draw_thread_chat(
         }
         lines
     } else {
-        let has_queued = app
-            .queued_compose_message
-            .as_ref()
-            .is_some_and(|(tid, _, _)| tid == &thread_ctx.thread.id);
         let compose_text = if compose_focused {
             format!(
                 "> {}",
@@ -1498,74 +1998,48 @@ pub(super) fn draw_thread_chat(
                 msg.clone()
             };
             format!("> {preview}")
-        } else if !app.thread_compose_buffer.is_empty()
+        } else if !workspace_draft.is_empty()
             && app.thread_compose_thread_id.as_deref() == Some(thread_ctx.thread.id.as_str())
         {
-            format!("> {}", app.thread_compose_buffer)
-        } else if session_state == "live" {
+            format!("> {}", workspace_draft)
+        } else if has_live_provider {
             "> Type a message to continue the conversation.".to_string()
+        } else if has_linked_session {
+            "> Type a message here. Press l to continue the thread or Ctrl+O to restore the terminal."
+                .to_string()
         } else {
             "> Type a message here. Press l to continue the thread if no live provider is attached."
                 .to_string()
         };
-        let (reply_label, reply_color) = if has_queued {
-            (
-                "Reply  \u{23F3} queued — Ctrl+C to interrupt and send now",
-                app.theme.status_paused,
-            )
-        } else {
-            (
-                "Reply",
-                if compose_focused {
-                    app.theme.accent_tertiary
-                } else {
-                    app.theme.accent_secondary
-                },
-            )
-        };
-        let mut reply_spans = vec![Span::styled(
-            reply_label,
-            Style::default()
-                .fg(reply_color)
-                .add_modifier(Modifier::BOLD),
-        )];
-        if app.clipboard_has_image {
-            reply_spans.push(Span::styled(
-                "  Ctrl+V to attach image",
-                Style::default()
-                    .fg(app.theme.text_secondary)
-                    .add_modifier(Modifier::DIM),
-            ));
-        }
-        vec![
-            Line::from(reply_spans),
-            Line::from(Span::styled(
-                compose_text,
-                Style::default().fg(if compose_focused || has_queued {
-                    app.theme.text_primary
-                } else {
-                    app.theme.text_secondary
-                }),
-            )),
-        ]
+        vec![Line::from(Span::styled(
+            compose_text,
+            Style::default().fg(if compose_focused || has_queued {
+                app.theme.text_primary
+            } else {
+                app.theme.text_secondary
+            }),
+        ))]
     };
 
     let compose_paragraph = Paragraph::new(compose_lines)
-        .style(app.theme.main_surface())
+        .style(app.theme.card_surface())
         .wrap(Wrap { trim: false });
 
     // Scroll the compose area to keep the cursor visible
-    let total_lines = compose_paragraph.line_count(compose_inner.width) as u16;
-    let visible_lines = compose_inner.height;
+    let total_lines = compose_paragraph.line_count(compose_sections[1].width) as u16;
+    let visible_lines = compose_sections[1].height;
     let compose_scroll = total_lines.saturating_sub(visible_lines);
-    frame.render_widget(compose_paragraph.scroll((compose_scroll, 0)), compose_inner);
+    frame.render_widget(
+        compose_paragraph.scroll((compose_scroll, 0)),
+        compose_sections[1],
+    );
 
     // Slash command autocomplete popup
     if !app.slash_suggestions.is_empty() && compose_focused {
         let popup_height = (app.slash_suggestions.len() as u16 + 1).min(8);
-        let popup_width = 32u16.min(compose_inner.width);
-        let popup_y = compose_inner.y.saturating_sub(popup_height);
-        let popup_area = Rect::new(compose_inner.x, popup_y, popup_width, popup_height);
+        let popup_width = 32u16.min(compose_sections[1].width);
+        let popup_y = compose_sections[1].y.saturating_sub(popup_height);
+        let popup_area = Rect::new(compose_sections[1].x, popup_y, popup_width, popup_height);
 
         frame.render_widget(Clear, popup_area);
         let mut lines: Vec<Line<'_>> = Vec::new();
@@ -1590,7 +2064,33 @@ pub(super) fn draw_thread_chat(
     }
 }
 
-fn build_thread_timeline(app: &App, thread_ctx: &SelectedThreadContext) -> Vec<Line<'static>> {
+fn thread_timeline_cache_key(thread_ctx: &SelectedThreadContext) -> String {
+    let last_message_id = thread_ctx
+        .messages
+        .last()
+        .map_or("", |message| message.id.as_str());
+    let latest_run_id = thread_ctx
+        .latest_run
+        .as_ref()
+        .map_or("", |run| run.id.as_str());
+    let workflow_stage = thread_ctx
+        .workflow_stage
+        .as_ref()
+        .map(|stage| format!("{}:{:?}", stage.stage_name, stage.status))
+        .unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        thread_ctx.thread.id,
+        thread_ctx.message_count,
+        thread_ctx.attachment_count,
+        thread_ctx.run_count,
+        thread_ctx.workflow_stages.len(),
+        last_message_id,
+        latest_run_id,
+    ) + &format!(":{workflow_stage}")
+}
+
+fn build_thread_timeline_base(app: &App, thread_ctx: &SelectedThreadContext) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     if thread_ctx.messages.is_empty() {
@@ -1731,35 +2231,57 @@ fn build_thread_timeline(app: &App, thread_ctx: &SelectedThreadContext) -> Vec<L
                 Style::default().fg(app.theme.text_primary),
             ),
         };
-        lines.push(Line::from(vec![
-            Span::styled(role_label.to_string(), role_style),
-            Span::styled(
-                format!("  {}", compact_timestamp(&message.created_at)),
-                Style::default().fg(app.theme.text_secondary),
-            ),
-        ]));
+        let label_color = role_style.fg.unwrap_or(app.theme.text_secondary);
+        lines.push(transcript_header_line(
+            &app.theme,
+            role_label,
+            label_color,
+            &message.created_at,
+            None,
+            message.id
+                == thread_ctx
+                    .messages
+                    .last()
+                    .map(|m| m.id.as_str())
+                    .unwrap_or(""),
+        ));
         let trimmed = message.content.trim();
         if trimmed.is_empty() {
-            lines.push(Line::from(Span::styled("  ", body_style)));
+            lines.push(transcript_body_line(
+                &app.theme,
+                label_color,
+                "",
+                body_style,
+            ));
         } else {
             for line in trimmed.lines() {
-                let mut spans = vec![Span::raw("  ")];
-                spans.extend(spans_with_urls(line, body_style, app.theme.pr_link));
-                lines.push(Line::from(spans));
+                lines.push(transcript_body_line(
+                    &app.theme,
+                    label_color,
+                    line,
+                    body_style,
+                ));
             }
         }
         if !message.attachments.is_empty() {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("attachments: {}", message.attachments.join(", ")),
-                    Style::default().fg(app.theme.text_secondary),
-                ),
-            ]));
+            lines.push(transcript_meta_line(
+                &app.theme,
+                "attachments",
+                app.theme.status_waiting,
+                &message.attachments.join(", "),
+            ));
         }
         lines.push(Line::from(""));
     }
 
+    lines
+}
+
+fn append_thread_timeline_live_status(
+    app: &App,
+    thread_ctx: &SelectedThreadContext,
+    lines: &mut Vec<Line<'static>>,
+) {
     // Show session status indicator
     if let Some(session_id) = thread_ctx.thread.session_id.as_deref() {
         let session = app.sessions.iter().find(|s| s.id == session_id);
@@ -1829,14 +2351,103 @@ fn build_thread_timeline(app: &App, thread_ctx: &SelectedThreadContext) -> Vec<L
             )));
         }
     }
-
-    lines
 }
 
 fn compact_timestamp(timestamp: &str) -> String {
     let trimmed = timestamp.trim_end_matches('Z');
     let normalized = trimmed.replace('T', " ");
     truncate(&normalized, 16)
+}
+
+const TRANSCRIPT_GUTTER: &str = "  │ ";
+
+fn transcript_header_line(
+    theme: &Theme,
+    label: &str,
+    label_color: ratatui::style::Color,
+    timestamp: &str,
+    detail: Option<(String, Style)>,
+    is_current: bool,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(format!(" {label} "), theme.chip_style(label_color)),
+        Span::raw(" "),
+        Span::styled(
+            compact_timestamp(timestamp),
+            Style::default()
+                .fg(theme.text_secondary)
+                .add_modifier(Modifier::DIM),
+        ),
+    ];
+    if let Some((text, style)) = detail {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(text, style));
+    }
+    if is_current {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            " current ",
+            theme.chip_style(theme.accent_secondary),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn transcript_body_line(
+    theme: &Theme,
+    gutter_color: ratatui::style::Color,
+    text: &str,
+    body_style: Style,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        TRANSCRIPT_GUTTER.to_string(),
+        Style::default().fg(gutter_color),
+    )];
+    spans.extend(spans_with_urls(text, body_style, theme.pr_link));
+    Line::from(spans)
+}
+
+fn transcript_meta_line(
+    theme: &Theme,
+    label: &str,
+    label_color: ratatui::style::Color,
+    text: &str,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label} ",), theme.chip_style(label_color)),
+        Span::raw(" "),
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(theme.text_secondary)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
+}
+
+fn transcript_preview_width(width: u16) -> usize {
+    usize::from(width.saturating_sub(10)).max(24)
+}
+
+fn transcript_preview_lines<'a>(
+    text: &'a str,
+    max_lines: usize,
+    max_width: usize,
+) -> (Vec<Cow<'a, str>>, usize) {
+    let all_lines: Vec<&str> = text.lines().collect();
+    let visible = all_lines
+        .iter()
+        .take(max_lines)
+        .map(|line| {
+            if line.chars().count() > max_width {
+                Cow::Owned(truncate(line, max_width))
+            } else {
+                Cow::Borrowed(*line)
+            }
+        })
+        .collect();
+    let remaining = all_lines.len().saturating_sub(max_lines);
+    (visible, remaining)
 }
 
 static URL_RE: LazyLock<Regex> =
@@ -1888,43 +2499,77 @@ fn thread_source_label(thread: &crate::store::Thread) -> &'static str {
 
 fn thread_session_state(app: &App, thread: &crate::store::Thread) -> &'static str {
     let Some(session_id) = thread.session_id.as_deref() else {
-        return "no session";
+        return "offline";
     };
 
     let session = app.sessions.iter().find(|session| session.id == session_id);
     match session {
         Some(session) if session.closed_at.is_some() => "closed",
         Some(session) => {
-            // Check if a session tab exists and Claude pane is alive
-            let has_live_tab = app.tabs.iter().any(|tab| {
-                matches!(tab, super::super::app::Tab::Session { session_id: sid, terminals, .. }
-                    if sid == session_id
-                    && terminals.with_claude_live_screen(|_| ()).is_some())
+            let live_screen_state = app.tabs.iter().rev().find_map(|tab| {
+                let super::super::app::Tab::Session {
+                    session_id: sid,
+                    terminals,
+                    ..
+                } = tab
+                else {
+                    return None;
+                };
+                if sid != session_id {
+                    return None;
+                }
+                if terminals
+                    .terminal(terminals.claude_pane_id)
+                    .is_none_or(crate::pty::Terminal::exited)
+                {
+                    return None;
+                }
+                terminals.with_claude_live_screen(|screen| {
+                    if screen.contents().trim().is_empty() {
+                        return "offline";
+                    }
+                    let (status, _) = super::super::app::classify_restored_agent_screen(screen);
+                    match status {
+                        crate::store::ClaudeStatus::Idle => "ready",
+                        crate::store::ClaudeStatus::Interrupted => "offline",
+                        crate::store::ClaudeStatus::Working => "working",
+                        crate::store::ClaudeStatus::Done => "done",
+                        crate::store::ClaudeStatus::Error => "error",
+                    }
+                })
             });
+            let Some(live_screen_state) = live_screen_state else {
+                return "offline";
+            };
 
-            if !has_live_tab {
-                // No tab or Claude pane exited
-                return "claude exited";
-            }
-
-            if app.pty_idle_sessions.contains(session_id) {
-                "claude exited"
-            } else if app.paused_sessions.contains(session_id) {
+            if app.paused_sessions.contains(session_id) {
                 "needs approval"
             } else if app.waiting_sessions.contains(session_id) {
-                "waiting for input"
+                "waiting for reply"
+            } else if app.pty_idle_sessions.contains(session_id) {
+                "ready"
             } else {
                 match session.claude_status {
-                    crate::store::ClaudeStatus::Idle => "idle",
-                    crate::store::ClaudeStatus::Working => "working",
+                    crate::store::ClaudeStatus::Idle => "ready",
+                    crate::store::ClaudeStatus::Working => live_screen_state,
                     crate::store::ClaudeStatus::Interrupted => "interrupted",
                     crate::store::ClaudeStatus::Done => "done",
                     crate::store::ClaudeStatus::Error => "error",
                 }
             }
         }
-        None => "no session",
+        None => "offline",
     }
+}
+
+fn thread_has_live_provider(app: &App, thread: &crate::store::Thread) -> bool {
+    let Some(session_id) = thread.session_id.as_deref() else {
+        return false;
+    };
+
+    app.session_has_live_claude_provider(session_id)
+        || (app.session_has_usable_claude_pane(session_id)
+            && app.pty_idle_sessions.contains(session_id))
 }
 
 fn draw_agents_view(frame: &mut Frame, app: &App, area: Rect) {
@@ -2817,6 +3462,7 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
                 )));
             } else {
                 let selected_idx = app.settings_workflow_index;
+                let selected_stage_idx = app.settings_workflow_stage_index;
                 for (i, def) in workflow_defs.iter().enumerate() {
                     let is_selected = i == selected_idx;
                     let scope_label = match def.scope.as_str() {
@@ -2863,6 +3509,7 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
                                     .add_modifier(Modifier::BOLD),
                             )));
                             for (si, stage) in def.stages.iter().enumerate() {
+                                let stage_selected = si == selected_stage_idx;
                                 let gate_marker = if stage.gate.is_some() {
                                     " \u{23F8}"
                                 } else {
@@ -2880,19 +3527,29 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
                                         }
                                     })
                                     .unwrap_or_default();
+                                let marker = if stage_selected { "\u{25B8}" } else { " " };
+                                let stage_name_style = if stage_selected {
+                                    Style::default()
+                                        .fg(theme.accent_primary)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(theme.accent_tertiary)
+                                };
+                                let provider_style = if stage_selected {
+                                    Style::default().fg(theme.accent_secondary)
+                                } else {
+                                    Style::default().fg(theme.text_secondary)
+                                };
                                 lines.push(Line::from(vec![
                                     Span::styled(
-                                        format!("    {}. ", si + 1),
+                                        format!("   {marker} {}. ", si + 1),
                                         Style::default().fg(theme.text_secondary),
                                     ),
                                     Span::styled(
                                         format!("{}{gate_marker}", stage.name),
-                                        Style::default().fg(theme.accent_tertiary),
+                                        stage_name_style,
                                     ),
-                                    Span::styled(
-                                        format!("  [{provider}]"),
-                                        Style::default().fg(theme.text_secondary),
-                                    ),
+                                    Span::styled(format!("  [{provider}]"), provider_style),
                                     Span::styled(
                                         prompt_hint,
                                         Style::default().fg(theme.text_secondary),
@@ -2910,11 +3567,15 @@ fn draw_settings_detail(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled("[n]", key_s),
                 Span::styled(" New  ", dim),
                 Span::styled("[e]", key_s),
-                Span::styled(" Edit name  ", dim),
+                Span::styled(" Rename  ", dim),
                 Span::styled("[d]", key_s),
                 Span::styled(" Delete  ", dim),
                 Span::styled("[j/k]", key_s),
-                Span::styled(" Navigate", dim),
+                Span::styled(" Workflow  ", dim),
+                Span::styled("[J/K]", key_s),
+                Span::styled(" Stage  ", dim),
+                Span::styled("[a/A]", key_s),
+                Span::styled(" Agent", dim),
             ]));
         }
         SettingsSection::General => {
@@ -2977,6 +3638,12 @@ pub(super) fn draw_inspector(
     selected_review_item: Option<&ReviewQueueItem>,
     thread_ctx: Option<&SelectedThreadContext>,
 ) {
+    if let Some(ctx) = thread_ctx {
+        app.initialize_thread_workspace(&ctx.thread);
+    }
+    let thread_id = thread_ctx.map(|ctx| ctx.thread.id.as_str());
+    let inspector_tab = app.thread_inspector_tab(thread_id);
+    let inspector_scroll = app.thread_inspector_scroll(thread_id);
     let block = Block::default()
         .title(" Inspector ")
         .borders(Borders::ALL)
@@ -3032,7 +3699,7 @@ pub(super) fn draw_inspector(
     let tabs = InspectorTab::ALL
         .iter()
         .map(|tab| {
-            let style = if *tab == app.inspector_tab {
+            let style = if *tab == inspector_tab {
                 app.theme.chip_style(app.theme.tab_active)
             } else {
                 Style::default().fg(app.theme.text_secondary)
@@ -3054,35 +3721,35 @@ pub(super) fn draw_inspector(
     };
 
     // Diff and Runtime tabs get special styled rendering; other tabs use plain or markdown text
-    if app.inspector_tab == InspectorTab::Diff {
+    if inspector_tab == InspectorTab::Diff {
         let max_lines = if app.inspector_expanded { 2000 } else { 180 };
         let raw = diff_content_with_limit(app, selected_review_item, thread_ctx, max_lines);
         let styled = super::overlays::styled_diff_lines(&raw, &app.theme);
         frame.render_widget(
             Paragraph::new(styled)
                 .style(app.theme.inspector_surface())
-                .scroll((app.inspector_scroll, 0)),
+                .scroll((inspector_scroll, 0)),
             content_area,
         );
-    } else if app.inspector_tab == InspectorTab::Runtime {
+    } else if inspector_tab == InspectorTab::Runtime {
         let styled = styled_runtime_lines(selected_review_item, thread_ctx, &app.theme);
         frame.render_widget(
             Paragraph::new(styled)
                 .style(app.theme.inspector_surface())
-                .scroll((app.inspector_scroll, 0)),
+                .scroll((inspector_scroll, 0)),
             content_area,
         );
-    } else if app.inspector_tab == InspectorTab::Plan {
+    } else if inspector_tab == InspectorTab::Plan {
         let styled = styled_plan_lines(selected_review_item, thread_ctx, &app.theme);
         frame.render_widget(
             Paragraph::new(styled)
                 .style(app.theme.inspector_surface())
                 .wrap(Wrap { trim: false })
-                .scroll((app.inspector_scroll, 0)),
+                .scroll((inspector_scroll, 0)),
             content_area,
         );
     } else {
-        let content = match app.inspector_tab {
+        let content = match inspector_tab {
             InspectorTab::Issue => issue_content(
                 selected_task,
                 selected_board_item,
@@ -3094,26 +3761,119 @@ pub(super) fn draw_inspector(
             InspectorTab::Attachments => attachments_content(thread_ctx),
             InspectorTab::Diff | InspectorTab::Runtime | InspectorTab::Plan => unreachable!(),
         };
-        match app.inspector_tab {
+        match inspector_tab {
             InspectorTab::Issue => frame.render_widget(
                 Paragraph::new(markdown_from_str(&content))
                     .style(app.theme.inspector_surface())
                     .wrap(Wrap { trim: false })
-                    .scroll((app.inspector_scroll, 0)),
+                    .scroll((inspector_scroll, 0)),
                 content_area,
             ),
             _ => frame.render_widget(
                 Paragraph::new(content)
                     .style(app.theme.inspector_surface())
                     .wrap(Wrap { trim: false })
-                    .scroll((app.inspector_scroll, 0)),
+                    .scroll((inspector_scroll, 0)),
                 content_area,
             ),
         }
     }
 
+    let render_cache = capture_inspector_render_cache(frame, content_area);
+    if let Some(selection) = thread_id
+        .and_then(|id| {
+            app.thread_workspace(id)
+                .and_then(|workspace| workspace.inspector_selection)
+        })
+        .or(app.inspector_selection)
+    {
+        apply_inspector_selection_overlay(frame, &render_cache, selection, &app.theme);
+    }
+    if let Some(thread_id) = thread_id {
+        app.ensure_thread_workspace(thread_id)
+            .inspector_render_cache = Some(render_cache);
+    } else {
+        app.inspector_render_cache = Some(render_cache);
+    }
+
     let token_usage = selected_task.map(|t| (t.input_tokens, t.output_tokens));
     draw_usage_bars(frame, app, sections[3], token_usage);
+}
+
+fn capture_inspector_render_cache(frame: &mut Frame, area: Rect) -> InspectorRenderCache {
+    let mut lines = Vec::with_capacity(area.height as usize);
+    {
+        let buffer = frame.buffer_mut();
+        for y in area.y..area.y.saturating_add(area.height) {
+            let mut line = String::new();
+            for x in area.x..area.x.saturating_add(area.width) {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+    }
+
+    let mut links = Vec::new();
+    for (row_idx, line) in lines.iter().enumerate() {
+        for matched in INSPECTOR_URL_RE.find_iter(line) {
+            let start_col = u16::try_from(line[..matched.start()].chars().count()).unwrap_or(0);
+            let end_col = u16::try_from(line[..matched.end()].chars().count()).unwrap_or(start_col);
+            links.push(InspectorLinkHit {
+                row: row_idx as u16,
+                start_col,
+                end_col,
+                url: matched.as_str().to_string(),
+            });
+        }
+    }
+
+    InspectorRenderCache { area, lines, links }
+}
+
+fn apply_inspector_selection_overlay(
+    frame: &mut Frame,
+    cache: &InspectorRenderCache,
+    selection: super::super::app::InspectorSelection,
+    theme: &Theme,
+) {
+    let ((start_row, start_col), (end_row, end_col)) = selection.normalized();
+    if start_row == end_row && start_col == end_col {
+        return;
+    }
+    if cache.area.width == 0 || cache.area.height == 0 {
+        return;
+    }
+
+    let selection_style = theme.selected_fill();
+    let max_row = cache.area.height.saturating_sub(1);
+    let start_row = start_row.min(max_row);
+    let end_row = end_row.min(max_row);
+
+    let buffer = frame.buffer_mut();
+    for rel_row in start_row..=end_row {
+        let row_idx = usize::from(rel_row);
+        let line_len = cache
+            .lines
+            .get(row_idx)
+            .map_or(0usize, |line| line.chars().count());
+        let line_len_u16 = u16::try_from(line_len).unwrap_or(u16::MAX);
+        let range_start = if rel_row == start_row { start_col } else { 0 };
+        let range_end = if rel_row == end_row {
+            end_col
+        } else {
+            line_len_u16.max(cache.area.width)
+        };
+        let range_end = range_end.min(cache.area.width);
+        if range_start >= range_end {
+            continue;
+        }
+
+        let y = cache.area.y.saturating_add(rel_row);
+        for rel_col in range_start..range_end {
+            let x = cache.area.x.saturating_add(rel_col);
+            buffer[(x, y)].set_style(selection_style);
+        }
+    }
 }
 
 fn issue_content(
@@ -3894,9 +4654,10 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 format!(
-                    " launch: {} via {} ",
+                    " launch: {} via {}  ·  {} ",
                     draft.source_label(),
-                    draft.provider_kind
+                    draft.provider_kind,
+                    draft.launch_result_label()
                 ),
                 Style::default()
                     .fg(app.theme.text_secondary)
@@ -4060,6 +4821,27 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.show_shortcuts_bar {
+        let compact = match app.input_mode {
+            InputMode::LaunchThread => " Enter:launch  Esc:cancel  ?:shortcuts  F1:help ",
+            InputMode::ThreadProviderPicker => {
+                " Enter:switch provider  Esc:cancel  ?:shortcuts  F1:help "
+            }
+            InputMode::ProjectPicker => " Enter:switch repo  Esc:cancel  ?:shortcuts  F1:help ",
+            InputMode::ThreadCompose => " Enter:send  Esc:keep draft  ?:shortcuts  F1:help ",
+            InputMode::HelpOverlay => " Esc:close help  ?:shortcuts  F1:help ",
+            _ => " ?:shortcuts  F1:help ",
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                compact,
+                Style::default().fg(app.theme.text_secondary),
+            )),
+            area,
+        );
+        return;
+    }
+
     let show_inspector = workbench_uses_persistent_inspector(app.workbench_view);
     let hints = if app.input_mode == InputMode::LaunchThread {
         " Tab:next field  Shift+Tab:prev  h/l:provider  type:add context  Ctrl+V:paste image  Enter:launch  Esc:cancel "
@@ -4068,7 +4850,7 @@ fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input_mode == InputMode::ProjectPicker {
         " j/k:choose repository  Enter:switch repo  Esc:cancel "
     } else if app.input_mode == InputMode::ThreadCompose {
-        " 1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  type:message  Ctrl+V:paste image  Enter:send  Esc:keep draft  o:terminal  Tab:cycle focus "
+        " 1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  type:message  j/k:scroll when empty  Ctrl+G:bottom  Ctrl+V:paste image  Enter:send  Esc:keep draft  Ctrl+O:terminal  Ctrl+E:editor  Tab:cycle focus "
     } else if app.workbench_view == WorkbenchView::SprintBoard
         && matches!(
             app.input_mode,
@@ -4087,9 +4869,9 @@ fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     } else if app.workbench_view == WorkbenchView::Threads && app.focus == Focus::Tasks {
-        " SPC:view  1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  j/k:thread  type:message  m:provider  l/Enter:continue thread  o:terminal  n:new ad hoc thread  Tab:cycle focus "
+        " SPC:view  1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  j/k:thread  type:message  m:provider  l/Enter:continue thread  R:fresh session  Ctrl+O:terminal  Ctrl+E:editor  n:new ad hoc thread  Tab:cycle focus "
     } else if app.workbench_view == WorkbenchView::Reviews && app.focus == Focus::Tasks {
-        " SPC:view  1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  j/k:pr  t:queue  v:drawer  l:launch/focus thread  Enter:open/focus thread  o:open PR  Tab:cycle focus "
+        " SPC:view  1:sidebar  2:main  3:inspect  [ / ]:resize  p:repo  j/k:pr  t:queue  v:drawer  l:launch/focus thread  R:fresh session  Enter:open/focus thread  o:open PR  Ctrl+O:terminal  Ctrl+E:editor  Tab:cycle focus "
     } else if app.workbench_view == WorkbenchView::Reviews && app.focus == Focus::Inspector {
         if app.inspector_expanded {
             " 1-6:tab  j/k:scroll  f:collapse  v:drawer  Esc:collapse  Tab:cycle focus "
@@ -4097,7 +4879,7 @@ fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
             " 1-6:tab  j/k:scroll  f:expand  v:drawer  Tab:cycle focus "
         }
     } else if matches!(app.workbench_view, WorkbenchView::MyTasks) && app.focus == Focus::Tasks {
-        " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  p:repo  j/k:navigate  Enter/v:details  l:launch/focus thread  N:new session  R:sync GitHub  Tab:cycle focus "
+        " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  p:repo  j/k:navigate  Enter/v:details  l:launch/focus thread  Ctrl+O:terminal  Ctrl+E:editor  N:new session  R:sync GitHub  Tab:cycle focus "
     } else if app.workbench_view == WorkbenchView::Settings && app.focus == Focus::Tasks {
         match SettingsSection::ALL
             .get(app.settings_section_index)
@@ -4127,7 +4909,7 @@ fn draw_hint_line(frame: &mut Frame, app: &App, area: Rect) {
                 " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  Enter/i:interval  p:prompt  Tab:cycle focus "
             }
             SettingsSection::Workflows => {
-                " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  J/K:workflow  n:new  e:edit  d:delete  Tab:cycle focus "
+                " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  H/L:section  j/k:workflow  J/K:stage  a/A:agent  n:new  e:rename  d:delete  Tab:cycle focus "
             }
             SettingsSection::Sandbox => {
                 " SPC:view  1:sidebar  2:main  [ / ]:resize sidebar  P:repo  j/k:section  Enter/p:profile  s:path  a:attachments  Tab:cycle focus "
@@ -4318,24 +5100,226 @@ fn truncate(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Format a character count with K/M suffixes.
+fn format_char_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Convert a syntect `Style` to a ratatui `Style`.
+fn syntect_style_to_ratatui(style: &syntect::highlighting::Style) -> Style {
+    let fg = ratatui::style::Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+    let mut ratatui_style = Style::default().fg(fg);
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::BOLD)
+    {
+        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+    }
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::ITALIC)
+    {
+        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+    }
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::UNDERLINE)
+    {
+        ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
+    }
+    ratatui_style
+}
+
+/// Syntax-highlight a code block and produce boxed lines.
+///
+/// Renders as:
+/// ```text
+///   +-- language -----------
+///   | highlighted code ...
+///   +-----------------------
+/// ```
+fn highlight_code_block(lang: &str, code: &str, theme: &Theme, lines: &mut Vec<Line<'static>>) {
+    let (ss, syn_theme) = &*SYNTAX_HIGHLIGHT;
+
+    let border_color = theme.border_unfocused;
+    let lang_display = if lang.is_empty() { "code" } else { lang };
+
+    // Top border
+    lines.push(Line::from(vec![
+        Span::styled(
+            TRANSCRIPT_GUTTER.to_string(),
+            Style::default().fg(border_color),
+        ),
+        Span::styled(
+            format!("\u{256d}\u{2500} {lang_display} "),
+            Style::default().fg(border_color),
+        ),
+        Span::styled("\u{2500}".repeat(40), Style::default().fg(border_color)),
+    ]));
+
+    let syntax = ss
+        .find_syntax_by_token(lang)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut highlighter = syntect::easy::HighlightLines::new(syntax, syn_theme);
+
+    for code_line in code.lines() {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            TRANSCRIPT_GUTTER.to_string(),
+            Style::default().fg(border_color),
+        )];
+        spans.push(Span::styled(
+            "\u{2502} ".to_string(),
+            Style::default().fg(border_color),
+        ));
+
+        // Highlight the line — if highlighting fails, fall back to plain text.
+        if let Ok(highlighted) = highlighter.highlight_line(code_line, ss) {
+            for (style, text) in highlighted {
+                spans.push(Span::styled(
+                    text.to_string(),
+                    syntect_style_to_ratatui(&style),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(
+                code_line.to_string(),
+                Style::default().fg(theme.text_primary),
+            ));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    // Bottom border
+    lines.push(Line::from(vec![
+        Span::styled(
+            TRANSCRIPT_GUTTER.to_string(),
+            Style::default().fg(border_color),
+        ),
+        Span::styled(
+            format!("\u{2570}{}", "\u{2500}".repeat(44)),
+            Style::default().fg(border_color),
+        ),
+    ]));
+}
+
+/// Render assistant text with markdown awareness and syntax-highlighted code blocks.
+///
+/// Splits the text on fenced code blocks (```lang ... ```), rendering:
+/// - Non-code sections via `tui_markdown::from_str` with 2-space indent
+/// - Code blocks via syntect highlighting in a bordered box
+fn render_assistant_text(text: &str, theme: &Theme, lines: &mut Vec<Line<'static>>) {
+    // Split on fenced code blocks: ```lang\n...\n```
+    // We walk through the text character by character, looking for ``` markers.
+    let mut segments: Vec<(&str, Option<&str>)> = Vec::new(); // (content, Some(lang) for code)
+    let mut rest = text;
+
+    while let Some(fence_start) = rest.find("```") {
+        // Everything before the fence is prose.
+        let before = &rest[..fence_start];
+        if !before.is_empty() {
+            segments.push((before, None));
+        }
+
+        // Find the language tag (text between ``` and the next newline).
+        let after_fence = &rest[fence_start + 3..];
+        let lang_end = after_fence.find('\n').unwrap_or(after_fence.len());
+        let lang = after_fence[..lang_end].trim();
+
+        // Find the closing fence.
+        let code_start_offset = if lang_end < after_fence.len() {
+            lang_end + 1
+        } else {
+            lang_end
+        };
+        let code_body = &after_fence[code_start_offset..];
+
+        if let Some(close_pos) = code_body.find("```") {
+            let code = &code_body[..close_pos];
+            // Strip trailing newline from code if present.
+            let code = code.strip_suffix('\n').unwrap_or(code);
+            segments.push((code, Some(lang)));
+            // Advance past the closing fence.
+            let skip_after_close = &code_body[close_pos + 3..];
+            // Skip a trailing newline after the closing fence.
+            rest = skip_after_close
+                .strip_prefix('\n')
+                .unwrap_or(skip_after_close);
+        } else {
+            // No closing fence — treat the rest as a code block.
+            let code = code_body.strip_suffix('\n').unwrap_or(code_body);
+            segments.push((code, Some(lang)));
+            rest = "";
+        }
+    }
+
+    // Remaining text after the last code block.
+    if !rest.is_empty() {
+        segments.push((rest, None));
+    }
+
+    // If no segments were found (empty text), nothing to render.
+    if segments.is_empty() {
+        return;
+    }
+
+    for (content, lang) in &segments {
+        if let Some(lang) = lang {
+            // Code block — syntax highlight.
+            highlight_code_block(lang, content, theme, lines);
+        } else {
+            // Prose — render via tui_markdown and indent each line.
+            // We must convert to owned spans since markdown_from_str borrows.
+            let owned_content = (*content).to_string();
+            let md_lines = markdown_from_str(&owned_content);
+            for md_line in md_lines {
+                let mut indented_spans: Vec<Span<'static>> =
+                    Vec::with_capacity(md_line.spans.len() + 1);
+                indented_spans.push(Span::styled(
+                    TRANSCRIPT_GUTTER.to_string(),
+                    Style::default().fg(theme.border_unfocused),
+                ));
+                for span in md_line.spans {
+                    // Convert borrowed spans to owned.
+                    indented_spans.push(Span::styled(span.content.to_string(), span.style));
+                }
+                lines.push(Line::from(indented_spans));
+            }
+        }
+    }
+}
+
 /// Build renderable lines from JSONL conversation entries.
 ///
 /// Each entry type gets a distinct visual treatment using the theme palette:
 /// - User messages: accent left bar, bold first line, dim timestamp
-/// - Assistant text: body text in normal color, dim separator with timestamp
+/// - Assistant text: markdown-rendered with syntax-highlighted code blocks
 /// - Tool use: individual lines with status icon (completed/in-progress)
 /// - Tool result: bordered output preview (first 8 lines, rest collapsed)
-/// - Thinking: hidden (too noisy)
-/// - Turn end: flushes any remaining pending state
+/// - Thinking: dim italic indicator with character count
+/// - Turn end: dim token usage summary (input/output)
 pub(super) fn build_jsonl_conversation_lines(
     entries: &[crate::conversation::ConversationEntry],
     theme: &Theme,
-    _width: u16,
+    width: u16,
 ) -> Vec<Line<'static>> {
     use crate::conversation::ConversationEntry;
 
-    /// Maximum visible output lines for a tool result box before collapsing.
-    const TOOL_RESULT_MAX_LINES: usize = 8;
+    let tool_result_max_lines = if width < 90 {
+        4
+    } else if width < 130 {
+        6
+    } else {
+        8
+    };
+    let preview_width = transcript_preview_width(width);
 
     // Pre-compute which tool_use_ids have a matching ToolResult so we can show
     // completed vs in-progress status icons.
@@ -4361,69 +5345,65 @@ pub(super) fn build_jsonl_conversation_lines(
         }
     });
 
+    let current_entry_index = entries.iter().rposition(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::UserMessage { .. }
+                | ConversationEntry::AssistantText { .. }
+                | ConversationEntry::ToolUse { .. }
+                | ConversationEntry::ToolResult { .. }
+        )
+    });
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for entry in entries {
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let is_current = current_entry_index == Some(entry_index);
         match entry {
             ConversationEntry::UserMessage { timestamp, text } => {
-                // Separator before user message
                 if !lines.is_empty() {
                     lines.push(Line::from(""));
                 }
-                // First line with accent left bar + bold text
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "\u{258e} ".to_string(),
-                        Style::default().fg(theme.accent_primary),
-                    ),
-                    Span::styled(
-                        text.lines().next().unwrap_or("").to_string(),
-                        Style::default()
-                            .fg(theme.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                // Additional lines of user message with left bar
-                for line in text.lines().skip(1) {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "\u{258e} ".to_string(),
-                            Style::default().fg(theme.accent_primary),
-                        ),
-                        Span::styled(line.to_string(), Style::default().fg(theme.text_primary)),
-                    ]));
+                lines.push(transcript_header_line(
+                    theme,
+                    "You",
+                    theme.accent_primary,
+                    timestamp,
+                    None,
+                    is_current,
+                ));
+                for line in text.lines() {
+                    lines.push(transcript_body_line(
+                        theme,
+                        theme.accent_primary,
+                        line,
+                        Style::default().fg(theme.text_primary),
+                    ));
                 }
-                // Timestamp on separate dim line
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", compact_timestamp(timestamp)),
-                    Style::default()
-                        .fg(theme.text_secondary)
-                        .add_modifier(Modifier::DIM),
-                )));
             }
 
             ConversationEntry::AssistantText { timestamp, text } => {
-                lines.push(Line::from(""));
-                // Agent response text — no label, just the content
-                for line in text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(theme.text_primary),
-                    )));
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
                 }
-                // Separator: "◇ Claude via Anthropic · timestamp"
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  \u{25c7} Claude via Anthropic \u{00b7} {}",
-                        compact_timestamp(timestamp)
-                    ),
-                    Style::default()
-                        .fg(theme.text_secondary)
-                        .add_modifier(Modifier::DIM),
-                )));
+                lines.push(transcript_header_line(
+                    theme,
+                    "Claude",
+                    theme.accent_tertiary,
+                    timestamp,
+                    Some((
+                        "assistant response".to_string(),
+                        Style::default()
+                            .fg(theme.text_secondary)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    is_current,
+                ));
+                render_assistant_text(text, theme, &mut lines);
             }
 
             ConversationEntry::ToolUse {
+                timestamp,
                 tool_name,
                 description,
                 tool_use_id,
@@ -4440,24 +5420,43 @@ pub(super) fn build_jsonl_conversation_lines(
                 } else {
                     ("\u{25cb}".to_string(), theme.text_secondary) // ○ dim
                 };
+                let status_label = if is_completed {
+                    "done"
+                } else if is_in_progress {
+                    "running"
+                } else {
+                    "queued"
+                };
 
-                // Show each tool call on its own line with status icon
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {icon_str} "), Style::default().fg(icon_color)),
-                    Span::styled(
-                        tool_name.clone(),
+                lines.push(transcript_header_line(
+                    theme,
+                    "Tool",
+                    icon_color,
+                    timestamp,
+                    Some((
+                        format!("{icon_str} {tool_name}"),
                         Style::default()
                             .fg(theme.text_primary)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {description}"),
-                        Style::default().fg(theme.text_secondary),
-                    ),
-                ]));
+                    )),
+                    is_current,
+                ));
+                lines.push(transcript_meta_line(
+                    theme,
+                    "status",
+                    icon_color,
+                    status_label,
+                ));
+                lines.push(transcript_body_line(
+                    theme,
+                    icon_color,
+                    description,
+                    Style::default().fg(theme.text_secondary),
+                ));
             }
 
             ConversationEntry::ToolResult {
+                timestamp,
                 is_error,
                 output_preview,
                 ..
@@ -4466,50 +5465,82 @@ pub(super) fn build_jsonl_conversation_lines(
                     continue;
                 }
 
-                let border_color = if *is_error {
+                let result_color = if *is_error {
                     theme.status_error
                 } else {
-                    theme.border_unfocused
+                    theme.status_done
                 };
-                let text_color = if *is_error {
-                    theme.status_error
-                } else {
-                    theme.text_secondary
-                };
-
-                let output_lines: Vec<&str> = output_preview.lines().collect();
-                let visible = output_lines.len().min(TOOL_RESULT_MAX_LINES);
-                for line in &output_lines[..visible] {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "    \u{2502} ".to_string(),
-                            Style::default().fg(border_color),
+                let (preview_lines, remaining) =
+                    transcript_preview_lines(output_preview, tool_result_max_lines, preview_width);
+                lines.push(transcript_header_line(
+                    theme,
+                    if *is_error { "Error" } else { "Result" },
+                    result_color,
+                    timestamp,
+                    Some((
+                        format!(
+                            "preview {}/{} lines",
+                            preview_lines.len(),
+                            output_preview.lines().count()
                         ),
-                        Span::styled(
-                            (*line).to_string(),
-                            Style::default().fg(text_color).add_modifier(Modifier::DIM),
-                        ),
-                    ]));
+                        Style::default()
+                            .fg(theme.text_secondary)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    is_current,
+                ));
+                for line in preview_lines {
+                    lines.push(transcript_body_line(
+                        theme,
+                        result_color,
+                        line.as_ref(),
+                        Style::default()
+                            .fg(if *is_error {
+                                theme.status_error
+                            } else {
+                                theme.text_secondary
+                            })
+                            .add_modifier(Modifier::DIM),
+                    ));
                 }
-                let remaining = output_lines.len().saturating_sub(TOOL_RESULT_MAX_LINES);
                 if remaining > 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "    \u{2502} ".to_string(),
-                            Style::default().fg(border_color),
-                        ),
-                        Span::styled(
-                            format!("({remaining} more lines)"),
-                            Style::default()
-                                .fg(theme.text_secondary)
-                                .add_modifier(Modifier::DIM),
-                        ),
-                    ]));
+                    lines.push(transcript_meta_line(
+                        theme,
+                        "more",
+                        theme.text_secondary,
+                        &format!("{remaining} more lines hidden — Ctrl+O for full output"),
+                    ));
                 }
             }
 
-            // Thinking and TurnEnd produce no visual output.
-            ConversationEntry::Thinking { .. } | ConversationEntry::TurnEnd { .. } => {}
+            ConversationEntry::Thinking {
+                timestamp,
+                char_count,
+            } => {
+                if *char_count > 0 {
+                    lines.push(transcript_header_line(
+                        theme,
+                        "Thinking",
+                        theme.text_secondary,
+                        timestamp,
+                        Some((
+                            format!("{} chars", format_char_count(*char_count)),
+                            Style::default()
+                                .fg(theme.text_secondary)
+                                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                        )),
+                        false,
+                    ));
+                }
+            }
+
+            ConversationEntry::TurnEnd {
+                timestamp,
+                input_tokens,
+                output_tokens,
+            } => {
+                let _ = (timestamp, input_tokens, output_tokens);
+            }
         }
     }
 

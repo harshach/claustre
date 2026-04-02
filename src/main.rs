@@ -189,8 +189,6 @@ enum Commands {
     Update,
     /// Roll back to the previous binary version after a bad auto-update
     Rollback,
-    /// Launch the native macOS desktop app
-    App,
 }
 
 #[derive(Subcommand)]
@@ -711,32 +709,6 @@ fn main() -> Result<()> {
         }
         Commands::Update => update::run_update(),
         Commands::Rollback => update::rollback(),
-        Commands::App => {
-            // Look for claustre-app binary next to this binary or in PATH
-            let app_binary = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|p| p.join("claustre-app")))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| std::path::PathBuf::from("claustre-app"));
-
-            let status = std::process::Command::new(&app_binary)
-                .status()
-                .with_context(|| {
-                    format!(
-                        "failed to launch claustre-app at '{}'. \
-                         Build it with: cd app && cargo tauri build",
-                        app_binary.display()
-                    )
-                })?;
-
-            if !status.success() {
-                anyhow::bail!(
-                    "claustre-app exited with status {}",
-                    status.code().unwrap_or(-1)
-                );
-            }
-            Ok(())
-        }
         Commands::Dashboard => {
             // Auto-update before opening TUI (if configured)
             let cfg = config::load().unwrap_or_default();

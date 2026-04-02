@@ -210,6 +210,9 @@ impl App {
     pub(super) fn maybe_poll_update_check(&mut self) {
         const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+        if !self.config.auto_update {
+            return;
+        }
         if self.updated_version.is_some() || self.available_version.is_some() {
             return;
         }
@@ -637,49 +640,42 @@ impl App {
                     if let Some(setup) = session_setup {
                         let sid = setup.session.id.clone();
                         self.spawn_session_tab(setup);
-                        // goto_session_tab also sets Conversation view mode
                         let _ = self.goto_session_tab(&sid);
+                        self.active_tab = 0;
                     }
 
-                    // Step 2: ensure we're on a session tab — try every
-                    // strategy until one works.
-                    if self.active_session_id().is_none() {
-                        // Get a fresh session_id from the DB (the thread object
-                        // from the background thread may be stale).
-                        let fresh_sid = self
-                            .store
-                            .get_thread(&thread.id)
-                            .ok()
-                            .and_then(|t| t.session_id)
-                            .or_else(|| thread.session_id.clone());
-                        if let Some(ref sid) = fresh_sid {
-                            if !self.goto_session_tab(sid) {
-                                if let Ok(session) = self.store.get_session(sid)
-                                    && session.closed_at.is_none()
-                                {
-                                    if self.restore_session_tab(&session).is_ok() {
-                                        let _ = self.goto_session_tab(sid);
-                                    }
-                                }
-                            }
+                    // Step 2: ensure a live session tab exists behind the scenes
+                    // so the thread workspace can reopen terminal/editor on demand.
+                    let fresh_sid = self
+                        .store
+                        .get_thread(&thread.id)
+                        .ok()
+                        .and_then(|t| t.session_id)
+                        .or_else(|| thread.session_id.clone());
+                    if let Some(ref sid) = fresh_sid {
+                        let has_live_session = self
+                            .tabs
+                            .iter()
+                            .any(|tab| matches!(tab, super::Tab::Session { session_id, .. } if session_id == sid));
+                        if !has_live_session
+                            && let Ok(session) = self.store.get_session(sid)
+                            && session.closed_at.is_none()
+                        {
+                            let _ = self.restore_session_tab(&session);
                         }
                     }
 
-                    // Step 3: absolute last resort — switch to most recent tab
-                    if self.active_session_id().is_none() && self.tabs.len() > 1 {
-                        self.active_tab = self.tabs.len() - 1;
-                    }
-
-                    let switched = self.active_session_id().is_some();
+                    // Step 3: land in the native thread workspace first.
+                    let switched = self.select_thread_workspace(&thread.id);
                     if switched {
                         self.show_toast(
-                            format!("Thread launched via {}", thread.provider_kind),
+                            format!("Opened thread workspace via {}", thread.provider_kind),
                             ToastStyle::Success,
                         );
                     } else {
                         self.show_toast(
                             format!(
-                                "Thread launched via {} (no session tab — press Ctrl+K/J to find it)",
+                                "Thread launched via {} (workspace selection failed — press Space+h to open Threads)",
                                 thread.provider_kind
                             ),
                             ToastStyle::Info,

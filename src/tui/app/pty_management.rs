@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::store::TaskStatus;
 
 use super::{
-    App, InputMode, Tab, ToastStyle, compute_pane_sizes_for_resize, screen_shows_idle_prompt,
-    screen_shows_permission_prompt, screen_shows_question_prompt,
+    App, InputMode, SessionTabView, Tab, ToastStyle, compute_pane_sizes_for_resize,
+    screen_shows_idle_prompt, screen_shows_permission_prompt, screen_shows_question_prompt,
 };
 
 enum PtyDetectedState {
@@ -13,7 +13,36 @@ enum PtyDetectedState {
     Idle,
 }
 
+pub(super) fn classify_restored_claude_status(
+    terminals: &crate::pty::SessionTerminals,
+) -> Option<(crate::store::ClaudeStatus, &'static str)> {
+    terminals.with_claude_live_screen(super::classify_restored_agent_screen)
+}
+
 impl App {
+    pub(super) fn active_session_shows_conversation(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active_tab),
+            Some(Tab::Session {
+                view_mode: SessionTabView::Conversation,
+                ..
+            })
+        )
+    }
+
+    fn active_session_needs_editor_surface(&self, view_mode: SessionTabView) -> bool {
+        matches!(view_mode, SessionTabView::Editor)
+    }
+
+    /// Whether the user is typing in a compose/text-input field.
+    /// Used by the event loop to skip expensive PTY processing during typing.
+    pub(super) fn is_compose_input_mode(&self) -> bool {
+        matches!(
+            self.input_mode,
+            InputMode::ThreadCompose | InputMode::CommentCompose
+        )
+    }
+
     /// Restore a session tab for an active session whose PTY was lost (e.g. after
     /// Claustre was closed and reopened). If a session-host is still running,
     /// reconnects via `RemoteTerminal`; otherwise spawns a new session-host.
@@ -21,7 +50,7 @@ impl App {
         let worktree = std::path::Path::new(&session.worktree_path);
         if !worktree.exists() {
             self.show_toast("Worktree no longer exists on disk", ToastStyle::Error);
-            return Ok(());
+            bail!("worktree no longer exists on disk");
         }
 
         let linked_task = self
@@ -90,10 +119,11 @@ impl App {
 
         let sizes = compute_pane_sizes_for_resize(&terminals.layout, term_size.0, term_size.1);
         let _ = terminals.resize_panes_with_clear(&sizes);
+        let restored_session_status = classify_restored_claude_status(&terminals);
         let label = session.tab_label.clone();
-        self.add_session_tab(session.id.clone(), Box::new(terminals), label);
-        // Switch to the newly added tab
-        self.active_tab = self.tabs.len() - 1;
+        let tab_idx = self.add_session_tab(session.id.clone(), Box::new(terminals), label);
+        // Switch to the restored canonical tab.
+        self.active_tab = tab_idx;
 
         // Restore session + task status based on task state
         if let Some(task) = self.tasks.iter().find(|t| {
@@ -132,13 +162,14 @@ impl App {
             )?;
         } else if session.claude_status == crate::store::ClaudeStatus::Interrupted {
             // Only override status when recovering from a crash (interrupted).
-            // Otherwise preserve the current DB status (e.g. Idle set by
-            // the Notification hook).
-            self.store.update_session_status(
-                &session.id,
-                crate::store::ClaudeStatus::Working,
-                "Restored",
-            )?;
+            // Otherwise preserve the current DB status (e.g. Idle set by the
+            // Notification hook). Prefer the restored screen state so a live
+            // Claude prompt becomes "ready" immediately instead of inheriting
+            // a stale "working" badge from the interrupted row.
+            let (status, message) = restored_session_status
+                .unwrap_or((crate::store::ClaudeStatus::Working, "Restored"));
+            self.store
+                .update_session_status(&session.id, status, message)?;
         }
         self.refresh_data()?;
 
@@ -197,10 +228,38 @@ impl App {
     }
 
     /// Process PTY output for all session tabs (budget-limited per pane).
+    /// Used by slow-tick and detection passes that need fresh state on all sessions.
     pub(super) fn process_pty_output(&mut self) {
         for tab in &mut self.tabs {
             if let Tab::Session { terminals, .. } = tab {
                 terminals.process_output();
+            }
+        }
+    }
+
+    /// Process PTY output only for the currently active session tab.
+    /// Background sessions accumulate in their channels and drain on slow ticks.
+    /// This is the fast-path called before every render at 60 FPS.
+    pub(super) fn process_active_pty_output(&mut self) {
+        let session_state = self.tabs.get(self.active_tab).and_then(|tab| match tab {
+            Tab::Session { view_mode, .. } => Some((
+                *view_mode,
+                self.active_session_needs_editor_surface(*view_mode),
+            )),
+            Tab::Dashboard => None,
+        });
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && let Tab::Session { terminals, .. } = tab
+            && let Some((view_mode, needs_editor_surface)) = session_state
+        {
+            match view_mode {
+                SessionTabView::Editor => terminals.process_editor_output(),
+                SessionTabView::Conversation | SessionTabView::Terminal => {
+                    terminals.process_layout_output();
+                    if needs_editor_surface {
+                        terminals.process_editor_output();
+                    }
+                }
             }
         }
     }
@@ -217,22 +276,53 @@ impl App {
         }
     }
 
-    /// Set all session terminal parsers to their scroll offsets for rendering.
-    /// Must be called immediately before `terminal.draw()` and paired with
-    /// [`Self::restore_live_scrollback`] immediately after.
-    pub(super) fn prepare_render_scrollback(&mut self) {
-        for tab in &mut self.tabs {
-            if let Tab::Session { terminals, .. } = tab {
-                terminals.prepare_for_render();
+    /// Prepare only the active session tab for rendering.
+    /// Only the visible tab needs its parser at the user's scroll offset.
+    pub(super) fn prepare_active_render_scrollback(&mut self) {
+        let session_state = self.tabs.get(self.active_tab).and_then(|tab| match tab {
+            Tab::Session { view_mode, .. } => Some((
+                *view_mode,
+                self.active_session_needs_editor_surface(*view_mode),
+            )),
+            Tab::Dashboard => None,
+        });
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && let Tab::Session { terminals, .. } = tab
+            && let Some((view_mode, needs_editor_surface)) = session_state
+        {
+            match view_mode {
+                SessionTabView::Editor => terminals.prepare_editor_for_render(),
+                SessionTabView::Conversation | SessionTabView::Terminal => {
+                    terminals.prepare_layout_for_render();
+                    if needs_editor_surface {
+                        terminals.prepare_editor_for_render();
+                    }
+                }
             }
         }
     }
 
-    /// Restore all session terminal parsers to the live screen (scrollback 0).
-    pub(super) fn restore_live_scrollback(&mut self) {
-        for tab in &mut self.tabs {
-            if let Tab::Session { terminals, .. } = tab {
-                terminals.restore_after_render();
+    /// Restore only the active session tab's parser to the live screen.
+    pub(super) fn restore_active_live_scrollback(&mut self) {
+        let session_state = self.tabs.get(self.active_tab).and_then(|tab| match tab {
+            Tab::Session { view_mode, .. } => Some((
+                *view_mode,
+                self.active_session_needs_editor_surface(*view_mode),
+            )),
+            Tab::Dashboard => None,
+        });
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && let Tab::Session { terminals, .. } = tab
+            && let Some((view_mode, needs_editor_surface)) = session_state
+        {
+            match view_mode {
+                SessionTabView::Editor => terminals.restore_editor_after_render(),
+                SessionTabView::Conversation | SessionTabView::Terminal => {
+                    terminals.restore_layout_after_render();
+                    if needs_editor_surface {
+                        terminals.restore_editor_after_render();
+                    }
+                }
             }
         }
     }
@@ -298,18 +388,27 @@ impl App {
                         self.working_no_indicator_since.remove(session_id);
                     }
                     Some(None) => {
+                        let shell_prompt_visible = terminals
+                            .with_claude_live_screen(|screen| {
+                                super::screen_shows_shell_prompt(screen)
+                            })
+                            .unwrap_or(false);
+                        if shell_prompt_visible {
+                            self.working_no_indicator_since.remove(session_id);
+                            continue;
+                        }
                         // No Claude indicator on screen. Could be Claude actively
                         // working (tool output streaming) or Claude has exited
-                        // (shell prompt visible). Use a timer to distinguish:
-                        // if no indicator appears for 15s, assume Claude exited.
+                        // (with a prompt style we do not explicitly recognize).
+                        // Keep timing this state for "stuck" diagnostics, but
+                        // do not declare it idle. Misclassifying shell fallback
+                        // as ready causes native compose to write into the shell
+                        // instead of restarting Claude.
                         let entry = self
                             .working_no_indicator_since
                             .entry(session_id.clone())
                             .or_insert_with(std::time::Instant::now);
                         let elapsed = entry.elapsed();
-                        if elapsed > std::time::Duration::from_secs(15) {
-                            self.pty_idle_sessions.insert(session_id.clone());
-                        }
                         // Flag sessions stuck for 5+ minutes for a toast after the loop
                         if elapsed > std::time::Duration::from_secs(300)
                             && elapsed < std::time::Duration::from_secs(303)
@@ -381,8 +480,9 @@ impl App {
             }
         }
         // Clear notification tracking for sessions no longer paused/waiting
-        self.notified_paused_sessions
-            .retain(|sid| self.paused_sessions.contains(sid) || self.waiting_sessions.contains(sid));
+        self.notified_paused_sessions.retain(|sid| {
+            self.paused_sessions.contains(sid) || self.waiting_sessions.contains(sid)
+        });
 
         // Clean up stale entries for sessions that are no longer working
         self.working_no_indicator_since.retain(|sid, _| {

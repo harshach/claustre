@@ -1,6 +1,7 @@
-//! Text selection within a terminal pane (vt100 screen coordinates).
+//! Text selection within a terminal pane (screen coordinates).
 
 use super::PaneId;
+use super::screen_view::ScreenView;
 
 /// A text selection within a terminal pane (vt100 screen coordinates).
 #[derive(Clone, Copy)]
@@ -42,8 +43,8 @@ impl Selection {
         true // middle row
     }
 
-    /// Extract the selected text from a vt100 screen.
-    pub fn extract_text(&self, screen: &vt100::Screen) -> String {
+    /// Extract the selected text from a terminal screen.
+    pub fn extract_text(&self, screen: &dyn ScreenView) -> String {
         let ((sr, sc), (er, ec)) = self.normalized();
         let mut text = String::new();
         let max_cols = screen.size().1;
@@ -58,11 +59,10 @@ impl Selection {
 
             for col in col_start..=col_end {
                 if let Some(cell) = screen.cell(row, col) {
-                    let contents = cell.contents();
-                    if contents.is_empty() {
+                    if cell.contents.is_empty() {
                         text.push(' ');
                     } else {
-                        text.push_str(&contents);
+                        text.push_str(&cell.contents);
                     }
                 }
             }
@@ -174,48 +174,50 @@ mod tests {
 
     #[test]
     fn extract_text_single_line() {
-        let parser = vt100::Parser::new(24, 80, 0);
-        // Write "Hello World" to the screen
-        let mut p = parser;
+        use crate::pty::screen_view::Vt100ScreenView;
+        let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"Hello World");
-        let screen = p.screen();
+        let view = Vt100ScreenView(p.screen());
 
         let s = sel((0, 0), (0, 10));
-        let text = s.extract_text(screen);
+        let text = s.extract_text(&view);
         assert_eq!(text, "Hello World");
     }
 
     #[test]
     fn extract_text_partial_line() {
+        use crate::pty::screen_view::Vt100ScreenView;
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"ABCDEFGHIJ");
-        let screen = p.screen();
+        let view = Vt100ScreenView(p.screen());
 
         let s = sel((0, 2), (0, 5));
-        let text = s.extract_text(screen);
+        let text = s.extract_text(&view);
         assert_eq!(text, "CDEF");
     }
 
     #[test]
     fn extract_text_multi_line() {
+        use crate::pty::screen_view::Vt100ScreenView;
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"Line one\r\nLine two\r\nLine three");
-        let screen = p.screen();
+        let view = Vt100ScreenView(p.screen());
 
         let s = sel((0, 5), (2, 3));
-        let text = s.extract_text(screen);
+        let text = s.extract_text(&view);
         assert_eq!(text, "one\nLine two\nLine");
     }
 
     #[test]
     fn extract_text_trims_trailing_spaces() {
+        use crate::pty::screen_view::Vt100ScreenView;
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"Hi");
-        let screen = p.screen();
+        let view = Vt100ScreenView(p.screen());
 
         // Select past the end of "Hi" — empty cells become spaces, but trailing should be trimmed
         let s = sel((0, 0), (0, 10));
-        let text = s.extract_text(screen);
+        let text = s.extract_text(&view);
         assert_eq!(text, "Hi");
     }
 }

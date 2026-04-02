@@ -362,11 +362,7 @@ impl Store {
     }
 
     /// Link all draft attachments for a thread to a specific message.
-    pub fn link_attachments_to_message(
-        &self,
-        thread_id: &str,
-        message_id: &str,
-    ) -> Result<usize> {
+    pub fn link_attachments_to_message(&self, thread_id: &str, message_id: &str) -> Result<usize> {
         let count = self.conn.execute(
             "UPDATE thread_attachments SET message_id = ?1 \
              WHERE thread_id = ?2 AND message_id IS NULL",

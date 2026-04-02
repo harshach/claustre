@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize};
 use vt100::Parser;
 
+use super::screen_view::{MouseEncoding, MouseMode, ScreenView, ScreenViewRef, Vt100ScreenView};
 use super::{PROCESS_BYTE_BUDGET, SCROLL_DOWN_ACCEL_DIVISOR, SCROLLBACK_LINES};
 
 /// The I/O backend for an `EmbeddedTerminal`.
@@ -300,8 +301,14 @@ impl EmbeddedTerminal {
         self.parser.process(b"\x1b[2J\x1b[H");
     }
 
-    /// Get the current terminal screen state for rendering.
-    pub fn screen(&self) -> &vt100::Screen {
+    /// Get a parser-agnostic view of the current terminal screen.
+    pub fn screen_view(&self) -> ScreenViewRef<'_> {
+        ScreenViewRef::Vt100(Vt100ScreenView(self.parser.screen()))
+    }
+
+    /// Get the raw vt100 screen (test use only).
+    #[cfg(test)]
+    pub(crate) fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
 
@@ -317,7 +324,7 @@ impl EmbeddedTerminal {
     /// the last-set mode, so checking `exited` prevents mouse events from
     /// being silently consumed by a dead process.
     pub fn should_forward_mouse(&self) -> bool {
-        !self.exited && self.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        !self.exited && self.mouse_protocol_mode() != MouseMode::None
     }
 
     /// Whether the PTY application has enabled mouse protocol tracking.
@@ -325,13 +332,13 @@ impl EmbeddedTerminal {
     /// When this returns a mode other than `None`, mouse events should be
     /// forwarded to the PTY as escape sequences instead of being consumed
     /// by the terminal emulator's own scrollback/selection handling.
-    pub fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
-        self.parser.screen().mouse_protocol_mode()
+    pub fn mouse_protocol_mode(&self) -> MouseMode {
+        self.screen_view().mouse_protocol_mode()
     }
 
     /// The mouse protocol encoding requested by the PTY application.
-    pub fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
-        self.parser.screen().mouse_protocol_encoding()
+    pub fn mouse_protocol_encoding(&self) -> MouseEncoding {
+        self.screen_view().mouse_protocol_encoding()
     }
 
     /// Scroll up into history by `lines` rows.
@@ -413,8 +420,8 @@ impl super::terminal_trait::Terminal for EmbeddedTerminal {
         self.clear_screen();
     }
 
-    fn screen(&self) -> &vt100::Screen {
-        self.screen()
+    fn screen_view(&self) -> ScreenViewRef<'_> {
+        self.screen_view()
     }
 
     fn scrollback(&self) -> usize {
@@ -425,11 +432,11 @@ impl super::terminal_trait::Terminal for EmbeddedTerminal {
         self.should_forward_mouse()
     }
 
-    fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
+    fn mouse_protocol_mode(&self) -> MouseMode {
         self.mouse_protocol_mode()
     }
 
-    fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
+    fn mouse_protocol_encoding(&self) -> MouseEncoding {
         self.mouse_protocol_encoding()
     }
 

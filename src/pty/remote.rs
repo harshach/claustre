@@ -12,6 +12,7 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use super::protocol::{ClientMessage, HostMessage};
+use super::screen_view::{MouseEncoding, MouseMode, ScreenView, ScreenViewRef, Vt100ScreenView};
 use super::terminal_trait::Terminal;
 use super::{PROCESS_BYTE_BUDGET, SCROLL_DOWN_ACCEL_DIVISOR, SCROLLBACK_LINES};
 
@@ -210,8 +211,8 @@ impl Terminal for RemoteTerminal {
         self.parser.process(b"\x1b[2J\x1b[H");
     }
 
-    fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+    fn screen_view(&self) -> ScreenViewRef<'_> {
+        ScreenViewRef::Vt100(Vt100ScreenView(self.parser.screen()))
     }
 
     fn scrollback(&self) -> usize {
@@ -219,15 +220,15 @@ impl Terminal for RemoteTerminal {
     }
 
     fn should_forward_mouse(&self) -> bool {
-        !self.has_exited && self.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        !self.has_exited && self.mouse_protocol_mode() != MouseMode::None
     }
 
-    fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
-        self.parser.screen().mouse_protocol_mode()
+    fn mouse_protocol_mode(&self) -> MouseMode {
+        self.screen_view().mouse_protocol_mode()
     }
 
-    fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
-        self.parser.screen().mouse_protocol_encoding()
+    fn mouse_protocol_encoding(&self) -> MouseEncoding {
+        self.screen_view().mouse_protocol_encoding()
     }
 
     fn scroll_up(&mut self, lines: usize) {

@@ -4,22 +4,24 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Rect};
 
-use crate::pty::SplitDirection;
+use crate::pty::{ScreenView, SplitDirection};
 
 use super::super::form::apply_text_edit;
 use super::super::ui;
 use super::{
-    App, BoardScope, DeleteTarget, Focus, InputMode, InspectorTab, LaunchThreadDraft,
-    LaunchThreadField, PaletteAction, PendingBoardIssueLaunch, PendingReviewLaunchMode,
-    PendingReviewPrLaunch, ReviewQueueTab, SessionOpResult, SessionTabView, SettingsEditTarget,
-    SettingsSection, SidebarItem, Tab, ToastStyle, WorkbenchDragTarget, WorkbenchView,
-    compute_pane_sizes_for_resize, fallback_title,
+    App, BoardScope, DeleteTarget, Focus, InputMode, InspectorRenderCache, InspectorSelection,
+    InspectorTab, LaunchThreadDraft, LaunchThreadField, PaletteAction, PendingBoardIssueLaunch,
+    PendingReviewLaunchMode, PendingReviewPrLaunch, ReviewQueueTab, SessionOpResult,
+    SessionTabView, SettingsEditTarget, SettingsSection, SidebarItem, Tab, ToastStyle,
+    WorkbenchDragTarget, WorkbenchView, compute_pane_sizes_for_resize, fallback_title,
 };
 
 const LAUNCH_THREAD_PROVIDERS: [crate::store::ProviderKind; 2] = [
     crate::store::ProviderKind::Claude,
     crate::store::ProviderKind::Codex,
 ];
+
+const WORKFLOW_STAGE_PROVIDER_OPTIONS: [&str; 5] = ["claude", "codex", "gemini", "local", "none"];
 
 #[derive(Debug, Clone, Copy)]
 enum ThreadRuntimeAction {
@@ -30,17 +32,180 @@ enum ThreadRuntimeAction {
 }
 
 impl App {
+    fn selected_settings_section(&self) -> SettingsSection {
+        SettingsSection::ALL
+            .get(self.settings_section_index)
+            .copied()
+            .unwrap_or(SettingsSection::AiProviders)
+    }
+
+    fn parsed_workflow_definitions(
+        &self,
+    ) -> Vec<(
+        crate::store::WorkflowDef,
+        crate::workflows::WorkflowDefinition,
+    )> {
+        self.store
+            .list_workflow_defs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|def| {
+                serde_yaml::from_str::<crate::workflows::WorkflowDefinition>(&def.definition_yaml)
+                    .ok()
+                    .map(|parsed| (def, parsed))
+            })
+            .collect()
+    }
+
+    fn clamp_settings_workflow_stage_index(&mut self) {
+        let stage_count = self
+            .parsed_workflow_definitions()
+            .get(self.settings_workflow_index)
+            .map_or(0, |(_, definition)| definition.stages.len());
+        if stage_count == 0 {
+            self.settings_workflow_stage_index = 0;
+        } else {
+            self.settings_workflow_stage_index = self
+                .settings_workflow_stage_index
+                .min(stage_count.saturating_sub(1));
+        }
+    }
+
+    fn move_settings_section_forward(&mut self) {
+        self.settings_section_index =
+            (self.settings_section_index + 1).min(SettingsSection::ALL.len().saturating_sub(1));
+        self.maybe_prefetch_github_installations();
+        self.clamp_settings_workflow_stage_index();
+    }
+
+    fn move_settings_section_backward(&mut self) {
+        self.settings_section_index = self.settings_section_index.saturating_sub(1);
+        self.maybe_prefetch_github_installations();
+        self.clamp_settings_workflow_stage_index();
+    }
+
+    fn move_settings_workflow_forward(&mut self) {
+        let count = self.store.list_workflow_defs().map_or(0, |defs| defs.len());
+        if count > 0 {
+            self.settings_workflow_index =
+                (self.settings_workflow_index + 1).min(count.saturating_sub(1));
+            self.clamp_settings_workflow_stage_index();
+        }
+    }
+
+    fn move_settings_workflow_backward(&mut self) {
+        self.settings_workflow_index = self.settings_workflow_index.saturating_sub(1);
+        self.clamp_settings_workflow_stage_index();
+    }
+
+    fn move_settings_workflow_stage_forward(&mut self) {
+        let stage_count = self
+            .parsed_workflow_definitions()
+            .get(self.settings_workflow_index)
+            .map_or(0, |(_, definition)| definition.stages.len());
+        if stage_count > 0 {
+            self.settings_workflow_stage_index =
+                (self.settings_workflow_stage_index + 1).min(stage_count.saturating_sub(1));
+        }
+    }
+
+    fn move_settings_workflow_stage_backward(&mut self) {
+        self.settings_workflow_stage_index = self.settings_workflow_stage_index.saturating_sub(1);
+    }
+
+    fn update_selected_workflow_definition<F>(
+        &mut self,
+        success_label: &str,
+        mut edit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut crate::workflows::WorkflowDefinition),
+    {
+        let defs = self.parsed_workflow_definitions();
+        let Some((stored_def, mut definition)) = defs.get(self.settings_workflow_index).cloned()
+        else {
+            return Ok(());
+        };
+
+        edit(&mut definition);
+        crate::workflows::save_workflow_definition(&definition)?;
+        let _ = crate::workflows::sync_workflow_definitions(&self.store, None);
+        self.refresh_available_workflow_names();
+
+        if let Ok(updated_defs) = self.store.list_workflow_defs()
+            && let Some(updated_index) = updated_defs
+                .iter()
+                .position(|def| def.name == definition.name || def.id == stored_def.id)
+        {
+            self.settings_workflow_index = updated_index;
+        }
+        self.clamp_settings_workflow_stage_index();
+        self.show_toast(success_label.to_string(), ToastStyle::Success);
+        Ok(())
+    }
+
+    fn cycle_selected_workflow_stage_provider(&mut self, forward: bool) -> Result<()> {
+        let defs = self.parsed_workflow_definitions();
+        let Some((_, definition)) = defs.get(self.settings_workflow_index) else {
+            self.show_toast("No workflow selected", ToastStyle::Info);
+            return Ok(());
+        };
+        let Some(stage) = definition.stages.get(self.settings_workflow_stage_index) else {
+            self.show_toast("No workflow stage selected", ToastStyle::Info);
+            return Ok(());
+        };
+
+        let current = stage.provider.as_deref().unwrap_or("none");
+        let current_index = WORKFLOW_STAGE_PROVIDER_OPTIONS
+            .iter()
+            .position(|option| *option == current)
+            .unwrap_or(0);
+        let next_index = if forward {
+            (current_index + 1) % WORKFLOW_STAGE_PROVIDER_OPTIONS.len()
+        } else if current_index == 0 {
+            WORKFLOW_STAGE_PROVIDER_OPTIONS.len() - 1
+        } else {
+            current_index - 1
+        };
+        let next_provider = WORKFLOW_STAGE_PROVIDER_OPTIONS[next_index];
+        let stage_index = self.settings_workflow_stage_index;
+        let stage_name = stage.name.clone();
+
+        self.update_selected_workflow_definition(
+            &format!("Updated {stage_name} agent to {next_provider}"),
+            move |definition| {
+                if let Some(stage) = definition.stages.get_mut(stage_index) {
+                    if next_provider == "none" {
+                        stage.provider = None;
+                        stage.provider_profile = None;
+                    } else {
+                        stage.provider = Some(next_provider.to_string());
+                        if stage
+                            .provider_profile
+                            .as_deref()
+                            .unwrap_or_default()
+                            .is_empty()
+                        {
+                            stage.provider_profile = Some("default".to_string());
+                        }
+                    }
+                }
+            },
+        )
+    }
+
     fn maybe_prefetch_github_installations(&mut self) {
         if self.workbench_view == WorkbenchView::Settings
-            && SettingsSection::ALL
-                .get(self.settings_section_index)
-                .copied()
-                == Some(SettingsSection::GitHub)
+            && self.selected_settings_section() == SettingsSection::GitHub
             && self.github_status.authenticated
             && self.github_installations.is_empty()
         {
             self.spawn_github_installations_fetch();
         }
+    }
+
+    fn toggle_shortcuts_bar(&mut self) {
+        self.show_shortcuts_bar = !self.show_shortcuts_bar;
     }
 
     /// Dispatch a key event to the correct dashboard handler based on `input_mode`.
@@ -127,6 +292,13 @@ impl App {
             return self.handle_permission_dialog_key(code);
         }
 
+        // Thread-backed conversation sessions own their own compose and chat
+        // interaction model. Route there before generic session hotkeys so
+        // normal typing never leaks into plain `o`/terminal toggles.
+        if self.active_session_uses_thread_workspace() {
+            return self.handle_thread_session_tab_key(code, modifiers);
+        }
+
         // Global session keys — work in ALL view modes (conversation, terminal, editor)
         // Ctrl+Q = close session permanently (with confirmation)
         if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('q')) {
@@ -151,20 +323,13 @@ impl App {
             );
             if in_editor {
                 // Exit editor → conversation
-                if let Some(Tab::Session { view_mode, .. }) =
-                    self.tabs.get_mut(self.active_tab)
-                {
+                if let Some(Tab::Session { view_mode, .. }) = self.tabs.get_mut(self.active_tab) {
                     *view_mode = SessionTabView::Conversation;
                 }
             } else {
                 self.switch_to_editor()?;
             }
             return Ok(());
-        }
-
-        // Conversation view has its own key handler for compose, inspector, etc.
-        if self.active_session_uses_thread_workspace() {
-            return self.handle_thread_session_tab_key(code, modifiers);
         }
 
         if let Some(action) = self.keymap.lookup_session(code, modifiers) {
@@ -196,7 +361,355 @@ impl App {
         ) && self.active_session_thread().is_some()
     }
 
+    fn current_thread_id_for_inspector(&self) -> Option<String> {
+        self.active_session_thread()
+            .map(|thread| thread.id)
+            .or_else(|| self.selected_thread().map(|thread| thread.id.clone()))
+    }
+
+    fn scroll_thread_transcript_by(&mut self, thread_id: &str, delta: i16) {
+        let (chat_auto_scroll, chat_scroll) = {
+            let workspace = self.ensure_thread_workspace(thread_id);
+            match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    workspace.chat_auto_scroll = false;
+                    workspace.chat_scroll = workspace.chat_scroll.saturating_add(delta as u16);
+                }
+                std::cmp::Ordering::Less => {
+                    let amount = delta.unsigned_abs();
+                    if workspace.chat_scroll > 0 {
+                        workspace.chat_scroll = workspace.chat_scroll.saturating_sub(amount);
+                        if workspace.chat_scroll == 0 {
+                            workspace.chat_auto_scroll = true;
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+            (workspace.chat_auto_scroll, workspace.chat_scroll)
+        };
+        self.session_chat_auto_scroll = chat_auto_scroll;
+        self.session_chat_scroll = chat_scroll;
+    }
+
+    fn sync_active_session_terminals_to_last_area(&mut self) {
+        let cols = self.last_terminal_area.width.max(80);
+        let rows = self.last_terminal_area.height.max(24);
+        if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab) {
+            let sizes = compute_pane_sizes_for_resize(&terminals.layout, cols, rows);
+            let _ = terminals.resize_panes_with_clear(&sizes);
+        }
+    }
+
+    fn mark_thread_session_resumed(&mut self, thread: &crate::store::Thread, status: &str) {
+        let Some(session_id) = thread.session_id.as_deref() else {
+            return;
+        };
+        let _ = self.store.update_session_status(
+            session_id,
+            crate::store::ClaudeStatus::Working,
+            status,
+        );
+        self.working_no_indicator_since.remove(session_id);
+        self.pty_idle_sessions.remove(session_id);
+    }
+
+    fn ensure_thread_session_tab_available(
+        &mut self,
+        thread: &crate::store::Thread,
+    ) -> Result<Option<String>> {
+        let Some(session) = self.live_session_for_thread(thread) else {
+            return Ok(None);
+        };
+
+        let previous_tab = self.active_tab;
+        let had_usable_tab = self.tabs.iter().enumerate().rev().any(|(_, tab)| {
+            if let Tab::Session {
+                session_id,
+                terminals,
+                ..
+            } = tab
+            {
+                session_id == &session.id
+                    && terminals
+                        .terminal(terminals.claude_pane_id)
+                        .is_some_and(|terminal| !terminal.exited())
+            } else {
+                false
+            }
+        });
+        if !had_usable_tab {
+            self.restore_session_tab(&session)?;
+            self.active_tab = previous_tab;
+        }
+        Ok(Some(session.id))
+    }
+
+    pub(crate) fn session_has_usable_claude_pane(&self, session_id: &str) -> bool {
+        self.tabs.iter().rev().any(|tab| {
+            matches!(tab, Tab::Session { session_id: sid, terminals, .. }
+                if sid == session_id
+                    && terminals
+                        .terminal(terminals.claude_pane_id)
+                        .is_some_and(|terminal| !terminal.exited()))
+        })
+    }
+
+    pub(crate) fn session_has_live_claude_provider(&self, session_id: &str) -> bool {
+        self.tabs.iter().rev().any(|tab| {
+            matches!(tab, Tab::Session { session_id: sid, terminals, .. }
+                if sid == session_id
+                    && terminals
+                        .terminal(terminals.claude_pane_id)
+                        .is_some_and(|terminal| !terminal.exited())
+                    && terminals
+                        .with_claude_live_screen(|screen| {
+                            !screen.contents().trim().is_empty()
+                                && !super::screen_shows_shell_prompt(screen)
+                        })
+                        .unwrap_or(false))
+        })
+    }
+
+    fn adjust_current_inspector_scroll(&mut self, delta: i16) {
+        self.clear_current_inspector_selection();
+        if let Some(thread_id) = self.current_thread_id_for_inspector() {
+            let current = self.thread_inspector_scroll(Some(&thread_id));
+            let next = if delta.is_negative() {
+                current.saturating_sub(delta.unsigned_abs())
+            } else {
+                current.saturating_add(delta as u16)
+            };
+            self.set_thread_inspector_scroll(&thread_id, next);
+        } else if delta.is_negative() {
+            self.inspector_scroll = self.inspector_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.inspector_scroll = self.inspector_scroll.saturating_add(delta as u16);
+        }
+    }
+
+    fn set_current_inspector_tab(&mut self, tab: InspectorTab) {
+        self.clear_current_inspector_selection();
+        if let Some(thread_id) = self.current_thread_id_for_inspector() {
+            self.set_thread_inspector_tab(&thread_id, tab);
+            self.set_thread_inspector_scroll(&thread_id, 0);
+        } else {
+            self.inspector_tab = tab;
+            self.inspector_scroll = 0;
+        }
+    }
+
+    fn current_inspector_render_cache(&self) -> Option<&InspectorRenderCache> {
+        if let Some(thread_id) = self.current_thread_id_for_inspector() {
+            self.thread_workspace(&thread_id)
+                .and_then(|workspace| workspace.inspector_render_cache.as_ref())
+        } else {
+            self.inspector_render_cache.as_ref()
+        }
+    }
+
+    fn current_inspector_selection(&self) -> Option<InspectorSelection> {
+        if let Some(thread_id) = self.current_thread_id_for_inspector() {
+            self.thread_workspace(&thread_id)
+                .and_then(|workspace| workspace.inspector_selection)
+        } else {
+            self.inspector_selection
+        }
+    }
+
+    fn set_current_inspector_selection(&mut self, selection: Option<InspectorSelection>) {
+        if let Some(thread_id) = self.current_thread_id_for_inspector() {
+            self.ensure_thread_workspace(&thread_id).inspector_selection = selection;
+        } else {
+            self.inspector_selection = selection;
+        }
+    }
+
+    fn clear_current_inspector_selection(&mut self) {
+        self.set_current_inspector_selection(None);
+    }
+
+    fn inspector_hit_test(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let cache = self.current_inspector_render_cache()?;
+        if cache.area.width == 0
+            || cache.area.height == 0
+            || col < cache.area.x
+            || col >= cache.area.x.saturating_add(cache.area.width)
+            || row < cache.area.y
+            || row >= cache.area.y.saturating_add(cache.area.height)
+        {
+            return None;
+        }
+        Some((
+            row.saturating_sub(cache.area.y),
+            col.saturating_sub(cache.area.x),
+        ))
+    }
+
+    fn current_inspector_selected_text(&self) -> Option<String> {
+        let cache = self.current_inspector_render_cache()?;
+        let selection = self.current_inspector_selection()?;
+        let ((start_row, start_col), (end_row, end_col)) = selection.normalized();
+        let start_idx = usize::from(start_row);
+        let end_idx = usize::from(end_row);
+        if start_idx >= cache.lines.len() {
+            return None;
+        }
+
+        let mut selected = Vec::new();
+        for idx in start_idx..=end_idx.min(cache.lines.len().saturating_sub(1)) {
+            let line = &cache.lines[idx];
+            let line_len = line.chars().count();
+            let line_start = if idx == start_idx {
+                usize::from(start_col).min(line_len)
+            } else {
+                0
+            };
+            let line_end = if idx == end_idx {
+                usize::from(end_col).min(line_len)
+            } else {
+                line_len
+            };
+            if idx == start_idx && idx == end_idx && line_start == line_end {
+                continue;
+            }
+            let fragment = line
+                .chars()
+                .skip(line_start)
+                .take(line_end.saturating_sub(line_start))
+                .collect::<String>();
+            selected.push(fragment);
+        }
+
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn maybe_open_inspector_link(&mut self, row: u16, col: u16) {
+        let Some(cache) = self.current_inspector_render_cache() else {
+            return;
+        };
+        let Some(link) = cache
+            .links
+            .iter()
+            .find(|link| link.row == row && col >= link.start_col && col < link.end_col)
+        else {
+            return;
+        };
+
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let _ = std::process::Command::new(opener).arg(&link.url).spawn();
+        self.show_toast("Opening link", ToastStyle::Success);
+    }
+
+    fn clamped_inspector_position(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let cache = self.current_inspector_render_cache()?;
+        if cache.area.width == 0 || cache.area.height == 0 {
+            return None;
+        }
+        let max_x = cache
+            .area
+            .x
+            .saturating_add(cache.area.width.saturating_sub(1));
+        let max_y = cache
+            .area
+            .y
+            .saturating_add(cache.area.height.saturating_sub(1));
+        let clamped_col = col.clamp(cache.area.x, max_x);
+        let clamped_row = row.clamp(cache.area.y, max_y);
+        Some((
+            clamped_row.saturating_sub(cache.area.y),
+            clamped_col.saturating_sub(cache.area.x),
+        ))
+    }
+
+    fn handle_inspector_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        if self.input_mode != InputMode::Normal {
+            return Ok(false);
+        }
+
+        let hit = self.inspector_hit_test(mouse.column, mouse.row);
+        let drag_target = if matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        ) {
+            self.clamped_inspector_position(mouse.column, mouse.row)
+        } else {
+            hit
+        };
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if hit.is_some() {
+                    self.focus = Focus::Inspector;
+                    self.adjust_current_inspector_scroll(-1);
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if hit.is_some() {
+                    self.focus = Focus::Inspector;
+                    self.adjust_current_inspector_scroll(1);
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((row, col)) = hit {
+                    self.focus = Focus::Inspector;
+                    self.set_current_inspector_selection(Some(InspectorSelection {
+                        anchor_row: row,
+                        anchor_col: col,
+                        focus_row: row,
+                        focus_col: col,
+                    }));
+                    return Ok(true);
+                }
+                self.clear_current_inspector_selection();
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some((row, col)), Some(mut selection)) =
+                    (drag_target, self.current_inspector_selection())
+                {
+                    selection.focus_row = row;
+                    selection.focus_col = col;
+                    self.set_current_inspector_selection(Some(selection));
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let (Some((row, col)), Some(mut selection)) =
+                    (drag_target, self.current_inspector_selection())
+                {
+                    selection.focus_row = row;
+                    selection.focus_col = col;
+                    if selection.anchor_row == row && selection.anchor_col == col {
+                        self.clear_current_inspector_selection();
+                        self.maybe_open_inspector_link(row, col);
+                    } else {
+                        self.set_current_inspector_selection(Some(selection));
+                        if let Some(text) = self.current_inspector_selected_text()
+                            && let Ok(mut clipboard) = arboard::Clipboard::new()
+                        {
+                            let _ = clipboard.set_text(text);
+                            self.show_toast("Copied inspector selection", ToastStyle::Success);
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
     fn toggle_active_session_view(&mut self) -> bool {
+        let mut entering_terminal = false;
+        let mut entering_conversation = false;
         let Some(Tab::Session {
             view_mode,
             terminals,
@@ -218,9 +731,10 @@ impl App {
                 {
                     terminals.focused = terminals.claude_pane_id;
                 } else {
-                    let live = terminals.pane_ids_in_order().into_iter().find(|&id| {
-                        terminals.terminal(id).is_some_and(|t| !t.exited())
-                    });
+                    let live = terminals
+                        .pane_ids_in_order()
+                        .into_iter()
+                        .find(|&id| terminals.terminal(id).is_some_and(|t| !t.exited()));
                     if let Some(id) = live {
                         tracing::debug!(
                             pane_id = id,
@@ -229,13 +743,22 @@ impl App {
                         terminals.focused = id;
                     }
                 }
+                entering_terminal = true;
                 SessionTabView::Terminal
             }
             SessionTabView::Terminal | SessionTabView::Editor => {
                 tracing::debug!("toggle_view: terminal/editor → conversation");
+                entering_conversation = true;
                 SessionTabView::Conversation
             }
         };
+        if entering_terminal {
+            self.sync_active_session_terminals_to_last_area();
+        } else if entering_conversation
+            && let Some(thread_id) = self.active_session_thread().map(|thread| thread.id)
+        {
+            self.reset_thread_chat_scroll(&thread_id);
+        }
         true
     }
 
@@ -256,9 +779,12 @@ impl App {
         }
 
         let area = self.last_terminal_area;
-        let editor_id = terminals.ensure_editor(area.height, area.width)?;
+        let rows = area.height.max(24);
+        let cols = area.width.max(80);
+        let editor_id = terminals.ensure_editor(rows, cols)?;
         terminals.focused = editor_id;
         *view_mode = SessionTabView::Editor;
+        self.sync_active_session_terminals_to_last_area();
         tracing::debug!("switch_to_editor: entering editor mode");
         Ok(())
     }
@@ -290,7 +816,7 @@ impl App {
                 if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab)
                     && let Some(term) = terminals.focused_terminal()
                 {
-                    let rows = usize::from(term.screen().size().0);
+                    let rows = usize::from(term.screen_view().size().0);
                     let half = rows / 2;
                     term.scroll_up(half);
                 }
@@ -299,7 +825,7 @@ impl App {
                 if let Some(Tab::Session { terminals, .. }) = self.tabs.get_mut(self.active_tab)
                     && let Some(term) = terminals.focused_terminal()
                 {
-                    let rows = usize::from(term.screen().size().0);
+                    let rows = usize::from(term.screen_view().size().0);
                     let half = rows / 2;
                     term.scroll_down(half);
                 }
@@ -402,7 +928,17 @@ impl App {
             }
             Action::ScrollPageUp => {
                 if self.focus == Focus::Inspector {
-                    self.inspector_scroll = self.inspector_scroll.saturating_sub(8);
+                    self.adjust_current_inspector_scroll(-8);
+                } else if let Some(thread_id) = self.active_session_thread().map(|thread| thread.id)
+                {
+                    let (chat_auto_scroll, chat_scroll) = {
+                        let workspace = self.ensure_thread_workspace(&thread_id);
+                        workspace.chat_auto_scroll = false;
+                        workspace.chat_scroll = workspace.chat_scroll.saturating_add(10);
+                        (workspace.chat_auto_scroll, workspace.chat_scroll)
+                    };
+                    self.session_chat_auto_scroll = chat_auto_scroll;
+                    self.session_chat_scroll = chat_scroll;
                 } else {
                     self.session_chat_auto_scroll = false;
                     self.session_chat_scroll = self.session_chat_scroll.saturating_add(10);
@@ -410,7 +946,21 @@ impl App {
             }
             Action::ScrollPageDown => {
                 if self.focus == Focus::Inspector {
-                    self.inspector_scroll = self.inspector_scroll.saturating_add(8);
+                    self.adjust_current_inspector_scroll(8);
+                } else if let Some(thread_id) = self.active_session_thread().map(|thread| thread.id)
+                {
+                    let (chat_auto_scroll, chat_scroll) = {
+                        let workspace = self.ensure_thread_workspace(&thread_id);
+                        if workspace.chat_scroll > 0 {
+                            workspace.chat_scroll = workspace.chat_scroll.saturating_sub(10);
+                            if workspace.chat_scroll == 0 {
+                                workspace.chat_auto_scroll = true;
+                            }
+                        }
+                        (workspace.chat_auto_scroll, workspace.chat_scroll)
+                    };
+                    self.session_chat_scroll = chat_scroll;
+                    self.session_chat_auto_scroll = chat_auto_scroll;
                 } else if self.session_chat_scroll > 0 {
                     self.session_chat_scroll = self.session_chat_scroll.saturating_sub(10);
                     if self.session_chat_scroll == 0 {
@@ -419,9 +969,17 @@ impl App {
                 }
             }
             Action::ScrollToBottom => {
-                self.inspector_scroll = u16::MAX;
-                self.session_chat_scroll = 0;
-                self.session_chat_auto_scroll = true;
+                if let Some(thread_id) = self.current_thread_id_for_inspector() {
+                    self.set_thread_inspector_scroll(&thread_id, u16::MAX);
+                } else {
+                    self.inspector_scroll = u16::MAX;
+                }
+                if let Some(thread_id) = self.active_session_thread().map(|thread| thread.id) {
+                    self.reset_thread_chat_scroll(&thread_id);
+                } else {
+                    self.session_chat_scroll = 0;
+                    self.session_chat_auto_scroll = true;
+                }
             }
             Action::SplitRight | Action::SplitDown | Action::ClosePane => {
                 // These work in terminal-focused mode via Ctrl+O
@@ -437,6 +995,10 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> Result<()> {
+        if self.input_mode == InputMode::ThreadCompose {
+            return self.handle_thread_compose_key(code, modifiers);
+        }
+
         // Ctrl+Q = close session permanently (with confirmation)
         if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('q')) {
             self.prompt_close_session();
@@ -446,10 +1008,6 @@ impl App {
         if modifiers == KeyModifiers::CONTROL && matches!(code, KeyCode::Char('o')) {
             self.toggle_active_session_view();
             return Ok(());
-        }
-
-        if self.input_mode == InputMode::ThreadCompose {
-            return self.handle_thread_compose_key(code, modifiers);
         }
         if self.input_mode == InputMode::ThreadProviderPicker {
             return self.handle_thread_provider_picker_key(code);
@@ -463,8 +1021,7 @@ impl App {
         // Ctrl+C in conversation view: interrupt Claude and force-send queued message
         if code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL {
             if self.interrupt_active_session_claude() {
-                if let Some((thread_id, content, image_paths)) =
-                    self.queued_compose_message.take()
+                if let Some((thread_id, content, image_paths)) = self.queued_compose_message.take()
                 {
                     // User wants to steer the agent — interrupt and send the queued message
                     self.show_toast(
@@ -489,6 +1046,7 @@ impl App {
                             );
                         }
                         self.cached_chat_lines = None;
+                        self.invalidate_thread_chat_cache(&thread_id);
                     }
                 } else {
                     self.show_toast("Sent interrupt (Ctrl+C) to Claude", ToastStyle::Info);
@@ -504,24 +1062,26 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Tab | KeyCode::BackTab => {
-                    self.focus = if self.focus == Focus::Inspector {
-                        Focus::Tasks
-                    } else {
-                        Focus::Inspector
+                    self.focus = match self.focus {
+                        Focus::Tasks => Focus::Inspector,
+                        Focus::Inspector => Focus::Tasks,
+                        Focus::Projects => Focus::Tasks,
                     };
                     return Ok(());
                 }
                 KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Inspector => {
-                    self.inspector_scroll = self.inspector_scroll.saturating_add(1);
+                    self.adjust_current_inspector_scroll(1);
                     return Ok(());
                 }
                 KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Inspector => {
-                    self.inspector_scroll = self.inspector_scroll.saturating_sub(1);
+                    self.adjust_current_inspector_scroll(-1);
                     return Ok(());
                 }
                 // Chat panel scroll (when chat is focused, not inspector)
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if self.session_chat_scroll > 0 {
+                    if let Some(thread_id) = self.active_session_thread().map(|thread| thread.id) {
+                        self.scroll_thread_transcript_by(&thread_id, -1);
+                    } else if self.session_chat_scroll > 0 {
                         self.session_chat_scroll = self.session_chat_scroll.saturating_sub(1);
                         if self.session_chat_scroll == 0 {
                             self.session_chat_auto_scroll = true;
@@ -530,8 +1090,12 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.session_chat_auto_scroll = false;
-                    self.session_chat_scroll = self.session_chat_scroll.saturating_add(1);
+                    if let Some(thread_id) = self.active_session_thread().map(|thread| thread.id) {
+                        self.scroll_thread_transcript_by(&thread_id, 1);
+                    } else {
+                        self.session_chat_auto_scroll = false;
+                        self.session_chat_scroll = self.session_chat_scroll.saturating_add(1);
+                    }
                     return Ok(());
                 }
                 KeyCode::Char('i') => {
@@ -543,59 +1107,65 @@ impl App {
                 // Quick-reply: when choices are detected and conversation pane
                 // is focused, number keys select and send a choice.
                 KeyCode::Char(c @ '1'..='9')
-                    if self.focus != Focus::Inspector && !self.quick_reply_choices.is_empty() =>
+                    if self.focus != Focus::Inspector
+                        && self.active_session_thread().as_ref().is_some_and(|thread| {
+                            self.thread_workspace(&thread.id)
+                                .is_some_and(|workspace| !workspace.quick_reply_choices.is_empty())
+                        }) =>
                 {
                     let idx = (c as usize) - ('1' as usize);
-                    if idx < self.quick_reply_choices.len() {
+                    if let Some(thread) = self.active_session_thread() {
+                        let choices = self
+                            .thread_workspace(&thread.id)
+                            .map(|workspace| workspace.quick_reply_choices.clone())
+                            .unwrap_or_default();
+                        if idx >= choices.len() {
+                            return Ok(());
+                        }
                         // Send the full choice text (e.g. "3. Both") for clarity
-                        let choice = format!("{}. {}", idx + 1, self.quick_reply_choices[idx]);
+                        let choice = format!("{}. {}", idx + 1, choices[idx]);
                         self.thread_compose_buffer = choice.clone();
                         self.thread_compose_cursor = choice.len();
                         self.input_buffer = choice;
                         self.input_cursor = self.input_buffer.len();
-                        if let Some(thread_id) =
-                            self.active_session_thread().map(|thread| thread.id.clone())
-                        {
-                            self.thread_compose_thread_id = Some(thread_id);
-                        }
+                        let draft_buffer = self.thread_compose_buffer.clone();
+                        let draft_cursor = self.thread_compose_cursor;
+                        let workspace = self.ensure_thread_workspace(&thread.id);
+                        workspace.compose_buffer = draft_buffer;
+                        workspace.compose_cursor = draft_cursor;
+                        self.thread_compose_thread_id = Some(thread.id);
                         self.submit_thread_compose_message()?;
                     }
                     return Ok(());
                 }
                 KeyCode::Char('1') => {
-                    self.inspector_tab = InspectorTab::Issue;
+                    self.set_current_inspector_tab(InspectorTab::Issue);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('2') => {
-                    self.inspector_tab = InspectorTab::Diff;
+                    self.set_current_inspector_tab(InspectorTab::Diff);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('3') => {
-                    self.inspector_tab = InspectorTab::Runtime;
+                    self.set_current_inspector_tab(InspectorTab::Runtime);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('4') => {
-                    self.inspector_tab = InspectorTab::Tests;
+                    self.set_current_inspector_tab(InspectorTab::Tests);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('5') => {
-                    self.inspector_tab = InspectorTab::Plan;
+                    self.set_current_inspector_tab(InspectorTab::Plan);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('6') => {
-                    self.inspector_tab = InspectorTab::Attachments;
+                    self.set_current_inspector_tab(InspectorTab::Attachments);
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
                     return Ok(());
                 }
                 KeyCode::Char('u') => {
@@ -726,8 +1296,7 @@ impl App {
                     .insert_str(self.input_cursor.min(self.input_buffer.len()), text);
                 self.input_cursor = (self.input_cursor + text.len()).min(self.input_buffer.len());
                 if self.input_mode == InputMode::ThreadCompose {
-                    self.thread_compose_buffer = self.input_buffer.clone();
-                    self.thread_compose_cursor = self.input_cursor;
+                    self.sync_thread_compose_shadow_from_input();
                 }
             }
             InputMode::TaskFilter => {
@@ -758,6 +1327,11 @@ impl App {
     /// single `process_pty_output()` pass runs so the parser state (scroll
     /// offset, screen content) is synced before the next frame is drawn.
     pub(super) fn handle_resize(&mut self, cols: u16, rows: u16) {
+        self.cached_compose_rect = None;
+        self.cached_compose_thread_id = None;
+        for workspace in self.thread_workspaces.values_mut() {
+            workspace.cached_compose_rect = None;
+        }
         for tab in &mut self.tabs {
             if let Tab::Session { terminals, .. } = tab {
                 let sizes = compute_pane_sizes_for_resize(&terminals.layout, cols, rows);
@@ -933,6 +1507,10 @@ impl App {
             return Ok(());
         }
 
+        if self.handle_inspector_mouse(mouse)? {
+            return Ok(());
+        }
+
         // --- Session tab mouse handling ---
         //
         // When the focused PTY application has enabled mouse tracking (e.g.
@@ -943,6 +1521,50 @@ impl App {
         // When mouse tracking is disabled (e.g. a plain shell), Claustre
         // handles events itself for scrollback and text selection.
         if self.active_tab > 0 {
+            let session_view_mode = match self.tabs.get(self.active_tab) {
+                Some(Tab::Session { view_mode, .. }) => *view_mode,
+                _ => SessionTabView::Terminal,
+            };
+
+            if session_view_mode == SessionTabView::Conversation
+                && self.input_mode == InputMode::Normal
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        if self.focus == Focus::Inspector {
+                            self.adjust_current_inspector_scroll(-1);
+                        } else if let Some(thread_id) =
+                            self.active_session_thread().map(|thread| thread.id)
+                        {
+                            self.scroll_thread_transcript_by(&thread_id, 1);
+                        } else {
+                            self.session_chat_auto_scroll = false;
+                            self.session_chat_scroll = self.session_chat_scroll.saturating_add(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if self.focus == Focus::Inspector {
+                            self.adjust_current_inspector_scroll(1);
+                        } else if let Some(thread_id) =
+                            self.active_session_thread().map(|thread| thread.id)
+                        {
+                            self.scroll_thread_transcript_by(&thread_id, -1);
+                        } else if self.session_chat_scroll > 0 {
+                            self.session_chat_scroll = self.session_chat_scroll.saturating_sub(1);
+                            if self.session_chat_scroll == 0 {
+                                self.session_chat_auto_scroll = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
             // Tab bar click: always handled by Claustre regardless of mouse mode
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let has_tab_bar = self.tabs.len() > 1;
@@ -1061,7 +1683,8 @@ impl App {
                                 // bottom of the output instead of the visible
                                 // region.
                                 term.prepare_for_render();
-                                let text = sel.extract_text(term.screen());
+                                let view = term.screen_view();
+                                let text = sel.extract_text(&view);
                                 term.restore_after_render();
                                 if !text.is_empty()
                                     && let Ok(mut clipboard) = arboard::Clipboard::new()
@@ -1140,10 +1763,10 @@ impl App {
                     if over_inspector {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
-                                self.inspector_scroll = self.inspector_scroll.saturating_sub(3);
+                                self.adjust_current_inspector_scroll(-1);
                             }
                             MouseEventKind::ScrollDown => {
-                                self.inspector_scroll = self.inspector_scroll.saturating_add(3);
+                                self.adjust_current_inspector_scroll(1);
                             }
                             _ => {}
                         }
@@ -1358,6 +1981,18 @@ impl App {
             self.open_adhoc_launch_modal()?;
             return Ok(());
         }
+        // R (Shift+R) force-relaunches the selected review/thread item.
+        if matches!(code, KeyCode::Char('R'))
+            && self.focus == Focus::Tasks
+            && matches!(
+                self.workbench_view,
+                WorkbenchView::Reviews | WorkbenchView::Threads
+            )
+            && let Some(thread) = self.selected_thread().cloned()
+        {
+            self.force_relaunch_thread(thread)?;
+            return Ok(());
+        }
         // R (Shift+R) to sync GitHub from any view
         if matches!(code, KeyCode::Char('R')) && self.focus == Focus::Tasks {
             self.refresh_board_issues();
@@ -1373,8 +2008,36 @@ impl App {
                 ReviewQueueTab::NeedsReview => ReviewQueueTab::Authored,
             };
             self.review_index = 0;
-            self.inspector_scroll = 0;
+            if let Some(thread) = self.selected_thread().cloned() {
+                self.set_thread_inspector_scroll(&thread.id, 0);
+            } else {
+                self.inspector_scroll = 0;
+            }
             self.refresh_review_selected_context();
+            return Ok(());
+        }
+        if matches!(code, KeyCode::Char('o'))
+            && modifiers == KeyModifiers::CONTROL
+            && self.focus == Focus::Tasks
+            && matches!(
+                self.workbench_view,
+                WorkbenchView::Threads | WorkbenchView::Reviews | WorkbenchView::MyTasks
+            )
+            && let Some(thread) = self.selected_thread().cloned()
+        {
+            self.open_thread_live_terminal(&thread)?;
+            return Ok(());
+        }
+        if matches!(code, KeyCode::Char('e'))
+            && modifiers == KeyModifiers::CONTROL
+            && self.focus == Focus::Tasks
+            && matches!(
+                self.workbench_view,
+                WorkbenchView::Threads | WorkbenchView::Reviews | WorkbenchView::MyTasks
+            )
+            && let Some(thread) = self.selected_thread().cloned()
+        {
+            self.open_thread_live_editor(&thread)?;
             return Ok(());
         }
         if modifiers.is_empty()
@@ -1398,6 +2061,14 @@ impl App {
             && self.workbench_view != WorkbenchView::Settings
         {
             self.open_project_picker()?;
+            return Ok(());
+        }
+        if modifiers.is_empty() && matches!(code, KeyCode::Char('?')) {
+            self.toggle_shortcuts_bar();
+            return Ok(());
+        }
+        if matches!(code, KeyCode::F(1)) {
+            self.input_mode = InputMode::HelpOverlay;
             return Ok(());
         }
         if modifiers.is_empty() && self.handle_settings_shortcuts(code)? {
@@ -1465,33 +2136,27 @@ impl App {
                     return Ok(true);
                 }
                 KeyCode::Char('1') => {
-                    self.inspector_tab = InspectorTab::Issue;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Issue);
                     return Ok(true);
                 }
                 KeyCode::Char('2') => {
-                    self.inspector_tab = InspectorTab::Diff;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Diff);
                     return Ok(true);
                 }
                 KeyCode::Char('3') => {
-                    self.inspector_tab = InspectorTab::Runtime;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Runtime);
                     return Ok(true);
                 }
                 KeyCode::Char('4') => {
-                    self.inspector_tab = InspectorTab::Tests;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Tests);
                     return Ok(true);
                 }
                 KeyCode::Char('5') => {
-                    self.inspector_tab = InspectorTab::Plan;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Plan);
                     return Ok(true);
                 }
                 KeyCode::Char('6') => {
-                    self.inspector_tab = InspectorTab::Attachments;
-                    self.inspector_scroll = 0;
+                    self.set_current_inspector_tab(InspectorTab::Attachments);
                     return Ok(true);
                 }
                 KeyCode::Esc if self.inspector_expanded => {
@@ -1517,7 +2182,8 @@ impl App {
                 } else {
                     match self.focus {
                         Focus::Projects => Focus::Tasks,
-                        Focus::Tasks | Focus::Inspector => Focus::Projects,
+                        Focus::Tasks => Focus::Projects,
+                        Focus::Inspector => Focus::Projects,
                     }
                 };
                 Ok(true)
@@ -1551,7 +2217,11 @@ impl App {
             .iter()
             .position(|candidate| *candidate == view)
             .unwrap_or(0);
-        self.inspector_scroll = 0;
+        if let Some(thread) = self.selected_thread().cloned() {
+            self.set_thread_inspector_scroll(&thread.id, 0);
+        } else {
+            self.inspector_scroll = 0;
+        }
         self.focus = Focus::Tasks;
         if view == WorkbenchView::SprintBoard {
             self.board_column_index = 0;
@@ -1584,8 +2254,6 @@ impl App {
         ) {
             self.input_mode = InputMode::Normal;
             self.thread_compose_thread_id = None;
-            self.thread_compose_buffer.clear();
-            self.thread_compose_cursor = 0;
         }
     }
 
@@ -1594,12 +2262,17 @@ impl App {
             return Ok(false);
         }
 
-        let section = SettingsSection::ALL
-            .get(self.settings_section_index)
-            .copied()
-            .unwrap_or(SettingsSection::AiProviders);
+        let section = self.selected_settings_section();
 
         match code {
+            KeyCode::Char('L') => {
+                self.move_settings_section_forward();
+                Ok(true)
+            }
+            KeyCode::Char('H') => {
+                self.move_settings_section_backward();
+                Ok(true)
+            }
             KeyCode::Enter => {
                 self.activate_settings_section(section)?;
                 Ok(true)
@@ -1714,16 +2387,36 @@ impl App {
                 self.start_settings_edit(SettingsEditTarget::RuntimeAttachmentsDir);
                 Ok(true)
             }
+            KeyCode::Char('j') if section == SettingsSection::Workflows => {
+                self.move_settings_workflow_forward();
+                Ok(true)
+            }
+            KeyCode::Char('k') if section == SettingsSection::Workflows => {
+                self.move_settings_workflow_backward();
+                Ok(true)
+            }
             KeyCode::Char('J') if section == SettingsSection::Workflows => {
-                let count = self.store.list_workflow_defs().map_or(0, |d| d.len());
-                if count > 0 {
-                    self.settings_workflow_index =
-                        (self.settings_workflow_index + 1).min(count.saturating_sub(1));
-                }
+                self.move_settings_workflow_stage_forward();
                 Ok(true)
             }
             KeyCode::Char('K') if section == SettingsSection::Workflows => {
-                self.settings_workflow_index = self.settings_workflow_index.saturating_sub(1);
+                self.move_settings_workflow_stage_backward();
+                Ok(true)
+            }
+            KeyCode::Char('p') if section == SettingsSection::Workflows => {
+                self.cycle_selected_workflow_stage_provider(true)?;
+                Ok(true)
+            }
+            KeyCode::Char('P') if section == SettingsSection::Workflows => {
+                self.cycle_selected_workflow_stage_provider(false)?;
+                Ok(true)
+            }
+            KeyCode::Char('a') if section == SettingsSection::Workflows => {
+                self.cycle_selected_workflow_stage_provider(true)?;
+                Ok(true)
+            }
+            KeyCode::Char('A') if section == SettingsSection::Workflows => {
+                self.cycle_selected_workflow_stage_provider(false)?;
                 Ok(true)
             }
             KeyCode::Char('n') if section == SettingsSection::Workflows => {
@@ -1746,6 +2439,11 @@ impl App {
                     Ok(()) => {
                         let _ = crate::workflows::sync_workflow_definitions(&self.store, None);
                         self.refresh_available_workflow_names();
+                        let count = self.store.list_workflow_defs().map_or(0, |defs| defs.len());
+                        if count > 0 {
+                            self.settings_workflow_index = count - 1;
+                        }
+                        self.settings_workflow_stage_index = 0;
                         self.show_toast(format!("Created workflow: {name}"), ToastStyle::Success);
                     }
                     Err(err) => {
@@ -1776,6 +2474,7 @@ impl App {
                                 if self.settings_workflow_index >= new_count && new_count > 0 {
                                     self.settings_workflow_index = new_count - 1;
                                 }
+                                self.clamp_settings_workflow_stage_index();
                                 self.show_toast(
                                     format!("Deleted workflow: {name}"),
                                     ToastStyle::Success,
@@ -1796,18 +2495,14 @@ impl App {
                 Ok(true)
             }
             KeyCode::Char('e') if section == SettingsSection::Workflows => {
-                // Edit the selected workflow's name (custom only)
+                // Edit the selected workflow's name.
                 let defs = self.store.list_workflow_defs().unwrap_or_default();
                 if let Some(def) = defs.get(self.settings_workflow_index) {
-                    if crate::workflows::is_builtin_workflow(&def.name) {
-                        self.show_toast("Cannot edit built-in workflows", ToastStyle::Info);
-                    } else {
-                        // Use the input buffer for inline editing
-                        self.input_buffer = def.name.clone();
-                        self.input_cursor = self.input_buffer.len();
-                        self.input_mode = InputMode::SettingsEdit;
-                        self.settings_edit_target = Some(SettingsEditTarget::WorkflowName);
-                    }
+                    // Built-ins are seeded into ~/.claustre/workflows/ and are editable there.
+                    self.input_buffer = def.name.clone();
+                    self.input_cursor = self.input_buffer.len();
+                    self.input_mode = InputMode::SettingsEdit;
+                    self.settings_edit_target = Some(SettingsEditTarget::WorkflowName);
                 }
                 Ok(true)
             }
@@ -2747,28 +3442,51 @@ impl App {
     }
 
     fn focus_thread_workspace(&mut self, thread_id: &str) {
-        // Find the session tab for this thread and switch to it.
-        let session_id = self
+        let _ = self.select_thread_workspace(thread_id);
+    }
+
+    pub(crate) fn select_thread_workspace(&mut self, thread_id: &str) -> bool {
+        let thread = self
             .threads
             .iter()
-            .find(|t| t.id == thread_id)
-            .and_then(|t| t.session_id.clone())
-            .or_else(|| {
-                self.store
-                    .get_thread(thread_id)
-                    .ok()
-                    .and_then(|t| t.session_id)
-            });
+            .find(|candidate| candidate.id == thread_id)
+            .cloned()
+            .or_else(|| self.store.get_thread(thread_id).ok());
+        let Some(thread) = thread else {
+            return false;
+        };
 
-        if let Some(ref sid) = session_id
-            && let Some(tab_idx) = self.tabs.iter().position(
-                |tab| matches!(tab, super::Tab::Session { session_id, .. } if session_id == sid),
-            )
+        if let Some(project_index) = self.projects.iter().position(|p| p.id == thread.project_id)
+            && self.project_index != project_index
         {
-            self.active_tab = tab_idx;
+            self.project_index = project_index;
+            let _ = self.refresh_data();
         }
-        // If no session tab exists, stay where we are — don't fall back to the
-        // inline Threads view which can't send messages or interact with Claude.
+
+        if let Some(index) = self
+            .threads
+            .iter()
+            .position(|candidate| candidate.id == thread.id)
+        {
+            self.thread_index = index;
+        } else {
+            let _ = self.refresh_data();
+            if let Some(index) = self
+                .threads
+                .iter()
+                .position(|candidate| candidate.id == thread.id)
+            {
+                self.thread_index = index;
+            } else {
+                return false;
+            }
+        }
+
+        self.active_tab = 0;
+        self.workbench_view = WorkbenchView::Threads;
+        self.focus = Focus::Tasks;
+        self.input_mode = InputMode::Normal;
+        true
     }
 
     fn start_thread_compose_for(&mut self, thread_id: &str, focus_workspace: bool) -> Result<()> {
@@ -2782,23 +3500,16 @@ impl App {
         };
 
         self.thread_index = index;
-        // When focus_workspace is true, try to switch to the thread's session
-        // tab instead of the inline Threads view (which can't send messages).
         if focus_workspace {
-            let thread = self.threads.get(index).cloned();
-            if let Some(ref t) = thread
-                && let Some(ref sid) = t.session_id
-                && let Some(tab_idx) = self.tabs.iter().position(
-                    |tab| matches!(tab, super::Tab::Session { session_id, .. } if session_id == sid),
-                )
-            {
-                self.active_tab = tab_idx;
-            }
+            let _ = self.select_thread_workspace(thread_id);
         }
         self.focus = Focus::Tasks;
+        self.cached_compose_rect = None;
+        self.cached_compose_thread_id = None;
+        self.ensure_thread_workspace(thread_id).cached_compose_rect = None;
+        self.reset_thread_chat_scroll(thread_id);
         self.thread_compose_thread_id = Some(thread_id.to_string());
-        self.input_buffer = self.thread_compose_buffer.clone();
-        self.input_cursor = self.thread_compose_cursor.min(self.input_buffer.len());
+        self.load_thread_draft_into_input(thread_id);
         self.input_mode = InputMode::ThreadCompose;
         Ok(())
     }
@@ -2812,14 +3523,18 @@ impl App {
         self.start_thread_compose_for(&thread.id, true)
     }
 
-    fn live_session_for_thread(
+    pub(crate) fn live_session_for_thread(
         &self,
         thread: &crate::store::Thread,
     ) -> Option<crate::store::Session> {
         thread.session_id.as_deref().and_then(|session_id| {
             self.sessions
                 .iter()
-                .find(|session| session.id == session_id && session.closed_at.is_none())
+                .find(|session| {
+                    session.id == session_id
+                        && session.closed_at.is_none()
+                        && std::path::Path::new(&session.worktree_path).exists()
+                })
                 .cloned()
         })
     }
@@ -2855,16 +3570,68 @@ impl App {
     }
 
     fn open_thread_live_session(&mut self, thread: &crate::store::Thread) -> Result<()> {
+        self.open_thread_live_session_in_view(thread, SessionTabView::Conversation)
+    }
+
+    fn open_thread_live_terminal(&mut self, thread: &crate::store::Thread) -> Result<()> {
+        self.open_thread_live_session_in_view(thread, SessionTabView::Terminal)
+    }
+
+    fn open_thread_live_editor(&mut self, thread: &crate::store::Thread) -> Result<()> {
+        self.open_thread_live_session_in_view(thread, SessionTabView::Editor)
+    }
+
+    fn open_thread_live_session_in_view(
+        &mut self,
+        thread: &crate::store::Thread,
+        view_mode: SessionTabView,
+    ) -> Result<()> {
         self.focus_thread_workspace(&thread.id);
         if let Some(session) = self.live_session_for_thread(thread) {
-            if !self.goto_session_tab(&session.id) {
-                self.restore_session_tab(&session)?;
-            } else if let Some(Tab::Session { view_mode, .. }) = self.tabs.iter_mut().find(
+            if !self.session_has_usable_claude_pane(&session.id) {
+                if let Err(error) = self.restore_session_tab(&session) {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        session_id = %session.id,
+                        "open_thread_live_session: failed to restore session tab: {error:#}"
+                    );
+                    self.show_toast(
+                        "Live session couldn't be restored — press l to continue it in a new session",
+                        ToastStyle::Error,
+                    );
+                    return Ok(());
+                }
+            } else if !self.goto_session_tab(&session.id) {
+                if let Err(error) = self.restore_session_tab(&session) {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        session_id = %session.id,
+                        "open_thread_live_session: failed to restore session tab: {error:#}"
+                    );
+                    self.show_toast(
+                        "Live session couldn't be restored — press l to continue it in a new session",
+                        ToastStyle::Error,
+                    );
+                    return Ok(());
+                }
+            }
+            let _ = self.goto_session_tab(&session.id);
+            if matches!(view_mode, SessionTabView::Editor) {
+                self.switch_to_editor()?;
+            } else if let Some(Tab::Session {
+                view_mode: current_view,
+                ..
+            }) = self.tabs.iter_mut().find(
                 |tab| matches!(tab, Tab::Session { session_id: sid, .. } if sid == &session.id),
             ) {
-                *view_mode = SessionTabView::Conversation;
+                *current_view = view_mode;
             }
-            self.show_toast("Opened live conversation session", ToastStyle::Success);
+            let message = match view_mode {
+                SessionTabView::Conversation => "Opened live conversation session",
+                SessionTabView::Terminal => "Opened live terminal session",
+                SessionTabView::Editor => "Opened live editor session",
+            };
+            self.show_toast(message, ToastStyle::Success);
         } else {
             self.show_toast(
                 "Thread is not live — press l to continue it first",
@@ -2876,15 +3643,34 @@ impl App {
 
     fn continue_thread(&mut self, thread: crate::store::Thread) -> Result<()> {
         self.focus_thread_workspace(&thread.id);
-        if self.live_session_for_thread(&thread).is_some() {
-            self.show_toast(
-                format!(
-                    "Thread is live via {} — just start typing here, or press o for the terminal",
-                    thread.provider_kind
-                ),
-                ToastStyle::Success,
+        if let Some(session) = self.live_session_for_thread(&thread) {
+            let has_tab = self.tabs.iter().any(
+                |tab| matches!(tab, Tab::Session { session_id, .. } if session_id == &session.id),
             );
-            return Ok(());
+            if has_tab {
+                self.show_toast(
+                    format!(
+                        "Thread is live via {} — just start typing here, or press Ctrl+O for the terminal",
+                        thread.provider_kind
+                    ),
+                    ToastStyle::Success,
+                );
+                return Ok(());
+            }
+
+            match self.restore_session_tab(&session) {
+                Ok(()) => {
+                    self.show_toast("Restored live conversation session", ToastStyle::Success);
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        session_id = %session.id,
+                        "continue_thread: failed to restore session tab: {error:#}"
+                    );
+                }
+            }
         }
 
         if self.session_op_in_progress {
@@ -2894,6 +3680,20 @@ impl App {
 
         self.spawn_thread_relaunch(thread.id);
         Ok(())
+    }
+
+    fn force_relaunch_thread(&mut self, thread: crate::store::Thread) -> Result<()> {
+        if self.session_op_in_progress {
+            self.show_toast("Session operation in progress...", ToastStyle::Info);
+            return Ok(());
+        }
+
+        self.focus_thread_workspace(&thread.id);
+        self.show_toast(
+            "Force relaunching thread in a fresh session...",
+            ToastStyle::Info,
+        );
+        self.full_relaunch_session(thread.session_id.clone(), thread.id)
     }
 
     /// Open neovim in a split pane in the session's worktree.
@@ -3069,48 +3869,189 @@ impl App {
         let Some(ref sid) = session_id else {
             return;
         };
+        self.refresh_session_output(sid);
         // Only drain when Claude is idle (DB status is Idle or in pty_idle_sessions)
         let is_idle = self
             .sessions
             .iter()
             .any(|s| s.id == *sid && s.claude_status == crate::store::ClaudeStatus::Idle)
-            || self.pty_idle_sessions.contains(sid.as_str());
+            || self.pty_idle_sessions.contains(sid.as_str())
+            || self.is_claude_idle_in_session(sid) == Some(true);
         if !is_idle {
             return;
         }
         let (thread_id, content, image_paths) =
             self.queued_compose_message.take().expect("checked above");
         if let Ok(thread) = self.store.get_thread(&thread_id) {
+            let _ = self.ensure_thread_session_tab_available(&thread);
             let prompt = augment_prompt_with_images(&content, &image_paths);
             let sent = self.send_to_active_session_claude(&prompt)
                 || self.send_prompt_to_live_thread_session(&thread, &prompt);
             if sent {
-                self.show_toast("Queued message sent to agent", ToastStyle::Success);
+                self.show_toast("Message sent to agent", ToastStyle::Success);
+                // Inject a user message into the conversation cache so it shows
+                // immediately in the chat view (for JSONL sessions).
                 if let Some(ref mut cache) = self.conversation_cache {
                     cache
                         .entries
                         .push(crate::conversation::ConversationEntry::UserMessage {
                             timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            text: content,
+                            text: content.clone(),
                         });
                 }
+                // Also persist a thread message so it shows in the timeline
+                // for non-JSONL providers (Codex etc.) where there is no
+                // conversation cache.
+                let _ = self
+                    .store
+                    .create_thread_message(&thread_id, None, "user", &content, &[]);
                 self.cached_chat_lines = None;
+                self.invalidate_thread_chat_cache(&thread_id);
             } else {
-                // Claude dead — try restart with image support
-                let _ = self.restart_claude_with_message(&thread, &content, &image_paths);
-                self.show_toast("Restarting Claude with queued message...", ToastStyle::Info);
+                // Provider process exited — check if we should restart.
+                // Only restart if the Claude pane is actually dead.
+                // If it's alive, the message was likely swallowed — don't
+                // inject a `codex resume` command into a live session.
+                let provider_alive = thread.session_id.as_deref().is_some_and(|sid| {
+                    self.tabs.iter().any(|tab| {
+                        if let Tab::Session {
+                            session_id,
+                            terminals,
+                            ..
+                        } = tab
+                            && session_id == sid
+                        {
+                            terminals
+                                .terminal(terminals.claude_pane_id)
+                                .is_some_and(|t| !t.exited())
+                                && !self
+                                    .is_shell_prompt_visible_in_session(sid)
+                                    .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    })
+                });
+                if provider_alive {
+                    // Provider is still alive but didn't accept input.
+                    // Re-queue and try again on next idle detection.
+                    self.queued_compose_message = Some((thread_id, content, image_paths));
+                    tracing::debug!("drain_compose: provider alive but not idle, re-queued");
+                } else {
+                    // Provider is dead. Try to restart it with the message.
+                    let restarted =
+                        self.restart_claude_with_message(&thread, &content, &image_paths);
+                    if restarted {
+                        self.show_toast(
+                            "Restarting agent with queued message...",
+                            ToastStyle::Info,
+                        );
+                    } else {
+                        // All panes are dead — can't restart. Persist the message
+                        // so it shows in the timeline, and tell the user to relaunch.
+                        let _ = self.store.create_thread_message(
+                            &thread_id,
+                            None,
+                            "user",
+                            &content,
+                            &[],
+                        );
+                        self.show_toast(
+                            "Session dead — message saved. Press l to relaunch.",
+                            ToastStyle::Error,
+                        );
+                        tracing::warn!(
+                            session_id = thread.session_id.as_deref().unwrap_or("?"),
+                            "drain_compose: all panes dead, dropped message"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Check the Claude pane's screen state in the active session tab.
-    /// Returns: `Some(true)` = Claude is at idle prompt (❯), `Some(false)` = Claude
-    /// is busy or showing other content, `None` = no session tab / pane not found.
-    fn is_claude_idle_in_active_session(&self) -> Option<bool> {
-        let Tab::Session { terminals, .. } = self.tabs.get(self.active_tab)? else {
-            return None;
-        };
-        terminals.with_claude_live_screen(|screen| super::screen_shows_idle_prompt(screen))
+    /// Force a full PTY drain for the matching session tab so hidden-session
+    /// state is current before we classify it.
+    fn refresh_session_output(&mut self, session_id: &str) {
+        for idx in (0..self.tabs.len()).rev() {
+            let Some(Tab::Session {
+                session_id: sid,
+                terminals,
+                ..
+            }) = self.tabs.get_mut(idx)
+            else {
+                continue;
+            };
+            if sid == session_id {
+                terminals.process_output_full();
+                break;
+            }
+        }
+    }
+
+    /// Check the Claude pane's screen state for an arbitrary session tab.
+    /// Returns: `Some(true)` when the Claude pane is at an idle prompt,
+    /// `Some(false)` when the pane is alive but busy, and `None` when the
+    /// session tab or Claude pane is unavailable.
+    fn is_claude_idle_in_session(&self, session_id: &str) -> Option<bool> {
+        self.tabs.iter().rev().find_map(|tab| {
+            let Tab::Session {
+                session_id: sid,
+                terminals,
+                ..
+            } = tab
+            else {
+                return None;
+            };
+            if sid != session_id {
+                return None;
+            }
+            terminals.with_claude_live_screen(|screen| {
+                if screen.contents().trim().is_empty() {
+                    None
+                } else {
+                    Some(super::screen_shows_idle_prompt(screen))
+                }
+            })?
+        })
+    }
+
+    /// Returns whether the Claude pane is showing the fallback shell prompt.
+    pub(super) fn is_shell_prompt_visible_in_session(&self, session_id: &str) -> Option<bool> {
+        self.tabs.iter().rev().find_map(|tab| {
+            let Tab::Session {
+                session_id: sid,
+                terminals,
+                ..
+            } = tab
+            else {
+                return None;
+            };
+            if sid != session_id {
+                return None;
+            }
+            terminals.with_claude_live_screen(|screen| super::screen_shows_shell_prompt(screen))
+        })
+    }
+
+    /// Returns whether the Claude pane for a given session tab has exited.
+    fn is_claude_pane_exited_for_session(&self, session_id: &str) -> Option<bool> {
+        self.tabs.iter().rev().find_map(|tab| {
+            let Tab::Session {
+                session_id: sid,
+                terminals,
+                ..
+            } = tab
+            else {
+                return None;
+            };
+            if sid != session_id {
+                return None;
+            }
+            terminals
+                .terminal(terminals.claude_pane_id)
+                .map(crate::pty::Terminal::exited)
+        })
     }
 
     /// Send a prompt directly to the active session tab's Claude pane.
@@ -3123,6 +4064,13 @@ impl App {
             );
             return false;
         };
+        if terminals
+            .with_claude_live_screen(|screen| super::screen_shows_shell_prompt(screen))
+            .unwrap_or(false)
+        {
+            tracing::debug!("send_to_active: claude pane is showing shell prompt");
+            return false;
+        }
         let pane_id = terminals.claude_pane_id;
         let Some(term) = terminals.terminal_mut(pane_id) else {
             tracing::debug!("send_to_active: no terminal for claude pane {pane_id}");
@@ -3173,28 +4121,41 @@ impl App {
         let Some(session_id) = thread.session_id.as_deref() else {
             return false;
         };
-        let Some(Tab::Session { terminals, .. }) = self
-            .tabs
-            .iter_mut()
-            .find(|tab| matches!(tab, Tab::Session { session_id: sid, .. } if sid == session_id))
-        else {
-            return false;
-        };
-
-        let pane_id = terminals.claude_pane_id;
-        let Some(term) = terminals.terminal_mut(pane_id) else {
-            return false;
-        };
-
-        term.reset_scrollback();
-        if term.exited() {
-            return false;
-        }
         let clean = prompt.replace('\n', " ");
-        if term.send_bytes(clean.as_bytes()).is_err() {
-            return false;
+        for idx in (0..self.tabs.len()).rev() {
+            let Some(Tab::Session {
+                session_id: sid,
+                terminals,
+                ..
+            }) = self.tabs.get_mut(idx)
+            else {
+                continue;
+            };
+            if sid != session_id {
+                continue;
+            }
+            if terminals
+                .with_claude_live_screen(|screen| super::screen_shows_shell_prompt(screen))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let pane_id = terminals.claude_pane_id;
+            let Some(term) = terminals.terminal_mut(pane_id) else {
+                continue;
+            };
+
+            term.reset_scrollback();
+            if term.exited() {
+                continue;
+            }
+            if term.send_bytes(clean.as_bytes()).is_ok() && term.send_bytes(b"\r").is_ok() {
+                return true;
+            }
         }
-        term.send_bytes(b"\r").is_ok()
+
+        false
     }
 
     /// Restart Claude Code in the existing shell PTY when Claude has exited.
@@ -3216,7 +4177,11 @@ impl App {
             Err(_) => return false,
         };
 
-        tracing::debug!(session_id, image_count = image_paths.len(), "restart_claude: building resume command");
+        tracing::debug!(
+            session_id,
+            image_count = image_paths.len(),
+            "restart_claude: building resume command"
+        );
         // Build resume command: claude --resume <csid> -p "message"
         // Images are included as path references in the prompt text
         // (Claude Code CLI doesn't support --image flags).
@@ -3388,13 +4353,11 @@ impl App {
                             cache.entries.clear();
                         }
                         self.cached_chat_lines = None;
+                        self.invalidate_thread_chat_cache(&thread_id);
                         return Ok(());
                     }
                     Err(e) => {
-                        self.show_toast(
-                            format!("In-place restart failed: {e}"),
-                            ToastStyle::Error,
-                        );
+                        self.show_toast(format!("In-place restart failed: {e}"), ToastStyle::Error);
                         tracing::warn!("in-place restart failed: {e:#}");
                         return self.full_relaunch_session(session_id, thread_id);
                     }
@@ -3469,6 +4432,11 @@ impl App {
                 self.show_toast(format!("Stage approved: {stage_name}"), ToastStyle::Success);
                 // Clear stale quick-reply choices from the previous stage
                 self.quick_reply_choices.clear();
+                if let Some(thread) = self.active_session_thread() {
+                    self.ensure_thread_workspace(&thread.id)
+                        .quick_reply_choices
+                        .clear();
+                }
                 // Add visual feedback in the conversation timeline
                 if let Some(ref mut cache) = self.conversation_cache {
                     cache
@@ -3479,6 +4447,9 @@ impl App {
                         });
                 }
                 self.cached_chat_lines = None;
+                if let Some(thread) = self.active_session_thread() {
+                    self.invalidate_thread_chat_cache(&thread.id);
+                }
                 // Reset conversation cache offset so next refresh picks up new JSONL entries
                 // from the restarted Claude process
                 if let Some(ref mut cache) = self.conversation_cache {
@@ -3504,7 +4475,13 @@ impl App {
             return Ok(());
         };
 
-        let content = self.thread_compose_buffer.trim().to_string();
+        let content = if self.input_mode == InputMode::ThreadCompose {
+            self.input_buffer.trim().to_string()
+        } else {
+            self.thread_workspace(&thread_id)
+                .map(|workspace| workspace.compose_buffer.trim().to_string())
+                .unwrap_or_default()
+        };
         tracing::debug!(
             thread_id = %thread_id,
             content_len = content.len(),
@@ -3521,10 +4498,10 @@ impl App {
         self.compose_history_index = None;
 
         // Snap chat scroll to bottom when sending a message
-        self.session_chat_scroll = 0;
-        self.session_chat_auto_scroll = true;
+        self.reset_thread_chat_scroll(&thread_id);
 
         let thread = self.store.get_thread(&thread_id)?;
+        let _ = self.ensure_thread_session_tab_available(&thread);
         let latest_run_id = self
             .store
             .list_thread_runs(&thread.id)?
@@ -3561,9 +4538,13 @@ impl App {
 
         self.store
             .update_thread_status(&thread.id, crate::store::ThreadStatus::Running)?;
+        self.mark_thread_session_resumed(&thread, "Native compose message sent");
 
         // Clear quick-reply choices since the user is responding
         self.quick_reply_choices.clear();
+        self.ensure_thread_workspace(&thread.id)
+            .quick_reply_choices
+            .clear();
 
         // Determine Claude's state to pick the right send strategy:
         // 1. Dead (PTY exited, or pty_idle + no ❯ prompt) → restart with --resume
@@ -3574,19 +4555,18 @@ impl App {
         // text with image path instructions (Claude can Read image files).
         // The restart path uses native --image flags for cleaner delivery.
         let session_id = thread.session_id.as_deref();
-        let claude_pane_exited = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|tab| {
-                if let Tab::Session { terminals, .. } = tab {
-                    terminals
-                        .terminal(terminals.claude_pane_id)
-                        .map(|t| t.exited())
-                } else {
-                    None
-                }
-            })
+        if let Some(sid) = session_id {
+            self.refresh_session_output(sid);
+        }
+        let session_idle_prompt = session_id.and_then(|sid| self.is_claude_idle_in_session(sid));
+        let shell_prompt_visible = session_id
+            .and_then(|sid| self.is_shell_prompt_visible_in_session(sid))
             .unwrap_or(false);
+        let claude_pane_exited = session_id
+            .and_then(|sid| self.is_claude_pane_exited_for_session(sid))
+            .unwrap_or(false);
+        let usable_claude_pane =
+            session_id.is_some_and(|sid| self.session_has_usable_claude_pane(sid));
         // If we recently restarted Claude in the shell pane (within 60s),
         // don't declare it dead — give it time to start and process.
         let restart_cooldown = session_id.is_some_and(|sid| {
@@ -3595,17 +4575,21 @@ impl App {
                 .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
         });
         let claude_dead = !restart_cooldown
-            && (claude_pane_exited
+            && (!usable_claude_pane
+                || claude_pane_exited
+                || shell_prompt_visible
                 || session_id.is_some_and(|sid| {
-                    self.pty_idle_sessions.contains(sid)
-                        && self.is_claude_idle_in_active_session() != Some(true)
+                    self.pty_idle_sessions.contains(sid) && session_idle_prompt != Some(true)
                 }));
         let claude_working = session_id.is_some_and(|sid| {
-            self.sessions
-                .iter()
-                .any(|s| s.id == sid && s.claude_status == crate::store::ClaudeStatus::Working)
+            usable_claude_pane
+                && !shell_prompt_visible
+                && session_idle_prompt == Some(false)
+                && self
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == sid && s.claude_status == crate::store::ClaudeStatus::Working)
                 && !self.pty_idle_sessions.contains(sid)
-                && self.is_claude_idle_in_active_session() != Some(true)
         });
 
         tracing::debug!(
@@ -3613,8 +4597,10 @@ impl App {
             claude_pane_exited,
             claude_dead,
             claude_working,
+            shell_prompt_visible,
+            usable_claude_pane,
             image_count = image_paths.len(),
-            idle = ?self.is_claude_idle_in_active_session(),
+            idle = ?session_idle_prompt,
             "compose: send strategy"
         );
 
@@ -3624,12 +4610,8 @@ impl App {
             // becomes idle. Don't try direct send (the original claude
             // pane is dead) or restart (would double-restart).
             tracing::debug!("compose: restart cooldown active → queuing message");
-            self.queued_compose_message =
-                Some((thread.id.clone(), content.clone(), image_paths));
-            self.show_toast(
-                "Message queued — Claude is restarting",
-                ToastStyle::Info,
-            );
+            self.queued_compose_message = Some((thread.id.clone(), content.clone(), image_paths));
+            self.show_toast("Message queued — Claude is restarting", ToastStyle::Info);
         } else if claude_dead {
             // Claude is dead — try restart, then direct send, then tell user
             tracing::info!("compose: claude dead → attempting restart");
@@ -3652,8 +4634,7 @@ impl App {
             }
         } else if claude_working {
             tracing::debug!("compose: claude working → queuing message");
-            self.queued_compose_message =
-                Some((thread.id.clone(), content.clone(), image_paths));
+            self.queued_compose_message = Some((thread.id.clone(), content.clone(), image_paths));
             self.show_toast(
                 "Message queued — will send when Claude finishes",
                 ToastStyle::Info,
@@ -3676,8 +4657,7 @@ impl App {
             } else {
                 // PTY send failed — try restart as last resort
                 tracing::info!("compose: direct send failed → attempting restart");
-                let restarted =
-                    self.restart_claude_with_message(&thread, &content, &image_paths);
+                let restarted = self.restart_claude_with_message(&thread, &content, &image_paths);
                 tracing::debug!(restarted, "compose: fallback restart result");
                 if restarted {
                     self.show_toast("Resuming Claude session...", ToastStyle::Info);
@@ -3703,9 +4683,9 @@ impl App {
         }
         // Invalidate rendered line cache so the timeline rebuilds with the new message
         self.cached_chat_lines = None;
+        self.invalidate_thread_chat_cache(&thread.id);
 
-        self.thread_compose_buffer.clear();
-        self.thread_compose_cursor = 0;
+        self.clear_thread_draft(&thread.id);
         self.input_buffer.clear();
         self.input_cursor = 0;
         // Stay in compose mode so the user can keep chatting without pressing
@@ -3981,8 +4961,6 @@ impl App {
                     if let Some(cmd) = self.slash_suggestions.get(self.slash_suggestion_index) {
                         self.input_buffer = format!("/{cmd}");
                         self.input_cursor = self.input_buffer.len();
-                        self.thread_compose_buffer = self.input_buffer.clone();
-                        self.thread_compose_cursor = self.input_cursor;
                     }
                     self.slash_suggestions.clear();
                     self.slash_suggestion_index = 0;
@@ -4004,18 +4982,56 @@ impl App {
         // Let tab-switching and dashboard keys pass through compose mode
         // so the user is never trapped in compose.
         match (code, modifiers) {
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                    self.input_mode = InputMode::Normal;
+                    if let Some(thread) = self
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == thread_id)
+                        .cloned()
+                        .or_else(|| self.store.get_thread(&thread_id).ok())
+                    {
+                        self.open_thread_live_terminal(&thread)?;
+                    } else {
+                        self.show_toast("Thread not found", ToastStyle::Error);
+                    }
+                }
+                return Ok(());
+            }
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                    self.input_mode = InputMode::Normal;
+                    if let Some(thread) = self
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == thread_id)
+                        .cloned()
+                        .or_else(|| self.store.get_thread(&thread_id).ok())
+                    {
+                        self.open_thread_live_editor(&thread)?;
+                    } else {
+                        self.show_toast("Thread not found", ToastStyle::Error);
+                    }
+                }
+                return Ok(());
+            }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 // Save draft and go to dashboard
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                }
                 self.input_mode = InputMode::Normal;
                 self.active_tab = 0;
                 return Ok(());
             }
             (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Save draft and switch to next tab
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                }
                 self.input_mode = InputMode::Normal;
                 if self.tabs.len() > 1 {
                     self.active_tab = (self.active_tab + 1) % self.tabs.len();
@@ -4024,8 +5040,9 @@ impl App {
             }
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                 // Save draft and switch to previous tab
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                }
                 self.input_mode = InputMode::Normal;
                 if self.tabs.len() > 1 {
                     self.active_tab = if self.active_tab == 0 {
@@ -4041,19 +5058,36 @@ impl App {
 
         match code {
             KeyCode::Esc => {
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                }
                 self.slash_suggestions.clear();
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Enter => {
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.sync_thread_draft_from_input(&thread_id);
+                }
                 self.slash_suggestions.clear();
                 self.submit_thread_compose_message()?;
             }
+            KeyCode::Char('g') if modifiers == KeyModifiers::CONTROL => {
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.reset_thread_chat_scroll(&thread_id);
+                }
+            }
             KeyCode::Char('v') if modifiers == KeyModifiers::CONTROL => {
                 self.smart_paste_into_compose()?;
+            }
+            KeyCode::Char('k') if modifiers.is_empty() && self.input_buffer.is_empty() => {
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.scroll_thread_transcript_by(&thread_id, 1);
+                }
+            }
+            KeyCode::Char('j') if modifiers.is_empty() && self.input_buffer.is_empty() => {
+                if let Some(thread_id) = self.thread_compose_thread_id.clone() {
+                    self.scroll_thread_transcript_by(&thread_id, -1);
+                }
             }
             // Up arrow: cycle to previous compose history entry
             KeyCode::Up if modifiers.is_empty() && !self.compose_history.is_empty() => {
@@ -4065,8 +5099,7 @@ impl App {
                 self.compose_history_index = Some(new_idx);
                 self.input_buffer.clone_from(&self.compose_history[new_idx]);
                 self.input_cursor = self.input_buffer.len();
-                self.thread_compose_buffer.clone_from(&self.input_buffer);
-                self.thread_compose_cursor = self.input_cursor;
+                self.sync_thread_compose_shadow_from_input();
             }
             // Down arrow: cycle to next compose history entry (or clear)
             KeyCode::Down if modifiers.is_empty() && self.compose_history_index.is_some() => {
@@ -4081,8 +5114,7 @@ impl App {
                     self.input_buffer.clear();
                 }
                 self.input_cursor = self.input_buffer.len();
-                self.thread_compose_buffer.clone_from(&self.input_buffer);
-                self.thread_compose_cursor = self.input_cursor;
+                self.sync_thread_compose_shadow_from_input();
             }
             _ => {
                 let _ = apply_text_edit(
@@ -4091,13 +5123,12 @@ impl App {
                     code,
                     modifiers,
                 );
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor.min(self.input_buffer.len());
 
                 // Update slash command suggestions
                 self.update_slash_suggestions();
                 // Reset history browsing when user types
                 self.compose_history_index = None;
+                self.sync_thread_compose_shadow_from_input();
             }
         }
         Ok(())
@@ -4173,8 +5204,6 @@ impl App {
                     .insert_str(self.input_cursor.min(self.input_buffer.len()), &ref_text);
                 self.input_cursor =
                     (self.input_cursor + ref_text.len()).min(self.input_buffer.len());
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor;
                 self.show_toast(
                     format!("Image attached: {}", attachment.file_name),
                     ToastStyle::Success,
@@ -4185,13 +5214,12 @@ impl App {
                 self.input_buffer
                     .insert_str(self.input_cursor.min(self.input_buffer.len()), &text);
                 self.input_cursor = (self.input_cursor + text.len()).min(self.input_buffer.len());
-                self.thread_compose_buffer = self.input_buffer.clone();
-                self.thread_compose_cursor = self.input_cursor;
             }
             Err(err) => {
                 self.show_toast(format!("Paste failed: {err:#}"), ToastStyle::Error);
             }
         }
+        self.sync_thread_compose_shadow_from_input();
         Ok(())
     }
 
@@ -4636,7 +5664,14 @@ impl App {
                     } else if self.workbench_view == WorkbenchView::Reviews {
                         if let Some(thread) = self.selected_thread().cloned() {
                             self.focus_thread_workspace(&thread.id);
-                            self.show_toast("Focused review thread", ToastStyle::Info);
+                            if self.live_session_for_thread(&thread).is_some() {
+                                self.open_thread_live_session(&thread)?;
+                            } else {
+                                self.show_toast(
+                                    "Focused review thread — press l to continue it",
+                                    ToastStyle::Info,
+                                );
+                            }
                         } else if self.selected_review_item().is_some() {
                             // Open the drawer instead of immediately launching
                             self.review_drawer_tab = super::ReviewDrawerTab::Description;
@@ -4925,8 +5960,7 @@ impl App {
                     }
                 } else if self.workbench_view == WorkbenchView::Reviews {
                     if let Some(thread) = self.selected_thread().cloned() {
-                        self.focus_thread_workspace(&thread.id);
-                        self.show_toast("Focused existing thread", ToastStyle::Info);
+                        self.continue_thread(thread)?;
                     } else {
                         self.open_review_launch_modal()?;
                     }
@@ -5784,9 +6818,11 @@ impl App {
                     }
                 }
                 WorkbenchView::Settings => {
-                    self.settings_section_index = (self.settings_section_index + 1)
-                        .min(SettingsSection::ALL.len().saturating_sub(1));
-                    self.maybe_prefetch_github_installations();
+                    if self.selected_settings_section() == SettingsSection::Workflows {
+                        self.move_settings_workflow_forward();
+                    } else {
+                        self.move_settings_section_forward();
+                    }
                 }
                 _ => {
                     let visible_count = self.visible_tasks().len();
@@ -5797,7 +6833,7 @@ impl App {
                 }
             },
             Focus::Inspector => {
-                self.inspector_scroll = self.inspector_scroll.saturating_add(1);
+                self.adjust_current_inspector_scroll(1);
             }
         }
     }
@@ -5816,15 +6852,18 @@ impl App {
                     self.thread_index = self.thread_index.saturating_sub(1);
                 }
                 WorkbenchView::Settings => {
-                    self.settings_section_index = self.settings_section_index.saturating_sub(1);
-                    self.maybe_prefetch_github_installations();
+                    if self.selected_settings_section() == SettingsSection::Workflows {
+                        self.move_settings_workflow_backward();
+                    } else {
+                        self.move_settings_section_backward();
+                    }
                 }
                 _ => {
                     self.task_index = self.task_index.saturating_sub(1);
                 }
             },
             Focus::Inspector => {
-                self.inspector_scroll = self.inspector_scroll.saturating_sub(1);
+                self.adjust_current_inspector_scroll(-1);
             }
         }
     }
@@ -6054,6 +7093,10 @@ impl App {
                 return Ok(());
             }
             (KeyCode::Char('?'), KeyModifiers::NONE) => {
+                self.toggle_shortcuts_bar();
+                return Ok(());
+            }
+            (KeyCode::F(1), _) => {
                 self.input_mode = InputMode::HelpOverlay;
                 return Ok(());
             }
@@ -7206,6 +8249,14 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.open_review_launch_modal()?;
             }
+            KeyCode::Char('R') if modifiers.is_empty() => {
+                self.input_mode = InputMode::Normal;
+                if let Some(thread) = self.selected_thread().cloned() {
+                    self.force_relaunch_thread(thread)?;
+                } else {
+                    self.open_review_launch_modal()?;
+                }
+            }
             KeyCode::Char('o') if modifiers.is_empty() => {
                 if let Some(item) = self.selected_review_item() {
                     let _ = std::process::Command::new("open")
@@ -8041,7 +9092,7 @@ pub(crate) fn encode_mouse_event(
     kind: &MouseEventKind,
     vt_col: u16,
     vt_row: u16,
-    encoding: vt100::MouseProtocolEncoding,
+    encoding: crate::pty::MouseEncoding,
 ) -> Option<Vec<u8>> {
     // SGR uses 1-based coordinates
     let x = u32::from(vt_col) + 1;
@@ -8064,7 +9115,7 @@ pub(crate) fn encode_mouse_event(
     };
 
     match encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
+        crate::pty::MouseEncoding::Sgr => {
             let suffix = if is_release { 'm' } else { 'M' };
             Some(format!("\x1b[<{button};{x};{y}{suffix}").into_bytes())
         }

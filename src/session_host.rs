@@ -271,13 +271,15 @@ pub fn run(session_id: &str, cmd_args: &[String], worktree_path: &str) -> Result
 /// session-host's terminal state — in particular, the mouse protocol mode is
 /// preserved so scroll events are forwarded correctly after reconnection.
 fn render_screen_snapshot(parser: &Parser) -> Vec<u8> {
-    let screen = parser.screen();
+    use crate::pty::screen_view::{ScreenView, Vt100ScreenView};
+
+    let view = Vt100ScreenView(parser.screen());
 
     // Reset terminal state first so the formatted output starts from a clean
     // baseline, then emit the full screen contents + input modes + title.
     let mut buf = Vec::with_capacity(4096);
     buf.extend_from_slice(b"\x1b[H\x1b[2J\x1b[0m");
-    buf.extend_from_slice(&screen.state_formatted());
+    buf.extend_from_slice(&view.state_formatted());
     buf
 }
 

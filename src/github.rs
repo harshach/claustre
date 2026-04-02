@@ -2035,9 +2035,7 @@ fn github_api_list_paginated_with_token(token: &str, endpoint: &str) -> Result<V
             .call()
             .map_err(http_error)?;
 
-        let next_url = response
-            .header("Link")
-            .and_then(parse_next_link_url);
+        let next_url = response.header("Link").and_then(parse_next_link_url);
 
         let page: Vec<Value> = response
             .into_json()

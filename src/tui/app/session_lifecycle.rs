@@ -6,7 +6,7 @@ use crate::pty::SessionTerminals;
 use crate::store::{Task, TaskStatus, ThreadStatus};
 
 use super::{
-    App, SessionOpResult, SessionTabView, TOAST_DURATION, Tab, ToastStyle,
+    App, Focus, InputMode, SessionOpResult, SessionTabView, TOAST_DURATION, Tab, ToastStyle,
     compute_pane_sizes_for_resize, fallback_title,
 };
 
@@ -216,6 +216,10 @@ impl App {
 
     /// Close the active thread session: set thread to Done, clear `session_id`, tear down.
     /// Always requires double-press: first `q` shows confirmation, second `q` actually closes.
+    #[expect(
+        dead_code,
+        reason = "kept as the shared close-thread-session path while the thread workspace refactor is still consolidating call sites"
+    )]
     pub fn close_active_thread_session(&mut self) -> Result<()> {
         let Some(thread) = self.active_session_thread() else {
             return Ok(());
@@ -225,11 +229,12 @@ impl App {
         };
 
         // If there's unsent compose text, first `q` clears it as a warning
-        if !self.thread_compose_buffer.is_empty()
-            && self.thread_compose_thread_id.as_deref() == Some(&thread.id)
+        if self.thread_compose_thread_id.as_deref() == Some(&thread.id)
+            && self
+                .thread_workspace(&thread.id)
+                .is_some_and(|workspace| !workspace.compose_buffer.is_empty())
         {
-            self.thread_compose_buffer.clear();
-            self.thread_compose_cursor = 0;
+            self.clear_thread_draft(&thread.id);
             self.thread_compose_thread_id = None;
             self.show_toast(
                 "Compose text cleared. Press q again to close session.",
@@ -352,7 +357,7 @@ impl App {
         session_id: String,
         terminals: Box<SessionTerminals>,
         label: String,
-    ) {
+    ) -> usize {
         // Ensure a thread workspace exists for session bridging (side-effectful).
         let _ = self.ensure_session_thread_workspace(&session_id)
             || self
@@ -361,15 +366,62 @@ impl App {
                 .ok()
                 .flatten()
                 .is_some();
-        let view_mode = SessionTabView::Conversation;
-        tracing::debug!(session_id = %session_id, label = %label, "add_session_tab: conversation mode");
-        self.tabs.push(Tab::Session {
-            session_id,
-            terminals,
-            label,
-            view_mode,
-        });
-        // Don't auto-switch to the new tab — stay on dashboard
+        let thread_id = self
+            .store
+            .find_thread_for_session(&session_id)
+            .ok()
+            .flatten()
+            .map(|thread| {
+                self.ensure_thread_workspace(&thread.id);
+                thread.id
+            });
+        let mut existing_indices = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                matches!(tab, Tab::Session { session_id: sid, .. } if sid == &session_id)
+                    .then_some(idx)
+            })
+            .collect::<Vec<_>>();
+        let primary_idx = existing_indices.first().copied();
+        let view_mode = primary_idx
+            .and_then(|idx| match self.tabs.get(idx) {
+                Some(Tab::Session { view_mode, .. }) => Some(*view_mode),
+                _ => None,
+            })
+            .unwrap_or(SessionTabView::Conversation);
+        tracing::debug!(session_id = %session_id, label = %label, "add_session_tab: canonicalizing session tab");
+
+        if let Some(idx) = primary_idx {
+            self.tabs[idx] = Tab::Session {
+                session_id,
+                thread_id,
+                terminals,
+                label,
+                view_mode,
+            };
+
+            existing_indices.reverse();
+            for duplicate_idx in existing_indices.into_iter().filter(|dup| *dup != idx) {
+                self.tabs.remove(duplicate_idx);
+                if self.active_tab > duplicate_idx {
+                    self.active_tab -= 1;
+                } else if self.active_tab == duplicate_idx {
+                    self.active_tab = idx.min(self.tabs.len().saturating_sub(1));
+                }
+            }
+            idx
+        } else {
+            self.tabs.push(Tab::Session {
+                session_id,
+                thread_id,
+                terminals,
+                label,
+                view_mode,
+            });
+            self.tabs.len() - 1
+        }
     }
 
     /// Remove a session tab by session ID. Returns to dashboard if it was active.
@@ -405,6 +457,8 @@ impl App {
             .position(|t| matches!(t, Tab::Session { session_id: sid, .. } if sid == session_id))
         {
             self.active_tab = idx;
+            self.focus = Focus::Tasks;
+            self.input_mode = InputMode::Normal;
             // Reset chat scroll when switching sessions
             self.session_chat_scroll = 0;
             self.session_chat_auto_scroll = true;
@@ -412,6 +466,10 @@ impl App {
                 && let Some(Tab::Session { view_mode, .. }) = self.tabs.get_mut(idx)
             {
                 *view_mode = SessionTabView::Conversation;
+            }
+            self.refresh_session_thread_context();
+            if let Some(thread) = self.active_session_thread() {
+                self.reset_thread_chat_scroll(&thread.id);
             }
             true
         } else {

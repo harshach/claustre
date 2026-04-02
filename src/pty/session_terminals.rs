@@ -11,6 +11,7 @@ use super::layout::{
     LayoutNode, SplitDirection, build_layout_from_config, collect_pane_ids, default_shell,
     remove_leaf, replace_leaf,
 };
+use super::screen_view::ScreenView;
 use super::selection::Selection;
 use super::terminal_trait::Terminal;
 
@@ -162,9 +163,13 @@ impl SessionTerminals {
     ///
     /// Since the parser is always at scrollback 0 (render-phase-only
     /// invariant), this is a simple read — no save/restore needed.
-    pub fn with_claude_live_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
+    pub fn with_claude_live_screen<R>(
+        &self,
+        f: impl FnOnce(&dyn super::screen_view::ScreenView) -> R,
+    ) -> Option<R> {
         let info = self.panes.get(&self.claude_pane_id)?;
-        Some(f(info.terminal.screen()))
+        let view = info.terminal.screen_view();
+        Some(f(&view))
     }
 
     /// Cycle focus to the next pane (DFS order).
@@ -331,7 +336,7 @@ impl SessionTerminals {
             anyhow::bail!("provider pane not found");
         };
 
-        let (rows, cols) = info.terminal.screen().size();
+        let (rows, cols) = info.terminal.screen_view().size();
         let terminal = EmbeddedTerminal::spawn(cmd, rows, cols)?;
         info.terminal = Box::new(terminal);
         info.label = label.to_string();
@@ -366,6 +371,28 @@ impl SessionTerminals {
         }
     }
 
+    /// Drain output only for panes currently visible in the layout tree.
+    ///
+    /// Hidden panes such as the off-layout editor should not consume frame
+    /// budget on the hot path when the user is interacting elsewhere.
+    pub fn process_layout_output(&mut self) {
+        let pane_ids = self.pane_ids_in_order();
+        for id in pane_ids {
+            if let Some(info) = self.panes.get_mut(&id) {
+                info.terminal.process_output();
+            }
+        }
+    }
+
+    /// Drain output only for the editor pane when it exists.
+    pub fn process_editor_output(&mut self) {
+        if let Some(id) = self.editor_pane_id
+            && let Some(info) = self.panes.get_mut(&id)
+        {
+            info.terminal.process_output();
+        }
+    }
+
     /// Drain all pending output from every pane without a byte budget.
     /// Used when a session tab becomes active to flush any backlog
     /// accumulated during slower dashboard ticks.
@@ -383,9 +410,47 @@ impl SessionTerminals {
         }
     }
 
+    /// Prepare only panes visible in the layout tree for rendering.
+    pub fn prepare_layout_for_render(&mut self) {
+        let pane_ids = self.pane_ids_in_order();
+        for id in pane_ids {
+            if let Some(info) = self.panes.get_mut(&id) {
+                info.terminal.prepare_for_render();
+            }
+        }
+    }
+
+    /// Prepare only the editor pane for rendering.
+    pub fn prepare_editor_for_render(&mut self) {
+        if let Some(id) = self.editor_pane_id
+            && let Some(info) = self.panes.get_mut(&id)
+        {
+            info.terminal.prepare_for_render();
+        }
+    }
+
     /// Restore all parsers to the live screen after rendering.
     pub fn restore_after_render(&mut self) {
         for info in self.panes.values_mut() {
+            info.terminal.restore_after_render();
+        }
+    }
+
+    /// Restore only panes visible in the layout tree after rendering.
+    pub fn restore_layout_after_render(&mut self) {
+        let pane_ids = self.pane_ids_in_order();
+        for id in pane_ids {
+            if let Some(info) = self.panes.get_mut(&id) {
+                info.terminal.restore_after_render();
+            }
+        }
+    }
+
+    /// Restore only the editor pane after rendering.
+    pub fn restore_editor_after_render(&mut self) {
+        if let Some(id) = self.editor_pane_id
+            && let Some(info) = self.panes.get_mut(&id)
+        {
             info.terminal.restore_after_render();
         }
     }
@@ -402,7 +467,7 @@ impl SessionTerminals {
     pub fn resize_panes_with_clear(&mut self, sizes: &[(PaneId, u16, u16)]) -> Result<()> {
         for &(id, rows, cols) in sizes {
             if let Some(info) = self.panes.get_mut(&id) {
-                let old_cols = info.terminal.screen().size().1;
+                let old_cols = info.terminal.screen_view().size().1;
                 info.terminal.resize(rows, cols)?;
                 if cols != old_cols {
                     info.terminal.clear_screen();

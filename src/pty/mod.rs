@@ -5,6 +5,7 @@
 
 pub mod protocol;
 pub(crate) mod remote;
+pub mod screen_view;
 pub(crate) mod terminal_trait;
 mod widget;
 pub use widget::TerminalWidget;
@@ -19,6 +20,9 @@ pub(crate) use embedded::Backend;
 pub use embedded::EmbeddedTerminal;
 pub use layout::{LayoutNode, SplitDirection};
 pub(crate) use remote::RemoteTerminal;
+pub use screen_view::{
+    CellView, MouseEncoding, MouseMode, ScreenView, ScreenViewRef, TermColor, Vt100ScreenView,
+};
 pub use selection::Selection;
 pub use session_terminals::SessionTerminals;
 pub(crate) use terminal_trait::Terminal;
@@ -32,9 +36,10 @@ pub type PaneId = u16;
 /// massive burst of output (e.g. a large diff).  Data beyond this budget
 /// stays in the channel and is drained on subsequent ticks.
 ///
-/// 256 KB at 60 fps ≈ 15 MB/s sustained throughput — well above normal
-/// interactive output while preventing multi-second freezes on bulk data.
-const PROCESS_BYTE_BUDGET: usize = 256 * 1024;
+/// 64 KB at 60 fps ≈ 3.8 MB/s sustained throughput — still well above
+/// normal interactive typing/streaming while reducing worst-case per-frame
+/// parser work when a pane emits a large burst of output.
+const PROCESS_BYTE_BUDGET: usize = 64 * 1024;
 
 /// Lines of scrollback history kept by the vt100 parser.
 const SCROLLBACK_LINES: usize = 5_000;
@@ -887,7 +892,10 @@ mod tests {
     #[test]
     fn mouse_protocol_mode_default_is_none() {
         let (term, _tx) = test_terminal(24, 80);
-        assert_eq!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_eq!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
     }
 
     #[test]
@@ -896,10 +904,13 @@ mod tests {
         // Enable SGR mouse mode (1000=press/release, 1006=SGR encoding)
         tx.send(b"\x1b[?1000h\x1b[?1006h".to_vec()).unwrap();
         term.process_output();
-        assert_ne!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_ne!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
         assert_eq!(
             term.mouse_protocol_encoding(),
-            vt100::MouseProtocolEncoding::Sgr
+            super::screen_view::MouseEncoding::Sgr
         );
     }
 
@@ -909,11 +920,17 @@ mod tests {
         // Enable then disable
         tx.send(b"\x1b[?1000h\x1b[?1006h".to_vec()).unwrap();
         term.process_output();
-        assert_ne!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_ne!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
 
         tx.send(b"\x1b[?1000l".to_vec()).unwrap();
         term.process_output();
-        assert_eq!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_eq!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
     }
 
     // ── should_forward_mouse decision logic ──
@@ -998,7 +1015,10 @@ mod tests {
         let (mut term, tx) = test_terminal(24, 80);
         tx.send(b"\x1b[?1000h\x1b[?1006h".to_vec()).unwrap();
         term.process_output();
-        assert_ne!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_ne!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
 
         drop(tx);
         term.process_output();
@@ -1006,7 +1026,7 @@ mod tests {
         assert!(term.exited);
         assert_eq!(
             term.mouse_protocol_mode(),
-            vt100::MouseProtocolMode::None,
+            super::screen_view::MouseMode::None,
             "mouse mode must be reset after process exit"
         );
     }
@@ -1018,14 +1038,17 @@ mod tests {
         tx.send(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h".to_vec())
             .unwrap();
         term.process_output();
-        assert_ne!(term.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_ne!(
+            term.mouse_protocol_mode(),
+            super::screen_view::MouseMode::None
+        );
 
         drop(tx);
         term.process_output();
 
         assert_eq!(
             term.mouse_protocol_mode(),
-            vt100::MouseProtocolMode::None,
+            super::screen_view::MouseMode::None,
             "all mouse tracking modes must be cleared on exit"
         );
     }

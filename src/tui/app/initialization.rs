@@ -193,6 +193,7 @@ impl App {
             review_queue_tab: super::ReviewQueueTab::Authored,
             settings_section_index: 0,
             settings_workflow_index: 0,
+            settings_workflow_stage_index: 0,
             github_installation_index: 0,
             github_project_index: 0,
             project_picker_index: 0,
@@ -207,6 +208,7 @@ impl App {
             settings_picker_options: vec![],
             settings_picker_index: 0,
             settings_picker_target: None,
+            show_shortcuts_bar: false,
             launch_thread_draft: None,
             launch_thread_field_index: 0,
             thread_provider_picker_index: 0,
@@ -222,6 +224,7 @@ impl App {
             thread_compose_thread_id: None,
             thread_compose_buffer: String::new(),
             thread_compose_cursor: 0,
+            thread_workspaces: HashMap::new(),
             slash_suggestions: vec![],
             slash_suggestion_index: 0,
             task_list_state: ListState::default(),
@@ -343,6 +346,7 @@ impl App {
             notified_in_review: HashSet::new(),
             review_loop_spawned: HashSet::new(),
             last_slow_tick: Instant::now(),
+            last_user_input_at: Instant::now(),
             last_terminal_area: Rect::default(),
             diff_preview_cache_key: None,
             diff_preview_cache: String::new(),
@@ -388,6 +392,10 @@ impl App {
             cached_session_thread_ctx: None,
             cached_session_thread_ctx_session_id: None,
             cached_chat_lines: None,
+            cached_compose_rect: None,
+            cached_compose_thread_id: None,
+            inspector_selection: None,
+            inspector_render_cache: None,
         };
 
         app.recompute_visible_tasks();
